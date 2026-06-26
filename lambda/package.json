@@ -1,0 +1,26 @@
+{
+  "name": "particle-log-ingestion-lambda",
+  "version": "1.0.0",
+  "description": "Lambda function for ingesting Particle webhook events",
+  "main": "dist/handler.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "jest",
+    "test:watch": "jest --watch"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.621.0",
+    "@aws-sdk/client-s3": "^3.621.0",
+    "@aws-sdk/lib-dynamodb": "^3.621.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.21.5",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.0",
+    "typescript": "^5.5.4"
+  }
+}
