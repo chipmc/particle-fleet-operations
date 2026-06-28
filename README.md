@@ -106,6 +106,40 @@ AWS_PROFILE=particle-admin aws dynamodb query \
 
 ⸻
 
+Inspect Device Timeline
+
+Local read-only tool for device event inspection:
+
+```bash
+cd scripts
+npm install
+npm run timeline -- --deviceId <deviceId> --hours 24
+```
+
+**Features:**
+- Query device timeline by deviceId
+- Time-range filtering (hours, start/end)
+- Display chronological events
+- Fetch raw S3 event data
+- Read-only (no AWS modification)
+
+**Quick examples:**
+```bash
+# Last 24 hours
+npm run timeline -- --deviceId e00fce68e4fa8ab3f8faa207 --hours 24
+
+# Specific time range
+npm run timeline -- --deviceId e00fce68e4fa8ab3f8faa207 \
+  --start 2026-06-26T00:00:00Z --end 2026-06-26T23:59:59Z
+
+# With raw S3 data
+npm run timeline -- --deviceId e00fce68e4fa8ab3f8faa207 --hours 24 --show-raw
+```
+
+See `docs/tools.md` and `scripts/README.md` for complete documentation.
+
+⸻
+
 Current State
 
 Working:

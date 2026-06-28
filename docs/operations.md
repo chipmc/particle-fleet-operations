@@ -170,6 +170,14 @@ AWS_PROFILE=particle-admin aws dynamodb query \
 
 **Expected:** Recent event from last burst cycle
 
+**Alternative: Use timeline tool**
+```bash
+cd scripts
+npm run timeline -- --deviceId KNOWN_DEVICE_ID --hours 1
+```
+
+See [tools.md](./tools.md) for detailed timeline tool usage.
+
 #### 8. Declare Success
 
 **Criteria:**
@@ -325,6 +333,46 @@ AWS_PROFILE=particle-admin aws lambda update-alias \
 1. Check Lambda concurrent execution limit
 2. Consider provisioned concurrency (requires AWS Agent review)
 3. Verify deployment timing (avoid :00–:15 deploys)
+
+---
+
+## Inspection Tools
+
+### Device Timeline Inspector
+
+**Purpose:** Local read-only tool for querying device event timelines.
+
+**Quick usage:**
+```bash
+cd scripts
+npm install
+npm run timeline -- --deviceId <deviceId> --hours 24
+```
+
+**Common scenarios:**
+
+**Check recent device activity:**
+```bash
+npm run timeline -- --deviceId e00fce68e4fa8ab3f8faa207 --hours 24
+```
+
+**Investigate specific time window:**
+```bash
+npm run timeline -- \
+  --deviceId e00fce68e4fa8ab3f8faa207 \
+  --start 2026-06-26T14:00:00Z \
+  --end 2026-06-26T15:00:00Z
+```
+
+**Inspect raw event data:**
+```bash
+npm run timeline -- \
+  --deviceId e00fce68e4fa8ab3f8faa207 \
+  --hours 24 \
+  --show-raw
+```
+
+**See [tools.md](./tools.md) for comprehensive documentation.**
 
 ---
 
