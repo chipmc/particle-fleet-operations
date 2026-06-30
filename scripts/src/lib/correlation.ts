@@ -204,13 +204,19 @@ function extractTelemetry(event: DynamoIndexRecord, payload: S3StorageRecord): T
  */
 function classifyEvent(event: DynamoIndexRecord): 'telemetry' | 'watchdog' | 'status' | 'serial-lifecycle' | 'serial-log' | 'other' {
   const name = event.eventName.toLowerCase();
+  const sourceEventType = event.sourceEventType || event.eventType;
   
   if (name.includes('watchdog')) return 'watchdog';
   if (name.includes('status') || name.includes('state')) return 'status';
-  if (event.eventType === 'SERIAL_CONNECTED' || event.eventType === 'SERIAL_DISCONNECTED' || event.eventType === 'SERIAL_MISSING') {
+  if (
+    event.eventType === 'serial.lifecycle' ||
+    sourceEventType === 'SERIAL_CONNECTED' ||
+    sourceEventType === 'SERIAL_DISCONNECTED' ||
+    sourceEventType === 'SERIAL_MISSING'
+  ) {
     return 'serial-lifecycle';
   }
-  if (event.sourceType === 'serial-forwarder' && event.logLine) {
+  if (event.eventType === 'serial.log' || (event.sourceType === 'serial-forwarder' && event.logLine)) {
     return 'serial-log';
   }
   
@@ -264,10 +270,11 @@ function extractStatus(event: DynamoIndexRecord, payload: S3StorageRecord): Stat
  */
 function extractSerialLifecycle(event: DynamoIndexRecord): SerialLifecycleData {
   let eventType: SerialLifecycleData['eventType'] = 'OTHER';
+  const sourceEventType = event.sourceEventType || event.eventType || event.eventName;
   
-  if (event.eventType === 'SERIAL_CONNECTED') eventType = 'SERIAL_CONNECTED';
-  else if (event.eventType === 'SERIAL_DISCONNECTED') eventType = 'SERIAL_DISCONNECTED';
-  else if (event.eventType === 'SERIAL_MISSING') eventType = 'SERIAL_MISSING';
+  if (sourceEventType === 'SERIAL_CONNECTED') eventType = 'SERIAL_CONNECTED';
+  else if (sourceEventType === 'SERIAL_DISCONNECTED') eventType = 'SERIAL_DISCONNECTED';
+  else if (sourceEventType === 'SERIAL_MISSING') eventType = 'SERIAL_MISSING';
   else if (event.logLine?.includes('MODEM_HEALTH')) eventType = 'MODEM_HEALTH';
   
   return {

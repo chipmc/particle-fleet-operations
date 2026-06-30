@@ -165,6 +165,31 @@ describe('Event Correlation', () => {
       expect(usbInference).toBeDefined();
       expect(usbInference!.severity).toBe('WARNING');
     });
+
+    it('should preserve serial lifecycle subtypes from normalized records', async () => {
+      const events: DynamoIndexRecord[] = [{
+        deviceId: 'test-device',
+        eventTime: '2026-06-28T10:00:00.000Z',
+        eventName: 'SERIAL_CONNECTED',
+        receivedAt: '2026-06-28T10:00:01.000Z',
+        s3Key: 'key-1',
+        dataType: 'string',
+        plane: 'serial',
+        eventType: 'serial.lifecycle',
+        sourceEventType: 'SERIAL_CONNECTED',
+      }];
+
+      const correlation = await correlateEvents(
+        'test-device',
+        events,
+        new Map<string, S3StorageRecord>(),
+        5
+      );
+
+      expect(correlation.windows[0].serialLifecycle).toEqual([
+        expect.objectContaining({ eventType: 'SERIAL_CONNECTED' }),
+      ]);
+    });
     
     it('should detect network stall causing watchdog (watchdog + high connecttime)', async () => {
       const events: DynamoIndexRecord[] = [

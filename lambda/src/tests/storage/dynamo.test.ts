@@ -127,4 +127,62 @@ describe('DynamoDB Storage', () => {
     expect(item.fw_version).toBeUndefined();
     expect(item.sourceType).toBeUndefined();
   });
+
+  it('should add normalized fields without removing legacy item fields', async () => {
+    const body: ParticleWebhook = {
+      event: 'serialLog',
+      data: '[ERROR] modem fault',
+      deviceId: 'device123',
+      published_at: '2026-06-26T14:30:00.000Z',
+      sourceType: 'serial-forwarder',
+      eventType: 'LOG',
+      logLine: '[ERROR] modem fault',
+    };
+
+    mockDdbSend.mockResolvedValue({});
+
+    await indexEvent(
+      'test-table',
+      'device123',
+      '2026-06-26T14:30:00.000Z',
+      'serialLog',
+      '2026-06-26T14:30:05.000Z',
+      'test-s3-key',
+      body,
+      body.data,
+      {
+        schemaVersion: '1.0',
+        eventId: 'event-id',
+        projectId: 'generalized-core-counter',
+        plane: 'serial',
+        eventType: 'serial.log',
+        eventVersion: '1.0',
+        sourceType: 'serial-forwarder',
+        isSyntheticTime: false,
+        severity: 'ERROR',
+        rawRef: { s3Key: 'test-s3-key' },
+      }
+    );
+
+    const command = mockDdbSend.mock.calls[0][0] as PutCommand;
+    expect(command.input.Item).toMatchObject({
+      // Original Phase 1 fields remain.
+      deviceId: 'device123',
+      eventTime: '2026-06-26T14:30:00.000Z',
+      eventName: 'serialLog',
+      receivedAt: '2026-06-26T14:30:05.000Z',
+      s3Key: 'test-s3-key',
+      dataType: 'string',
+      logLine: '[ERROR] modem fault',
+      // Raw serial classification is retained separately.
+      sourceEventType: 'LOG',
+      // Phase 2 additions.
+      schemaVersion: '1.0',
+      eventId: 'event-id',
+      plane: 'serial',
+      eventType: 'serial.log',
+      severity: 'ERROR',
+      rawRef: { s3Key: 'test-s3-key' },
+    });
+  });
 });

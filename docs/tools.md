@@ -15,12 +15,12 @@ Query and inspect device event timelines using data already collected in DynamoD
 - Raw event inspection from S3
 - **Analytics summary mode** (event patterns, gaps, bursts, anomalies)
 - **Health diagnostics mode** (payload-aware device health analysis)
-- Works with current Phase 1 schema
+- Works with Phase 1 and additive Phase 2A records
 
 **Does NOT:**
 - Modify DynamoDB or S3
 - Change Lambda behavior
-- Perform normalization (Phase 2)
+- Modify or replay normalized records
 - Write to AWS resources
 - Require infrastructure deployment
 
@@ -278,6 +278,12 @@ S3 Key:     particle-events/2026-06-26/Ubidots-Sensor-Hook-v1/...
 ```
 
 **Key fields:**
+
+Phase 2A timeline records may also include `plane`, stable `eventType`,
+`severity`, normalized health metrics, and `rawRef.s3Key`. Older Phase 1
+records remain valid. Serial lifecycle analysis reads `sourceEventType` when
+present and falls back to the legacy `eventType` layout.
+
 - **Event**: Event name (from Particle webhook or serial forwarder)
 - **Time**: Event timestamp from device (published_at)
 - **Received**: Ingestion timestamp (when Lambda processed)

@@ -197,7 +197,13 @@ describe('Lambda Handler', () => {
         expect.any(String),
         expect.stringContaining('particle-events/2026-06-26/occupancy'),
         expect.any(Object),
-        expect.any(Object)
+        expect.any(Object),
+        expect.objectContaining({
+          schemaVersion: '1.0',
+          eventType: 'telemetry.event',
+          plane: 'telemetry',
+          isSyntheticTime: false,
+        })
       );
     });
 
@@ -240,7 +246,12 @@ describe('Lambda Handler', () => {
           collectorId: 'pi-001',
           deviceName: 'Counter-42',
         }),
-        expect.any(String)
+        expect.any(String),
+        expect.objectContaining({
+          eventType: 'serial.log',
+          severity: 'INFO',
+          plane: 'serial',
+        })
       );
     });
 
@@ -262,7 +273,8 @@ describe('Lambda Handler', () => {
         expect.any(String),
         expect.any(String),
         expect.any(Object),
-        undefined // data field is undefined when not present
+        undefined, // data field is undefined when not present
+        expect.objectContaining({ isSyntheticTime: true })
       );
 
       jest.clearAllMocks();
@@ -281,7 +293,8 @@ describe('Lambda Handler', () => {
         expect.any(String),
         expect.any(String),
         expect.any(Object),
-        undefined
+        undefined,
+        expect.objectContaining({ isSyntheticTime: true })
       );
     });
   });

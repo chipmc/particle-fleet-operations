@@ -6,7 +6,7 @@
  * - Raspberry Pi Serial Forwarder
  * 
  * Phase 1: Extracted from inline CDK code (exact behavior preservation)
- * Phase 2: Will add normalization and enrichment pipeline
+ * Phase 2A: Additive normalization and enrichment pipeline
  * 
  * Architecture:
  * - Webhook auth via X-Particle-Webhook-Secret header
@@ -25,7 +25,9 @@ import {
   extractEventName,
   generateS3Key,
   safeParseData,
+  normalizeEvent,
 } from './utils/parse';
+import { NormalizedEventFields } from './types';
 
 /**
  * Main Lambda handler
@@ -90,6 +92,19 @@ export async function handler(event: InboundEvent): Promise<LambdaResponse> {
   
   const s3Key = generateS3Key(eventName, deviceId, publishedAt);
 
+  let normalized: NormalizedEventFields | undefined;
+  try {
+    normalized = normalizeEvent(body, parsedData, {
+      deviceId,
+      eventName,
+      eventTime: publishedAt,
+      s3Key,
+    });
+  } catch (err) {
+    // Enrichment must never prevent the existing raw/index storage path.
+    console.warn('Event normalization failed; preserving ingestion', err);
+  }
+
   // Store raw event in S3 (immutable archive)
   await storeRawEvent(
     process.env.RAW_LOGS_BUCKET_NAME!,
@@ -107,7 +122,8 @@ export async function handler(event: InboundEvent): Promise<LambdaResponse> {
     parsed.receivedAt,
     s3Key,
     body,
-    parsedData
+    parsedData,
+    normalized
   );
 
   // ============================================================================

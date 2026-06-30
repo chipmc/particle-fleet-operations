@@ -182,104 +182,142 @@ describe('Parser Utilities', () => {
   });
 });
 
-// ============================================================================
-// Phase 2 Function Tests (Scaffolded - Currently Skipped)
-// ============================================================================
+describe('Phase 2 Normalization Functions', () => {
+  const context = {
+    deviceId: 'device123',
+    eventName: 'Ubidots-Sensor-Hook-v1',
+    eventTime: '2026-06-26T14:30:00.000Z',
+    s3Key: 'particle-events/2026-06-26/test/device123/event.json',
+  };
 
-describe.skip('Phase 2 Normalization Functions', () => {
   describe('normalizeEvent', () => {
-    it('should normalize Particle webhook to canonical envelope', () => {
-      // TODO Phase 2: Implement test
-      expect(() => normalizeEvent()).toThrow('not implemented');
+    it('normalizes telemetry webhook metrics', () => {
+      const body: ParticleWebhook = {
+        event: context.eventName,
+        coreid: context.deviceId,
+        published_at: context.eventTime,
+        deviceName: 'Counter-42',
+        fw_version: '2.4.0',
+      };
+      const result = normalizeEvent(body, {
+        battery: '91.5',
+        connecttime: 14,
+        resets: '2',
+        alerts: 0,
+        occupancy: 7,
+        dailyoccupancy: '42',
+        temp: 28.75,
+      }, context);
+
+      expect(result).toMatchObject({
+        schemaVersion: '1.0',
+        projectId: 'generalized-core-counter',
+        plane: 'telemetry',
+        eventType: 'telemetry.occupancy',
+        eventVersion: '1.0',
+        sourceType: 'particle-webhook',
+        deviceName: 'Counter-42',
+        isSyntheticTime: false,
+        battery: 91.5,
+        connectTime: 14,
+        resetCount: 2,
+        alertCount: 0,
+        occupancy: 7,
+        dailyOccupancy: 42,
+        temperature: 28.75,
+        fwVersion: '2.4.0',
+        rawRef: { s3Key: context.s3Key },
+      });
+      expect(result.eventId).toMatch(/^[a-f0-9]{64}$/);
+      expect(normalizeEvent(body, {}, context).eventId).toBe(result.eventId);
     });
 
-    it('should map eventName to stable eventType', () => {
-      // TODO Phase 2: Test eventName -> eventType mapping
-      // Example: watchdog -> forensic.watchdog
-      expect(() => normalizeEvent()).toThrow('not implemented');
+    it('normalizes serial logs and parses severity', () => {
+      const result = normalizeEvent({
+        event: 'serialLog',
+        sourceType: 'serial-forwarder',
+        collectorId: 'pi-001',
+        eventType: 'LOG',
+        logLine: '2026-06-26 [WARN] modem reconnect',
+      }, 'not-json', {
+        ...context,
+        eventName: 'serialLog',
+      });
+
+      expect(result).toMatchObject({
+        plane: 'serial',
+        eventType: 'serial.log',
+        severity: 'WARN',
+        collectorId: 'pi-001',
+      });
     });
 
-    it('should add schemaVersion and eventVersion', () => {
-      // TODO Phase 2: Test version fields
-      expect(() => normalizeEvent()).toThrow('not implemented');
+    it.each([
+      ['watchdog-v2', 'forensic', 'fault.watchdog'],
+      ['device-status', 'forensic', 'telemetry.status'],
+    ])('classifies %s', (eventName, plane, eventType) => {
+      const result = normalizeEvent({ event: eventName }, {}, {
+        ...context,
+        eventName,
+      });
+
+      expect(result).toMatchObject({ plane, eventType });
     });
 
-    it('should classify plane (telemetry|forensic|serial)', () => {
-      // TODO Phase 2: Test plane classification
-      expect(() => normalizeEvent()).toThrow('not implemented');
+    it('classifies health and serial lifecycle events', () => {
+      expect(normalizeEvent(
+        { event: 'sensor-hook' },
+        { battery: 80 },
+        { ...context, eventName: 'sensor-hook' }
+      ).eventType).toBe('telemetry.health');
+
+      expect(normalizeEvent(
+        {
+          event: 'SERIAL_CONNECTED',
+          sourceType: 'serial-forwarder',
+          eventType: 'SERIAL_CONNECTED',
+        },
+        undefined,
+        { ...context, eventName: 'SERIAL_CONNECTED' }
+      )).toMatchObject({
+        plane: 'serial',
+        eventType: 'serial.lifecycle',
+      });
+    });
+
+    it('uses best-effort fallback for malformed payloads', () => {
+      expect(() => normalizeEvent(
+        { event: 'brand-new-event', data: '{"battery":' },
+        '{"battery":',
+        { ...context, eventName: 'brand-new-event' }
+      )).not.toThrow();
+
+      const result = normalizeEvent(
+        { event: 'brand-new-event' },
+        '{"battery":',
+        { ...context, eventName: 'brand-new-event' }
+      );
+      expect(result.eventType).toBe('telemetry.event');
+      expect(result.battery).toBeUndefined();
+    });
+
+    it('flags a generated event timestamp as synthetic', () => {
+      const result = normalizeEvent(
+        { event: 'test' },
+        undefined,
+        { ...context, eventName: 'test' }
+      );
+      expect(result.isSyntheticTime).toBe(true);
     });
   });
 
   describe('parseSeverity', () => {
-    it('should extract INFO from log prefix', () => {
-      // TODO Phase 2: Test [INFO] -> INFO
-      expect(() => parseSeverity()).toThrow('not implemented');
+    it.each(['TRACE', 'INFO', 'WARN', 'ERROR'])('extracts %s', severity => {
+      expect(parseSeverity(`[${severity}] message`)).toBe(severity);
     });
 
-    it('should extract WARN from log prefix', () => {
-      // TODO Phase 2: Test [WARN] -> WARN
-      expect(() => parseSeverity()).toThrow('not implemented');
-    });
-
-    it('should extract ERROR from log prefix', () => {
-      // TODO Phase 2: Test [ERROR] -> ERROR
-      expect(() => parseSeverity()).toThrow('not implemented');
-    });
-
-    it('should classify watchdog events as ERROR', () => {
-      // TODO Phase 2: Test watchdog -> ERROR
-      expect(() => parseSeverity()).toThrow('not implemented');
-    });
-
-    it('should return null for non-log events', () => {
-      // TODO Phase 2: Test telemetry events -> null
-      expect(() => parseSeverity()).toThrow('not implemented');
-    });
-  });
-
-  describe('parseResetCause', () => {
-    it('should extract reset cause from watchdog event', () => {
-      // TODO Phase 2: Test watchdog data parsing
-      expect(() => parseResetCause()).toThrow('not implemented');
-    });
-
-    it('should extract reset cause from status event', () => {
-      // TODO Phase 2: Test status data parsing
-      expect(() => parseResetCause()).toThrow('not implemented');
-    });
-
-    it('should return null for non-reset events', () => {
-      // TODO Phase 2: Test normal events -> null
-      expect(() => parseResetCause()).toThrow('not implemented');
-    });
-  });
-
-  describe('parseQueueDepth', () => {
-    it('should extract queue depth from status event', () => {
-      // TODO Phase 2: Test queue metrics extraction
-      expect(() => parseQueueDepth()).toThrow('not implemented');
-    });
-
-    it('should return null for non-status events', () => {
-      // TODO Phase 2: Test other events -> null
-      expect(() => parseQueueDepth()).toThrow('not implemented');
-    });
-  });
-
-  describe('parseNetworkState', () => {
-    it('should extract modem state from connectivity events', () => {
-      // TODO Phase 2: Test modem state extraction
-      expect(() => parseNetworkState()).toThrow('not implemented');
-    });
-
-    it('should extract signal strength', () => {
-      // TODO Phase 2: Test signal metrics
-      expect(() => parseNetworkState()).toThrow('not implemented');
-    });
-
-    it('should return null for non-connectivity events', () => {
-      // TODO Phase 2: Test other events -> null
-      expect(() => parseNetworkState()).toThrow('not implemented');
+    it('returns null for unclassified lines', () => {
+      expect(parseSeverity('ordinary line')).toBeNull();
     });
   });
 });

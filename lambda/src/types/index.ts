@@ -40,6 +40,39 @@ export interface ParticleWebhook {
   eventType?: string;
   deviceName?: string;
   logLine?: string;
+  projectId?: string;
+}
+
+export type EventPlane = 'telemetry' | 'forensic' | 'serial';
+export type EventSeverity = 'TRACE' | 'INFO' | 'WARN' | 'ERROR';
+
+/**
+ * Additive Phase 2 fields written alongside the existing DynamoDB index.
+ * The raw payload remains exclusively in S3.
+ */
+export interface NormalizedEventFields {
+  schemaVersion: '1.0';
+  eventId: string;
+  projectId: string;
+  plane: EventPlane;
+  eventType: string;
+  eventVersion: '1.0';
+  sourceType?: string;
+  deviceName?: string;
+  collectorId?: string;
+  isSyntheticTime: boolean;
+  severity?: EventSeverity;
+  battery?: number;
+  connectTime?: number;
+  resetCount?: number;
+  alertCount?: number;
+  occupancy?: number;
+  dailyOccupancy?: number;
+  temperature?: number;
+  fwVersion?: string;
+  rawRef: {
+    s3Key: string;
+  };
 }
 
 /**
@@ -86,8 +119,29 @@ export interface DynamoIndexRecord {
   collectorId?: string;
   transport?: string;
   eventType?: string;
+  sourceEventType?: string;
   deviceName?: string;
   logLine?: string;
+
+  // Phase 2 normalized/enriched fields
+  schemaVersion?: string;
+  eventId?: string;
+  projectId?: string;
+  plane?: EventPlane;
+  eventVersion?: string;
+  isSyntheticTime?: boolean;
+  severity?: EventSeverity;
+  battery?: number;
+  connectTime?: number;
+  resetCount?: number;
+  alertCount?: number;
+  occupancy?: number;
+  dailyOccupancy?: number;
+  temperature?: number;
+  fwVersion?: string;
+  rawRef?: {
+    s3Key: string;
+  };
 }
 
 /**
@@ -97,41 +151,3 @@ export interface LambdaResponse {
   statusCode: number;
   body: string;
 }
-
-// ============================================================================
-// Phase 2 Types (Not Used Yet)
-// ============================================================================
-
-/**
- * Canonical event envelope
- * From: docs/contracts/canonical-event-envelope.md
- * 
- * This will be implemented in Phase 2 - Normalization
- * Keeping type definition here for future reference
- */
-/*
-export interface CanonicalEvent {
-  schemaVersion: string;
-  eventId: string;
-  projectId: string;
-  deviceId: string;
-  deviceName: string | null;
-  eventTime: string;
-  ingestTime: string;
-  isSyntheticTime: boolean;
-  plane: 'telemetry' | 'forensic' | 'serial';
-  eventType: string;
-  eventVersion: string;
-  eventName: string;
-  sourceType: string;
-  collectorId: string | null;
-  severity: 'INFO' | 'WARN' | 'ERROR' | 'TRACE' | null;
-  resetCause: string | null;
-  networkState: string | null;
-  queueDepth: number | null;
-  payload: Record<string, any>;
-  rawRef: {
-    s3Key: string;
-  };
-}
-*/

@@ -80,22 +80,30 @@ Expected: `{"ok":true,"stored":true}`
 
 ## Architecture Notes
 
-### Current Behavior (Phase 1)
+### Current Behavior (Phase 2A)
 
-This implementation preserves exact current behavior:
+This implementation preserves the Phase 1 ingestion path and adds best-effort
+normalization:
 
 - Authentication via webhook secret header
 - S3 immutable raw event storage
 - DynamoDB fast indexed retrieval
-- No normalization or validation
+- Unchanged `deviceId` partition key and `eventTime` sort key
+- Existing DynamoDB attributes retained
+- Stable `plane` and `eventType` classification
+- Common Particle webhook metrics extracted into normalized fields
+- Serial severity extraction from `logLine`
+- Deterministic event IDs and S3 `rawRef`
+- Synthetic timestamp marking
+- Unknown and malformed payloads accepted
 
-### Phase 2 Preparation
+Normalized attributes are added to the existing DynamoDB item. Raw S3 object
+keys and bodies are unchanged. If normalization unexpectedly throws, the
+handler logs a warning and continues the original index write without the
+normalized attributes.
 
-The codebase is structured for upcoming normalization:
-
-- `utils/parse.ts` has scaffolded normalization functions
-- `types/index.ts` has commented canonical event types
-- Test scaffolding exists for future enrichment logic
+For serial lifecycle compatibility, canonical `eventType` is stored alongside
+the inbound classification retained as `sourceEventType`.
 
 See `docs/contracts/canonical-event-envelope.md` for canonical schema.
 

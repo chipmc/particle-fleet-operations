@@ -88,6 +88,11 @@ Purpose:
 
 timeline reconstruction
 
+Phase 2A writes normalized/enriched attributes onto the same item. It does not
+change the table keys, API Gateway, or S3 path/body format. Legacy Phase 1
+attributes remain in place, while canonical fields provide stable plane and
+event-type classification plus common telemetry metrics.
+
 ⸻
 
 Lambda Architecture
@@ -101,21 +106,24 @@ lambda/src/
 │   ├── s3.ts           # Raw event storage
 │   └── dynamo.ts       # Event indexing
 ├── utils/
-│   └── parse.ts        # Event parsing + future normalization
+│   └── parse.ts        # Event parsing + Phase 2A normalization
 └── types/
     └── index.ts        # Type definitions
 ```
 
-**Current behavior (Phase 1):**
+**Current behavior (Phase 2A):**
 - Authentication via webhook secret
 - Raw event immutable storage in S3
 - Fast indexed retrieval via DynamoDB
-- No normalization or validation
+- Additive canonical normalization in `utils/parse.ts`
+- Stable telemetry, forensic, and serial classification
+- Common health/occupancy metric extraction
+- Best-effort enrichment; normalization failure does not block ingestion
+- Unknown event types remain accepted
 
-**Phase 2 preparation:**
-- Scaffolded normalization functions in `utils/parse.ts`
-- Type definitions for canonical event envelope
-- Test scaffolding for enrichment logic
+The DynamoDB `deviceId`/`eventTime` key model is unchanged. Raw serial
+`eventType` values are retained as `sourceEventType` when the canonical
+`eventType` is written.
 
 See `lambda/README.md` for development guide.
 

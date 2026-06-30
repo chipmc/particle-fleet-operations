@@ -1,15 +1,19 @@
 /**
  * DynamoDB operations for event indexing
  * 
- * Preserves exact current behavior:
+ * Preserves the Phase 1 index shape and adds Phase 2A normalized fields:
  * - Fast indexed retrieval by deviceId + eventTime
- * - Current schema (no normalization yet)
+ * - Unchanged partition and sort key model
  * - Extended fields from serial forwarder
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
-import { ParticleWebhook, DynamoIndexRecord } from '../types';
+import {
+  ParticleWebhook,
+  DynamoIndexRecord,
+  NormalizedEventFields,
+} from '../types';
 
 // Initialize client at module level to allow mocking
 const client = new DynamoDBClient({});
@@ -31,6 +35,7 @@ const ddb = DynamoDBDocumentClient.from(client);
  * @param s3Key - S3 key for raw event
  * @param body - Original webhook body (for extended fields)
  * @param parsedData - Parsed data (for dataType)
+ * @param normalized - Best-effort Phase 2 normalization fields
  */
 export async function indexEvent(
   tableName: string,
@@ -40,7 +45,8 @@ export async function indexEvent(
   receivedAt: string,
   s3Key: string,
   body: ParticleWebhook,
-  parsedData: any
+  parsedData: any,
+  normalized?: NormalizedEventFields
 ): Promise<void> {
   const item: DynamoIndexRecord = {
     deviceId,
@@ -57,8 +63,13 @@ export async function indexEvent(
     collectorId: body.collectorId,
     transport: body.transport,
     eventType: body.eventType,
+    sourceEventType: body.eventType,
     deviceName: body.deviceName,
     logLine: body.logLine,
+
+    // Additive normalized/enriched fields. Canonical eventType intentionally
+    // supersedes the inbound value; sourceEventType retains the raw value.
+    ...normalized,
   };
 
   await ddb.send(

@@ -2,10 +2,17 @@
  * Parsing utilities for Particle webhook events
  * 
  * Phase 1: Extract current parsing logic (exact behavior preservation)
- * Phase 2: Add normalization functions (scaffolded below)
+ * Phase 2A: Add best-effort normalization functions
  */
 
-import { ParticleWebhook, ParsedEvent } from '../types';
+import { createHash } from 'crypto';
+import {
+  EventPlane,
+  EventSeverity,
+  NormalizedEventFields,
+  ParticleWebhook,
+  ParsedEvent,
+} from '../types';
 
 /**
  * Parse raw request body into ParticleWebhook object
@@ -103,68 +110,224 @@ export function generateS3Key(
   return `particle-events/${datePrefix}/${eventName}/${deviceId}/${safeTimestamp}.json`;
 }
 
-// ============================================================================
-// Phase 2 Functions (Scaffolded - Not Implemented Yet)
-// ============================================================================
-
 /**
- * Normalize raw event into canonical envelope
- * 
- * Phase 2 implementation will:
- * - Map eventName -> stable eventType
- * - Add schemaVersion, eventVersion
- * - Classify plane (telemetry|forensic|serial)
- * - Extract enrichment fields (severity, resetCause, etc.)
- * 
- * @see docs/contracts/canonical-event-envelope.md
+ * Context already established by the handler before normalization.
  */
-export function normalizeEvent(/* params TBD */): any {
-  throw new Error('normalizeEvent not implemented - Phase 2');
+export interface NormalizationContext {
+  deviceId: string;
+  eventName: string;
+  eventTime: string;
+  s3Key: string;
 }
 
 /**
- * Parse severity from event data
- * 
- * Phase 2 implementation will extract:
- * INFO | WARN | ERROR | TRACE | null
- * 
- * Based on:
- * - Log level prefixes in serial logs
- * - Alert event types
- * - Reset/watchdog events (ERROR)
+ * Normalize an inbound event into the additive fields stored in DynamoDB.
+ * Parsing is deliberately best effort: unknown or malformed payloads still
+ * receive the base envelope fields and are classified as telemetry.event.
  */
-export function parseSeverity(/* params TBD */): string | null {
-  throw new Error('parseSeverity not implemented - Phase 2');
+export function normalizeEvent(
+  body: ParticleWebhook,
+  parsedData: any,
+  context: NormalizationContext
+): NormalizedEventFields {
+  const data = parsePayloadObject(parsedData);
+  const plane = classifyPlane(body, context.eventName);
+  const eventType = classifyEventType(body, context.eventName, plane, data);
+  const severity = plane === 'serial' ? parseSeverity(body.logLine) : null;
+  const sourceType =
+    body.sourceType || (plane === 'serial' ? 'serial-forwarder' : 'particle-webhook');
+
+  const normalized: NormalizedEventFields = {
+    schemaVersion: '1.0',
+    eventId: createEventId(context),
+    projectId: body.projectId || 'generalized-core-counter',
+    plane,
+    eventType,
+    eventVersion: '1.0',
+    sourceType,
+    isSyntheticTime: !body.published_at && !body.timestamp,
+    rawRef: {
+      s3Key: context.s3Key,
+    },
+  };
+
+  addString(normalized, 'deviceName', body.deviceName);
+  addString(normalized, 'collectorId', body.collectorId);
+  if (severity) normalized.severity = severity;
+
+  addNumber(normalized, 'battery', getField(data, body, 'battery'));
+  addNumber(normalized, 'connectTime', getField(data, body, 'connecttime'));
+  addNumber(normalized, 'resetCount', getField(data, body, 'resets'));
+  addNumber(normalized, 'alertCount', getField(data, body, 'alerts'));
+  addNumber(normalized, 'occupancy', getField(data, body, 'occupancy'));
+  addNumber(normalized, 'dailyOccupancy', getField(data, body, 'dailyoccupancy'));
+  addNumber(
+    normalized,
+    'temperature',
+    getField(data, body, 'temp') ?? getField(data, body, 'temperature')
+  );
+
+  const fwVersion = getField(data, body, 'fw_version') ?? body.fw_version;
+  if (typeof fwVersion === 'string' && fwVersion.length > 0) {
+    normalized.fwVersion = fwVersion;
+  } else if (typeof fwVersion === 'number' && Number.isFinite(fwVersion)) {
+    normalized.fwVersion = String(fwVersion);
+  }
+
+  return normalized;
 }
 
 /**
- * Parse reset cause from watchdog/status events
- * 
- * Phase 2 implementation will extract reset reason
- * from Particle system events
+ * Parse serial log severity without rejecting unfamiliar log formats.
  */
+export function parseSeverity(logLine?: unknown): EventSeverity | null {
+  if (typeof logLine !== 'string') return null;
+  const match = logLine.match(/\b(TRACE|INFO|WARN|ERROR)\b/i);
+  return match ? (match[1].toUpperCase() as EventSeverity) : null;
+}
+
+// Reserved enrichment hooks for later Phase 2 work.
 export function parseResetCause(/* params TBD */): string | null {
-  throw new Error('parseResetCause not implemented - Phase 2');
+  return null;
 }
 
-/**
- * Parse queue depth from status events
- * 
- * Phase 2 implementation will extract queue metrics
- * for connectivity diagnostics
- */
 export function parseQueueDepth(/* params TBD */): number | null {
-  throw new Error('parseQueueDepth not implemented - Phase 2');
+  return null;
 }
 
-/**
- * Parse network state from connectivity events
- * 
- * Phase 2 implementation will extract:
- * - Modem state
- * - Signal strength
- * - Connection status
- */
 export function parseNetworkState(/* params TBD */): string | null {
-  throw new Error('parseNetworkState not implemented - Phase 2');
+  return null;
+}
+
+function createEventId(context: NormalizationContext): string {
+  return createHash('sha256')
+    .update([
+      context.deviceId,
+      context.eventName,
+      context.eventTime,
+      context.s3Key,
+    ].join('\u0000'))
+    .digest('hex');
+}
+
+function classifyPlane(body: ParticleWebhook, eventName: string): EventPlane {
+  if (body.sourceType === 'serial-forwarder' || eventName === 'serialLog') {
+    return 'serial';
+  }
+
+  if (/(watchdog|status|reset|boot|fault)/i.test(eventName)) {
+    return 'forensic';
+  }
+
+  return 'telemetry';
+}
+
+function classifyEventType(
+  body: ParticleWebhook,
+  eventName: string,
+  plane: EventPlane,
+  data: Record<string, any> | null
+): string {
+  const name = eventName.toLowerCase();
+  const sourceEventType = body.eventType?.toUpperCase();
+  const lifecycleTypes = new Set([
+    'SERIAL_CONNECTED',
+    'SERIAL_DISCONNECTED',
+    'SERIAL_MISSING',
+  ]);
+
+  if (lifecycleTypes.has(eventName.toUpperCase()) ||
+      (sourceEventType && lifecycleTypes.has(sourceEventType))) {
+    return 'serial.lifecycle';
+  }
+
+  if (
+    plane === 'serial' &&
+    (name === 'seriallog' || name === 'log' || sourceEventType === 'LOG' || !!body.logLine)
+  ) {
+    return 'serial.log';
+  }
+
+  if (name.includes('watchdog')) return 'fault.watchdog';
+  if (name.includes('status')) return 'telemetry.status';
+
+  const keys = new Set(Object.keys(data || {}).map(key => key.toLowerCase()));
+  if (keys.has('occupancy') || keys.has('dailyoccupancy')) {
+    return 'telemetry.occupancy';
+  }
+
+  if (
+    ['battery', 'connecttime', 'resets', 'alerts', 'temperature', 'temp']
+      .some(key => keys.has(key))
+  ) {
+    return 'telemetry.health';
+  }
+
+  return 'telemetry.event';
+}
+
+function parsePayloadObject(data: any): Record<string, any> | null {
+  if (data && typeof data === 'object' && !Array.isArray(data)) return data;
+  if (typeof data !== 'string') return null;
+
+  const decoded = data
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#39;/g, "'");
+
+  for (const candidate of [decoded, `{${decoded}`, `{${decoded}}`]) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // Continue through best-effort candidates.
+    }
+  }
+
+  return null;
+}
+
+function getField(
+  data: Record<string, any> | null,
+  body: ParticleWebhook,
+  field: string
+): unknown {
+  const dataEntry = data
+    ? Object.entries(data).find(([key]) => key.toLowerCase() === field.toLowerCase())
+    : undefined;
+  if (dataEntry) return dataEntry[1];
+
+  const bodyEntry = Object.entries(body).find(
+    ([key]) => key.toLowerCase() === field.toLowerCase()
+  );
+  return bodyEntry?.[1];
+}
+
+function addNumber(
+  target: NormalizedEventFields,
+  field:
+    | 'battery'
+    | 'connectTime'
+    | 'resetCount'
+    | 'alertCount'
+    | 'occupancy'
+    | 'dailyOccupancy'
+    | 'temperature',
+  value: unknown
+): void {
+  if (value === null || value === undefined || value === '') return;
+  const numberValue = typeof value === 'number' ? value : Number(value);
+  if (Number.isFinite(numberValue)) target[field] = numberValue;
+}
+
+function addString(
+  target: NormalizedEventFields,
+  field: 'deviceName' | 'collectorId',
+  value: unknown
+): void {
+  if (typeof value === 'string' && value.length > 0) target[field] = value;
 }

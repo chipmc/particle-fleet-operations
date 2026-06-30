@@ -1,6 +1,7 @@
 /**
  * Type definitions for timeline CLI tool
- * Matches current DynamoDB schema (Phase 1)
+ * Matches the additive Phase 2 DynamoDB schema while remaining compatible
+ * with Phase 1 records.
  */
 
 /**
@@ -21,8 +22,29 @@ export interface DynamoIndexRecord {
   collectorId?: string;
   transport?: string;
   eventType?: string;
+  sourceEventType?: string;
   deviceName?: string;
   logLine?: string;
+
+  // Phase 2 normalized/enriched fields
+  schemaVersion?: string;
+  eventId?: string;
+  projectId?: string;
+  plane?: 'telemetry' | 'forensic' | 'serial';
+  eventVersion?: string;
+  isSyntheticTime?: boolean;
+  severity?: 'TRACE' | 'INFO' | 'WARN' | 'ERROR';
+  battery?: number;
+  connectTime?: number;
+  resetCount?: number;
+  alertCount?: number;
+  occupancy?: number;
+  dailyOccupancy?: number;
+  temperature?: number;
+  fwVersion?: string;
+  rawRef?: {
+    s3Key: string;
+  };
 }
 
 /**
