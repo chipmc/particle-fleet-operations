@@ -90,3 +90,26 @@ Use cases:
 * watchdog root cause analysis
 * modem instability
 * fleet anomaly detection
+
+## Security Hardening: Secrets Management
+
+Current token model is functional but suboptimal.
+
+Known secrets:
+- Particle API access token for device-name enrichment
+- Particle webhook/shared publish secret
+- Raspberry Pi to AWS ingestion secret
+- future cloud-event ingestion token
+- AWS SSO/operator access
+
+Near-term:
+- use 1-year Particle token to reduce operational churn
+- document token creation and expiry date
+- store local operator copy in `~/.particle-log-monitoring/secrets.env`
+
+Target:
+- migrate runtime secrets to AWS Secrets Manager
+- keep only secret ARNs/names in Lambda environment variables
+- define rotation runbooks
+- avoid shared credentials across ingestion and query APIs
+- validate IAM least privilege before deployment

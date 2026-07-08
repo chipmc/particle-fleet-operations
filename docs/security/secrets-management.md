@@ -54,6 +54,20 @@ Treat every GitHub secret scanning alert as credential compromise unless proven 
 
 Do not dismiss a secret scanning alert as a false positive without review.
 
+### Local Operator Secret Cache
+
+For local development and emergency rotation:
+
+~/.particle-log-monitoring/secrets.env
+
+Managed by:
+
+~/Documents/Maker/Particle/ops/ParticleTokenRotation.sh
+
+Not committed.
+Not synced.
+Local-only.
+
 ## If A Secret Is Committed
 
 If a secret is committed or otherwise exposed:

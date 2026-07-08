@@ -2,7 +2,7 @@ AI Development Workflow
 
 Purpose
 
-This document defines how AI tools are used within the Generalized Core Counter project.
+This document defines how AI tools are used within the Particle Log Monitoring / Unified Telemetry project.
 
 The goal is to maximize reliability and maintainability while minimizing field risk.
 
@@ -19,6 +19,7 @@ Responsibilities:
 * Priority setting
 * Acceptance of architectural changes
 * Determination of production readiness
+* Chatty may propose implementation patterns and review diffs, but should not author large repo changes unless explicitly requested by Chip.
 
 No AI agent may be considered the final approver of a change.
 
@@ -130,6 +131,21 @@ Phase 4 — Implementation
 
 Claude implements approved changes in repo branches.
 
+Every proposed change should be classified as:
+- additive
+- refactor-only
+- behavior-changing
+- contract-changing
+- security-sensitive
+- infrastructure-sensitive
+
+Security Gate — Required Before Deployment
+- no plaintext secrets
+- no unexpected IAM broadening
+- no public data exposure
+- no contract-breaking API/schema change
+- no destructive data operation
+
 Phase 5 — Deployment Review
 
 AWS Agent shows CDK diff / CloudFormation impact before deployment.
@@ -154,8 +170,38 @@ When tradeoffs exist:
 4. Prefer reliability over new features.
 5. Prefer evidence over assumptions.
 
+All investigation findings should include:
+- files/resources inspected
+- evidence observed
+- risk level
+- recommendation
+- confidence level
+
+⸻
+
+When investigating discrepancies:
+
+1. Deployed AWS state (CloudFormation, Lambda, DynamoDB, API Gateway)
+2. Generated deployment artifacts (cdk.out, Lambda bundles)
+3. Tracked source code
+4. Build output
+5. Assumptions
+
+If these disagree:
+
+Do not implement until the discrepancy is understood.
+
+Repository and deployment are both authoritative sources of evidence.
+
 ⸻
 
 Current Project Focus
 
 Current priorities:
+Current Project Focus
+
+1. Stabilize Particle device-name enrichment.
+2. Verify current-state projection correctness.
+3. Preserve no-scan fleet API design.
+4. Prepare additive Ubidots cloud event plane.
+5. Harden secrets with AWS Secrets Manager.
