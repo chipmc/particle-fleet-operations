@@ -195,6 +195,30 @@ Repository and deployment are both authoritative sources of evidence.
 
 ⸻
 
+Architect
+
+* Defines the problem.
+* Approves the design.
+* Produces implementation prompt.
+
+Investigator
+
+* No code changes.
+* Evidence only.
+* Contract verification.
+* Identifies risks.
+* Recommends implementation.
+
+Implementor
+
+* Changes only approved files.
+* Never broadens scope.
+* Always runs validation.
+* Reports exactly what changed.
+* Never invents architecture.
+
+--- 
+
 Current Project Focus
 
 Current priorities:
