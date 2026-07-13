@@ -1,6 +1,6 @@
 import { ParticleLedgerClient } from './integrations/particle-ledger';
 import { DeviceCurrentState, ParticleWebhook } from './types';
-export type DeviceStatusLedgerRefreshResult = 'disabled' | 'not_allow_listed' | 'missing_product_id' | 'not_found_or_failed' | 'missing_updated_at' | 'stale' | 'updated';
+export type DeviceStatusLedgerRefreshResult = 'disabled' | 'not_allow_listed' | 'event_not_eligible' | 'refresh_cooldown' | 'missing_product_id' | 'not_found_or_failed' | 'missing_updated_at' | 'stale' | 'updated';
 interface RefreshDeviceStatusLedgerInput {
     tableName: string;
     projectId: string;

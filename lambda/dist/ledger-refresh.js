@@ -6,19 +6,43 @@ const particle_api_1 = require("./integrations/particle-api");
 const particle_ledger_1 = require("./integrations/particle-ledger");
 const current_state_1 = require("./storage/current-state");
 const productIdByDeviceId = new Map();
+const lastRefreshAttemptAtByDeviceId = new Map();
+const inFlightRefreshByDeviceId = new Map();
 async function refreshDeviceStatusLedger(input) {
     if (!isLedgerRefreshEnabled()) {
-        logLedgerRefresh({ deviceId: input.deviceId, result: 'skipped', reason: 'feature_disabled' });
         return 'disabled';
     }
     if (!isDeviceAllowListed(input.deviceId)) {
-        logLedgerRefresh({ deviceId: input.deviceId, result: 'skipped', reason: 'device_not_allowlisted' });
         return 'not_allow_listed';
     }
+    if (!isEventNameEligible(input.body.event || 'unknown')) {
+        return 'event_not_eligible';
+    }
+    const inFlightRefresh = inFlightRefreshByDeviceId.get(input.deviceId);
+    if (inFlightRefresh) {
+        return inFlightRefresh;
+    }
+    const nowMs = (input.fetchedAt || new Date()).getTime();
+    const lastRefreshAttemptAt = lastRefreshAttemptAtByDeviceId.get(input.deviceId);
+    if (lastRefreshAttemptAt !== undefined && nowMs - lastRefreshAttemptAt < getRefreshMinIntervalMs()) {
+        return 'refresh_cooldown';
+    }
+    lastRefreshAttemptAtByDeviceId.set(input.deviceId, nowMs);
+    const refreshPromise = executeDeviceStatusLedgerRefresh(input);
+    inFlightRefreshByDeviceId.set(input.deviceId, refreshPromise);
+    try {
+        return await refreshPromise;
+    }
+    finally {
+        if (inFlightRefreshByDeviceId.get(input.deviceId) === refreshPromise) {
+            inFlightRefreshByDeviceId.delete(input.deviceId);
+        }
+    }
+}
+async function executeDeviceStatusLedgerRefresh(input) {
     try {
         const productId = await resolveProductId(input.body, input.deviceId, input.fetchedAt);
         if (!productId) {
-            logLedgerRefresh({ deviceId: input.deviceId, result: 'skipped', reason: 'missing_product_id' });
             return 'missing_product_id';
         }
         const ledgerClient = input.ledgerClient || new particle_ledger_1.ParticleLedgerClient();
@@ -35,7 +59,6 @@ async function refreshDeviceStatusLedger(input) {
         }
         const ledgerUpdatedAt = ledgerResult.instance.updated_at;
         if (!ledgerUpdatedAt) {
-            logLedgerRefresh({ deviceId: input.deviceId, productId, result: 'skipped', reason: 'missing_updated_at' });
             return 'missing_updated_at';
         }
         if (input.previous?.deviceStatusLedgerUpdatedAt && input.previous.deviceStatusLedgerUpdatedAt >= ledgerUpdatedAt) {
@@ -68,7 +91,6 @@ function logLedgerRefresh(input) {
         ledgerName: particle_ledger_1.ParticleLedgerNames.deviceStatus,
         ...(input.ledgerUpdatedAt && { ledgerUpdatedAt: input.ledgerUpdatedAt }),
         result: input.result,
-        ...(input.reason && { reason: input.reason }),
         ...(input.httpStatus !== undefined && { httpStatus: input.httpStatus }),
         ...(input.httpStatus === undefined && input.errorKind && { errorKind: input.errorKind }),
     }));
@@ -78,6 +100,15 @@ function isLedgerRefreshEnabled() {
 }
 function isDeviceAllowListed(deviceId) {
     return parseAllowList(process.env.PARTICLE_LEDGER_REFRESH_DEVICE_IDS).has(deviceId);
+}
+function isEventNameEligible(eventName) {
+    return parseAllowList(process.env.PARTICLE_LEDGER_REFRESH_EVENT_NAMES).has(eventName);
+}
+function getRefreshMinIntervalMs() {
+    const seconds = Number.parseInt(process.env.PARTICLE_LEDGER_REFRESH_MIN_INTERVAL_SECONDS || '60', 10);
+    if (!Number.isFinite(seconds) || seconds < 0)
+        return 60_000;
+    return seconds * 1000;
 }
 function parseAllowList(value) {
     return new Set((value || '').split(',').map((entry) => entry.trim()).filter(Boolean));
@@ -106,5 +137,7 @@ function normalizeProductId(value) {
 }
 function clearDeviceProductIdCacheForTests() {
     productIdByDeviceId.clear();
+    lastRefreshAttemptAtByDeviceId.clear();
+    inFlightRefreshByDeviceId.clear();
 }
 //# sourceMappingURL=ledger-refresh.js.map
