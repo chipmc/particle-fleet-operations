@@ -1,0 +1,524 @@
+#!/usr/bin/env node
+'use strict';
+
+const { spawnSync } = require('child_process');
+const { URLSearchParams } = require('url');
+
+const DEFAULT_STACK_NAME = 'InfraStack';
+const DEFAULT_PROJECT_ID = 'generalized-core-counter';
+const DEFAULT_TIMELINE_HOURS = 24;
+const DEFAULT_TIMELINE_LIMIT = 25;
+const DEVICE_ID_PATTERN = /^[A-Za-z0-9._~-]{12,}$/;
+
+async function main() {
+  const args = process.argv.slice(2);
+  const command = args.shift();
+
+  if (!command || command === '--help' || command === '-h') {
+    printUsage();
+    return;
+  }
+
+  try {
+    const options = parseOptions(args);
+    const context = await loadContext(options);
+
+    if (command === 'devices') {
+      ensureNoSelector(options.positionals, 'devices');
+      const devices = await loadDevices(context);
+      await enrichDeviceNames(context, devices, { required: false });
+      if (devices.length === 0) fail('No devices found in DeviceCurrentState.');
+      outputDevices(devices, options.json);
+      return;
+    }
+
+    if (command === 'device') {
+      const selector = requireSelector(options.positionals, 'device');
+      const devices = await loadDevices(context);
+        const device = await resolveDeviceSelectorWithFallback(context, devices, selector);
+      outputDevice(device, options.json);
+      return;
+    }
+
+    if (command === 'timeline') {
+      const selector = requireSelector(options.positionals, 'timeline');
+      const devices = await loadDevices(context);
+      const device = await resolveDeviceSelectorWithFallback(context, devices, selector);
+      const timeline = await fetchTimeline(context, device.deviceId, options);
+      outputTimeline(device, timeline, options.json);
+      return;
+    }
+
+    fail(`Unknown command: ${command}`);
+  } catch (err) {
+    if (err instanceof OperatorError) {
+      console.error(`ERROR: ${err.message}`);
+      process.exit(err.exitCode);
+    }
+    console.error(`ERROR: ${err && err.message ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+function printUsage() {
+  console.log(`Usage:
+  ./tools/telemetry devices [--json]
+  ./tools/telemetry device <name-or-device-id> [--json]
+  ./tools/telemetry timeline <name-or-device-id> [--hours 24] [--limit 50] [--json]
+
+Options:
+  --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
+  --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
+  --profile <name>     AWS CLI profile
+  --region <region>    AWS region
+  --json               Emit JSON output
+  --hours <hours>      Timeline lookback window
+  --limit <count>      Timeline max events
+`);
+}
+
+function parseOptions(args) {
+  const options = {
+    stackName: process.env.TELEMETRY_STACK_NAME || DEFAULT_STACK_NAME,
+    projectId: process.env.TELEMETRY_PROJECT_ID || DEFAULT_PROJECT_ID,
+    json: false,
+    hours: DEFAULT_TIMELINE_HOURS,
+    limit: DEFAULT_TIMELINE_LIMIT,
+    awsProfile: process.env.AWS_PROFILE,
+    awsRegion: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION,
+    positionals: [],
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--json') {
+      options.json = true;
+    } else if (arg === '--stack') {
+      options.stackName = requireOptionValue(args, ++index, '--stack');
+    } else if (arg === '--project-id') {
+      options.projectId = requireOptionValue(args, ++index, '--project-id');
+    } else if (arg === '--profile') {
+      options.awsProfile = requireOptionValue(args, ++index, '--profile');
+    } else if (arg === '--region') {
+      options.awsRegion = requireOptionValue(args, ++index, '--region');
+    } else if (arg === '--hours') {
+      options.hours = parsePositiveInteger(requireOptionValue(args, ++index, '--hours'), '--hours');
+    } else if (arg === '--limit') {
+      options.limit = parsePositiveInteger(requireOptionValue(args, ++index, '--limit'), '--limit');
+    } else if (arg.startsWith('--')) {
+      fail(`Unknown option: ${arg}`);
+    } else {
+      options.positionals.push(arg);
+    }
+  }
+
+  return options;
+}
+
+function requireOptionValue(args, index, option) {
+  const value = args[index];
+  if (!value || value.startsWith('--')) fail(`${option} requires a value.`);
+  return value;
+}
+
+function parsePositiveInteger(value, option) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) fail(`${option} must be a positive integer.`);
+  return parsed;
+}
+
+function ensureNoSelector(positionals, command) {
+  if (positionals.length > 0) fail(`${command} does not accept a selector.`);
+}
+
+function requireSelector(positionals, command) {
+  if (positionals.length !== 1) fail(`${command} requires exactly one device name or device id.`);
+  return positionals[0];
+}
+
+async function loadContext(options) {
+  const stack = awsJson(options, ['cloudformation', 'describe-stacks', '--stack-name', options.stackName], {
+    notFoundMessage: `CloudFormation stack not found: ${options.stackName}`,
+  });
+  const stackDescription = stack.Stacks && stack.Stacks[0];
+  if (!stackDescription) fail(`CloudFormation stack not found: ${options.stackName}`);
+
+  const outputs = Object.fromEntries((stackDescription.Outputs || []).map(output => [output.OutputKey, output.OutputValue]));
+  const deviceCurrentStateTableName = outputs.DeviceCurrentStateTableName;
+  const logEventsTableName = outputs.LogEventsTableName;
+  const queryApiBaseUrl = outputs.QueryApiBaseUrl;
+  if (!deviceCurrentStateTableName) fail('Stack output DeviceCurrentStateTableName was not found.');
+  if (!logEventsTableName) fail('Stack output LogEventsTableName was not found.');
+  if (!queryApiBaseUrl) fail('Stack output QueryApiBaseUrl was not found.');
+
+  const resources = awsJson(options, ['cloudformation', 'describe-stack-resources', '--stack-name', options.stackName]);
+  const lambdaResource = (resources.StackResources || []).find(resource => resource.ResourceType === 'AWS::Lambda::Function');
+  if (!lambdaResource || !lambdaResource.PhysicalResourceId) {
+    fail('Could not discover telemetry Lambda function from the CloudFormation stack.');
+  }
+
+  const lambdaConfig = awsJson(options, ['lambda', 'get-function-configuration', '--function-name', lambdaResource.PhysicalResourceId]);
+  const lambdaEnv = (lambdaConfig.Environment && lambdaConfig.Environment.Variables) || {};
+
+  return {
+    options,
+    deviceCurrentStateTableName,
+    logEventsTableName,
+    queryApiBaseUrl: queryApiBaseUrl.replace(/\/+$/, ''),
+    webhookSecret: lambdaEnv.PARTICLE_WEBHOOK_SECRET || '',
+    particleAccessToken: lambdaEnv.PARTICLE_ACCESS_TOKEN || '',
+    particleApiBaseUrl: (lambdaEnv.PARTICLE_API_BASE_URL || 'https://api.particle.io').replace(/\/+$/, ''),
+    nameCache: new Map(),
+  };
+}
+
+async function loadDevices(context) {
+  const devices = [];
+  let exclusiveStartKey;
+
+  do {
+    const args = [
+      'dynamodb', 'scan',
+      '--table-name', context.deviceCurrentStateTableName,
+      '--filter-expression', 'projectId = :projectId',
+      '--expression-attribute-values', JSON.stringify({ ':projectId': { S: context.options.projectId } }),
+    ];
+    if (exclusiveStartKey) {
+      args.push('--exclusive-start-key', JSON.stringify(exclusiveStartKey));
+    }
+
+    const page = awsJson(context.options, args);
+    for (const item of page.Items || []) {
+      devices.push(unmarshall(item));
+    }
+    exclusiveStartKey = page.LastEvaluatedKey;
+  } while (exclusiveStartKey);
+
+  devices.sort((left, right) => compareIso(right.lastEventTime, left.lastEventTime));
+  return devices;
+}
+
+async function enrichDeviceNames(context, devices, { required }) {
+  const missing = devices.filter(device => !stringValue(device.deviceName));
+  if (missing.length === 0) return;
+
+  if (!context.particleAccessToken) {
+    if (required) {
+      fail('Device-name lookup requires PARTICLE_ACCESS_TOKEN in the deployed Lambda environment, but it is missing. Use a full device ID or configure the token.');
+    }
+    return;
+  }
+
+  await Promise.all(missing.map(async (device) => {
+    const resolved = await resolveParticleDeviceName(context, device.deviceId);
+    if (resolved) device.deviceName = resolved;
+  }));
+}
+
+async function resolveParticleDeviceName(context, deviceId) {
+  if (context.nameCache.has(deviceId)) return context.nameCache.get(deviceId);
+
+  const response = await fetch(`${context.particleApiBaseUrl}/v1/devices/${encodeURIComponent(deviceId)}`, {
+    headers: {
+      Authorization: `Bearer ${context.particleAccessToken}`,
+      Accept: 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    context.nameCache.set(deviceId, null);
+    return null;
+  }
+
+  const payload = await response.json();
+  const name = typeof payload.name === 'string' && payload.name.trim() ? payload.name.trim() : null;
+  context.nameCache.set(deviceId, name);
+  return name;
+}
+
+function resolveDeviceSelector(devices, selector) {
+  if (isDeviceId(selector)) {
+    const byId = devices.find(device => device.deviceId === selector);
+    if (!byId) fail(`Device selector not found: ${selector}`);
+    return byId;
+  }
+
+  const exact = devices.filter(device => stringValue(device.deviceName) === selector);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) failAmbiguous(selector, exact);
+
+  const partial = devices.filter(device => stringValue(device.deviceName).includes(selector));
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) failAmbiguous(selector, partial);
+
+  fail(`Device selector not found: ${selector}`);
+}
+
+async function resolveDeviceSelectorWithFallback(context, devices, selector) {
+  if (isDeviceId(selector)) return resolveDeviceSelector(devices, selector);
+
+  try {
+    return resolveDeviceSelector(devices, selector);
+  } catch (err) {
+    if (!(err instanceof OperatorError) || !err.message.startsWith('Device selector not found')) {
+      throw err;
+    }
+  }
+
+  if (!devices.some(device => !stringValue(device.deviceName))) {
+    fail(`Device selector not found: ${selector}`);
+  }
+
+  await enrichDeviceNames(context, devices, { required: true });
+  return resolveDeviceSelector(devices, selector);
+}
+
+async function fetchTimeline(context, deviceId, options) {
+  if (!context.webhookSecret) return queryTimelineFromDynamo(context, deviceId, options);
+
+  const params = new URLSearchParams({
+    hours: String(options.hours),
+    limit: String(options.limit),
+  });
+  const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${params.toString()}`;
+  const response = await fetch(url, {
+    headers: {
+      'x-particle-webhook-secret': context.webhookSecret,
+      Accept: 'application/json',
+    },
+  });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    fail(`Timeline API returned non-JSON response with HTTP ${response.status}.`);
+  }
+
+  if (!response.ok) {
+    fail(`Timeline API request failed with HTTP ${response.status}: ${payload.message || payload.error || 'unknown error'}`);
+  }
+  return payload;
+}
+
+function queryTimelineFromDynamo(context, deviceId, options) {
+  const end = new Date();
+  const start = new Date(end.getTime() - options.hours * 60 * 60 * 1000);
+  const page = awsJson(context.options, [
+    'dynamodb', 'query',
+    '--table-name', context.logEventsTableName,
+    '--key-condition-expression', 'deviceId = :deviceId AND eventTime BETWEEN :start AND :end',
+    '--expression-attribute-values', JSON.stringify({
+      ':deviceId': { S: deviceId },
+      ':start': { S: start.toISOString() },
+      ':end': { S: end.toISOString() },
+    }),
+    '--no-scan-index-forward',
+    '--limit', String(options.limit),
+  ]);
+  const records = (page.Items || []).map(unmarshall);
+
+  if (records.length === 0) fail(`No data found for device: ${deviceId}`);
+
+  return {
+    deviceId,
+    start: start.toISOString(),
+    end: end.toISOString(),
+    count: records.length,
+    events: records.map(formatTimelineRecord),
+    source: 'dynamodb',
+  };
+}
+
+function formatTimelineRecord(record) {
+  return {
+    eventTime: record.eventTime,
+    eventName: record.eventName,
+    ...(record.eventType && { eventType: record.eventType }),
+    ...(record.plane && { plane: record.plane }),
+    ...(record.severity && { severity: record.severity }),
+    ...(record.fwVersion && { fwVersion: record.fwVersion }),
+    ...(record.battery !== undefined && { battery: record.battery }),
+    ...(record.connectTime !== undefined && { connectTime: record.connectTime }),
+    ...(record.resetCount !== undefined && { resetCount: record.resetCount }),
+    ...(record.alertCount !== undefined && { alertCount: record.alertCount }),
+    ...(record.temperature !== undefined && { temperature: record.temperature }),
+    ...(record.occupancy !== undefined && { occupancy: record.occupancy }),
+    ...(record.dailyOccupancy !== undefined && { dailyOccupancy: record.dailyOccupancy }),
+    ...(record.s3Key && { s3Key: record.s3Key }),
+  };
+}
+
+function outputDevices(devices, json) {
+  const rows = devices.map(device => ({
+    NAME: displayName(device),
+    'DEVICE ID': safe(device.deviceId),
+    'LAST EVENT': safe(device.lastEventType || device.eventName),
+    'LAST SEEN': safeIso(device.lastEventTime),
+    FIRMWARE: safe(device.fwVersion),
+    'LEDGER UPDATED': safeIso(device.deviceStatusLedgerUpdatedAt),
+  }));
+
+  if (json) {
+    console.log(JSON.stringify(devices, null, 2));
+  } else {
+    printTable(rows, ['NAME', 'DEVICE ID', 'LAST EVENT', 'LAST SEEN', 'FIRMWARE', 'LEDGER UPDATED']);
+  }
+}
+
+function outputDevice(device, json) {
+  if (json) {
+    console.log(JSON.stringify(device, null, 2));
+    return;
+  }
+
+  const rows = [
+    ['Name', displayName(device)],
+    ['Device ID', safe(device.deviceId)],
+    ['Project', safe(device.projectId)],
+    ['Last event', safe(device.lastEventType)],
+    ['Last seen', safeIso(device.lastEventTime)],
+    ['Last ingest', safeIso(device.lastIngestTime)],
+    ['Firmware', safe(device.fwVersion)],
+    ['Ledger updated', safeIso(device.deviceStatusLedgerUpdatedAt)],
+    ['Ledger fetched', safeIso(device.deviceStatusLedgerFetchedAt)],
+    ['Ledger size bytes', safe(device.deviceStatusLedgerSizeBytes)],
+    ['Battery', safe(device.battery)],
+    ['Occupancy', safe(device.occupancy)],
+    ['Daily occupancy', safe(device.dailyOccupancy)],
+    ['Temperature', safe(device.temperature)],
+  ];
+
+  const width = Math.max(...rows.map(([label]) => label.length));
+  for (const [label, value] of rows) {
+    console.log(`${label.padEnd(width)}  ${value}`);
+  }
+}
+
+function outputTimeline(device, timeline, json) {
+  if (json) {
+    console.log(JSON.stringify(timeline, null, 2));
+    return;
+  }
+
+  console.log(`Device: ${displayName(device)} (${device.deviceId})`);
+  console.log(`Window: ${safeIso(timeline.start)} to ${safeIso(timeline.end)}`);
+  console.log(`Events: ${timeline.count}`);
+  console.log('');
+
+  const rows = (timeline.events || []).map(event => ({
+    TIME: safeIso(event.eventTime),
+    EVENT: safe(event.eventName),
+    TYPE: safe(event.eventType),
+    PLANE: safe(event.plane),
+    FIRMWARE: safe(event.fwVersion),
+  }));
+  printTable(rows, ['TIME', 'EVENT', 'TYPE', 'PLANE', 'FIRMWARE']);
+}
+
+function printTable(rows, columns) {
+  if (rows.length === 0) {
+    console.log('No rows.');
+    return;
+  }
+
+  const widths = Object.fromEntries(columns.map(column => [
+    column,
+    Math.max(column.length, ...rows.map(row => String(row[column] || '-').length)),
+  ]));
+
+  console.log(columns.map(column => column.padEnd(widths[column])).join(' | '));
+  console.log(columns.map(column => '-'.repeat(widths[column])).join('-|-'));
+  for (const row of rows) {
+    console.log(columns.map(column => String(row[column] || '-').padEnd(widths[column])).join(' | '));
+  }
+}
+
+function awsJson(options, args, settings = {}) {
+  const awsArgs = [...args, '--output', 'json'];
+  if (options.awsProfile) awsArgs.push('--profile', options.awsProfile);
+  if (options.awsRegion) awsArgs.push('--region', options.awsRegion);
+
+  const result = spawnSync('aws', awsArgs, { encoding: 'utf8' });
+  if (result.error && result.error.code === 'ENOENT') fail('AWS CLI was not found. Install/configure awscli before using this tool.');
+  if (result.status !== 0) {
+    const stderr = (result.stderr || '').trim();
+    if (settings.notFoundMessage && /does not exist|not found|ValidationError/i.test(stderr)) fail(settings.notFoundMessage);
+    if (/NoRegion|must specify a region/i.test(stderr)) {
+      fail('AWS region is not configured. Set AWS_REGION/AWS_DEFAULT_REGION or pass --region <region>.');
+    }
+    if (/Unable to locate credentials|could not be found|NoCredentials|ExpiredToken|AccessDenied/i.test(stderr)) {
+      fail(`AWS credentials unavailable or unauthorized: ${stderr}`);
+    }
+    fail(`AWS CLI command failed: ${stderr || args.join(' ')}`);
+  }
+
+  try {
+    return JSON.parse(result.stdout || '{}');
+  } catch {
+    fail(`AWS CLI returned invalid JSON for: aws ${args.join(' ')}`);
+  }
+}
+
+function unmarshall(attributeMap) {
+  return Object.fromEntries(Object.entries(attributeMap).map(([key, value]) => [key, unmarshallValue(value)]));
+}
+
+function unmarshallValue(value) {
+  if (value.S !== undefined) return value.S;
+  if (value.N !== undefined) return Number(value.N);
+  if (value.BOOL !== undefined) return value.BOOL;
+  if (value.NULL !== undefined) return null;
+  if (value.M !== undefined) return unmarshall(value.M);
+  if (value.L !== undefined) return value.L.map(unmarshallValue);
+  if (value.SS !== undefined) return value.SS;
+  if (value.NS !== undefined) return value.NS.map(Number);
+  return undefined;
+}
+
+function isDeviceId(value) {
+  return DEVICE_ID_PATTERN.test(value);
+}
+
+function failAmbiguous(selector, matches) {
+  console.error(`ERROR: Ambiguous device selector: ${selector}`);
+  console.error('Matches:');
+  for (const device of matches) {
+    console.error(`  ${displayName(device)}  ${device.deviceId}`);
+  }
+  process.exit(2);
+}
+
+function fail(message) {
+  throw new OperatorError(message);
+}
+
+class OperatorError extends Error {
+  constructor(message, exitCode = 1) {
+    super(message);
+    this.exitCode = exitCode;
+  }
+}
+
+function displayName(device) {
+  return stringValue(device.deviceName) || '<unknown>';
+}
+
+function stringValue(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+function safe(value) {
+  if (value === undefined || value === null || value === '') return '-';
+  return String(value);
+}
+
+function safeIso(value) {
+  return safe(value);
+}
+
+function compareIso(left, right) {
+  return new Date(left || 0).getTime() - new Date(right || 0).getTime();
+}
+
+main();

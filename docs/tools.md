@@ -2,6 +2,40 @@
 
 Local inspection and diagnostic tools for particle-log-monitoring.
 
+## Telemetry Operator CLI
+
+### Purpose
+
+Use the deployed telemetry stack without memorizing DynamoDB table names, API Gateway URLs, or Particle device IDs.
+
+### Prerequisites
+
+- Node.js 18 or newer
+- AWS CLI authenticated for the account and region containing `InfraStack`
+- Deployed `InfraStack` with `DeviceCurrentStateTableName` and `QueryApiBaseUrl` outputs
+
+If your AWS CLI profile does not have a default region, pass `--region <region>` or set `AWS_REGION`/`AWS_DEFAULT_REGION`.
+
+### Quick Start
+
+```bash
+cd ~/Documents/Maker/AWS/particle-log-monitoring
+
+./tools/telemetry devices
+./tools/telemetry device e00fce68399ee6244a963935
+./tools/telemetry timeline e00fce68399ee6244a963935 --hours 24
+```
+
+### Commands
+
+```bash
+./tools/telemetry devices
+./tools/telemetry device <name-or-device-id>
+./tools/telemetry timeline <name-or-device-id> --hours 24 --limit 50
+```
+
+All commands support `--json`. Device selectors accept a full Particle device ID, exact device name, or unambiguous partial device name. The tool discovers deployed resources from CloudFormation and uses the existing query API for timeline reads.
+
 ## Device Timeline Inspector
 
 ### Purpose
