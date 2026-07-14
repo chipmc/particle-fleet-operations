@@ -31,6 +31,34 @@ cd ~/Documents/Maker/AWS/particle-log-monitoring
 ./tools/telemetry watch P2-NewCode-Dev
 ```
 
+### Installation
+
+Install the operator CLI once from the repository root:
+
+```bash
+cd ~/Documents/Maker/AWS/particle-log-monitoring
+./tools/install
+```
+
+The installer creates or updates these symlinks:
+
+```text
+/usr/local/bin/telemetry -> <repo>/tools/telemetry
+/usr/local/bin/fleetops  -> <repo>/tools/telemetry
+```
+
+After installation, operators can run the CLI from any directory:
+
+```bash
+telemetry --help
+telemetry fleet
+telemetry watch Boron-Dev-09
+telemetry timeline Boron-Dev-09
+fleetops fleet
+```
+
+If `/usr/local/bin` is not writable, rerun the installer with `sudo ./tools/install`. The installer does not attempt privilege escalation automatically and refuses to overwrite an existing non-symlink command. To remove the installed commands, run `./tools/uninstall` from any directory with write access to `/usr/local/bin`; use `sudo ./tools/uninstall` when needed.
+
 ### Commands
 
 ```bash
@@ -52,6 +80,7 @@ All data commands support `--json`. Device selectors accept a full Particle devi
 ```bash
 ./tools/telemetry fleet
 ./tools/telemetry fleet --product-id 42131
+./tools/telemetry fleet --activity-limit 5
 ./tools/telemetry fleet --json
 ./tools/telemetry fleet --verbose
 ```
@@ -69,14 +98,57 @@ The confirmation command reports only whether a token is set; it does not expose
 
 The text report includes:
 - Fleet header
-- Coverage counts
-- Connected counts
-- Firmware distribution
-- Device OS distribution
-- Device table
+- Compact overview with Coverage, Cloud, Firmware, and Device OS shown side by side in normal-width terminals
+- Devices Requiring Attention section with factual per-device observations
+- Device table with compact evidence columns: `CS` for current state, `RT` for runtime status, and `DD` for device data
+- Recent Activity section derived from existing fleet summary/current-state evidence
+
+Compact overview example:
+
+```text
+Fleet Summary: Product 42131
+Schema: fleet-summary.v1
+Generated: 2026-07-14T12:01:38.528Z
+
+COVERAGE                  CLOUD             FIRMWARE          DEVICE OS
+Inventory       6 / 6     Online       5    20          5     6.4.1       6
+Current State   5 / 6     Offline      1    <unknown>   1
+Runtime Status  4 / 6     Unknown      0
+Device Data     Not Enabled
+```
+
+For narrow terminals, the overview falls back to stacked sections so values remain readable and are not silently truncated.
+
+Default text output uses relative times such as `2 min ago` and labels the activity column `Last Heard`. Use `--verbose` to show ISO timestamps and additional per-device metadata.
+
+When no devices have produced Device Data, the text coverage line reports `Device Data: Not Enabled` and Device Data is not listed as an operator attention item. If any device begins publishing Device Data later, the report automatically returns to numeric Device Data coverage and can show per-device Device Data observations.
+
+Runtime table values are evidence labels only: `Observed`, `Pending`, or `Unknown`. Fleet Summary does not infer health.
+
+Terminology:
+- `CS`: Current State. Indicates that a `DeviceCurrentState` projection exists for the device.
+- `RT`: Runtime Status. Indicates that a `device-status` Ledger snapshot has been projected.
+- `DD`: Device Data. Indicates that a `device-data` Ledger snapshot has been projected.
+- `Cloud`: Point-in-time Particle Cloud connection status. `Online` or `Offline` is not equivalent to device health because sleeping devices may normally be offline.
+- `Last Heard`: The most recent time Particle Cloud heard from the device.
+- `Firmware`: The application firmware version reported by Particle.
+- `Device OS`: The Particle Device OS version reported by Particle.
+- `Runtime`: Human-readable presence state for the runtime-status projection: `Observed`, `Pending`, or `Unknown`.
+- `Coverage`: Evidence completeness across the Particle product inventory.
+- `Attention`: Factual observations that may warrant operator review. This is not a derived health classification.
+- `Recent Activity`: Recent fleet observations, newest first.
+
+Product inventory is authoritative for fleet membership. `CS`, `RT`, and `DD` are evidence-presence indicators, not health scores. `Device Data: Not Enabled` means no device in the scoped product currently has a `device-data` projection.
+
+Devices Requiring Attention groups factual observations by device. For an online device that has not reported telemetry yet, the section says `Cloud connected` and `Waiting for first telemetry` instead of listing low-level missing projections. For devices with existing telemetry but missing runtime projection evidence, observations use factual wording such as `Last heard 6 hours ago` and `Runtime status not yet observed`. An empty section means no observations apply in the current snapshot.
+
+Recent Activity is newest-first and intentionally lightweight. It is derived from the existing Fleet Summary object: devices with Current State appear as `reported`, and online inventory-only devices with Particle last-heard time appear as `connected to Particle Cloud`. Use `--activity-limit <n>` to control the row count. No additional backend APIs are used.
+
+Interactive terminal output may use ANSI color for compact status cues. Color is automatically disabled for redirected output, `--json`, or when `NO_COLOR` is set.
 
 Options:
 - `--product-id <id>`: Particle product ID. Default is `42131`.
+- `--activity-limit <n>`: Recent Activity row limit. Default is `10`; use `0` to hide activity rows.
 - `--json`: Emit stable `fleet-summary.v1` JSON.
 - `--verbose`: Include additional per-device metadata, such as Particle last-heard time, Ledger update time, and last event type.
 
@@ -92,6 +164,38 @@ Coverage in `fleet-summary.v1` JSON is reported with stable keys:
     "runtimeStatus": 10,
     "deviceData": 9
   }
+}
+```
+
+JSON may also include an optional `attention` array with structured operator observations:
+
+```json
+{
+  "attention": [
+    {
+      "deviceId": "e00fce68399ee6244a963935",
+      "deviceName": "SAMIT-TRAIL02",
+      "observations": [
+        "Last heard 6 hours ago",
+        "Runtime status not yet observed"
+      ]
+    }
+  ]
+}
+```
+
+JSON may also include additive `recentActivity` rows:
+
+```json
+{
+  "recentActivity": [
+    {
+      "time": "2026-07-14T11:58:00.000Z",
+      "deviceId": "e00fce68399ee6244a963935",
+      "deviceName": "Morrisville-Tennis-MAFC-1",
+      "summary": "reported"
+    }
+  ]
 }
 ```
 

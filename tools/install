@@ -1,0 +1,83 @@
+#!/usr/bin/env sh
+set -eu
+
+BIN_DIR="${TELEMETRY_BIN_DIR:-/usr/local/bin}"
+REPO_ROOT="$(pwd)"
+TELEMETRY_SOURCE="${REPO_ROOT}/tools/telemetry"
+COMMANDS="telemetry fleetops"
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+require_repo_root() {
+  if [ ! -f "${REPO_ROOT}/README.md" ] || [ ! -d "${REPO_ROOT}/tools" ] || [ ! -f "${TELEMETRY_SOURCE}" ]; then
+    fail "Run this installer from the particle-log-monitoring repository root."
+  fi
+
+  if [ ! -x "${TELEMETRY_SOURCE}" ]; then
+    fail "tools/telemetry exists but is not executable."
+  fi
+}
+
+require_writable_bin_dir() {
+  if [ ! -d "${BIN_DIR}" ]; then
+    if ! mkdir -p "${BIN_DIR}" 2>/dev/null; then
+      printf '%s\n' "${BIN_DIR} does not exist or is not writable."
+      printf '%s\n' "Please rerun with:"
+      printf '\n%s\n' "sudo ./tools/install"
+      exit 1
+    fi
+  fi
+
+  if [ ! -w "${BIN_DIR}" ]; then
+    printf '%s\n' "${BIN_DIR} is not writable."
+    printf '%s\n' "Please rerun with:"
+    printf '\n%s\n' "sudo ./tools/install"
+    exit 1
+  fi
+}
+
+install_command() {
+  command_name="$1"
+  target="${BIN_DIR}/${command_name}"
+  existed="no"
+
+  if [ -e "${target}" ] || [ -L "${target}" ]; then
+    if [ ! -L "${target}" ]; then
+      fail "${target} already exists and is not a symlink. Refusing to overwrite it."
+    fi
+    existed="yes"
+  fi
+
+  if [ "${existed}" = "yes" ]; then
+    rm "${target}"
+  fi
+
+  ln -s "${TELEMETRY_SOURCE}" "${target}"
+
+  if [ "${existed}" = "yes" ]; then
+    printf '%s\n' "${command_name} already installed."
+    printf '%s\n' "Updated symlink:"
+  else
+    printf '%s\n' "Installed ${command_name}:"
+  fi
+
+  printf '\n%s\n' "${target}"
+  printf '%s\n' "    ->"
+  printf '%s\n\n' "${TELEMETRY_SOURCE}"
+}
+
+require_repo_root
+require_writable_bin_dir
+
+for command_name in ${COMMANDS}; do
+  install_command "${command_name}"
+done
+
+printf '%s\n' "Installation successful."
+printf '\n%s\n\n' "Try:"
+printf '%s\n' "telemetry --help"
+printf '%s\n' "telemetry fleet"
+printf '%s\n' "telemetry watch Boron-Dev-09"

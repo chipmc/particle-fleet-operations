@@ -1,0 +1,49 @@
+#!/usr/bin/env sh
+set -eu
+
+BIN_DIR="${TELEMETRY_BIN_DIR:-/usr/local/bin}"
+COMMANDS="telemetry fleetops"
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+require_writable_bin_dir() {
+  if [ ! -d "${BIN_DIR}" ]; then
+    printf '%s\n' "Nothing to uninstall. ${BIN_DIR} does not exist."
+    exit 0
+  fi
+
+  if [ ! -w "${BIN_DIR}" ]; then
+    printf '%s\n' "${BIN_DIR} is not writable."
+    printf '%s\n' "Please rerun with:"
+    printf '\n%s\n' "sudo ./tools/uninstall"
+    exit 1
+  fi
+}
+
+uninstall_command() {
+  command_name="$1"
+  target="${BIN_DIR}/${command_name}"
+
+  if [ ! -e "${target}" ] && [ ! -L "${target}" ]; then
+    printf '%s\n' "${target} is not installed."
+    return
+  fi
+
+  if [ ! -L "${target}" ]; then
+    fail "${target} exists and is not a symlink. Refusing to remove it."
+  fi
+
+  rm "${target}"
+  printf '%s\n' "Removed ${target}."
+}
+
+require_writable_bin_dir
+
+for command_name in ${COMMANDS}; do
+  uninstall_command "${command_name}"
+done
+
+printf '%s\n' "Uninstall complete."
