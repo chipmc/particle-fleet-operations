@@ -134,6 +134,7 @@ export interface DynamoIndexRecord {
     dailyOccupancy?: number;
     temperature?: number;
     fwVersion?: string;
+    serialLogLine?: string;
     rawRef?: {
         s3Key: string;
     };
@@ -187,6 +188,7 @@ export interface QueryEvent {
 export interface TimelineEvent {
     eventTime: string;
     eventName: string;
+    eventId?: string;
     eventType?: string;
     plane?: string;
     battery?: number;
@@ -199,6 +201,8 @@ export interface TimelineEvent {
     severity?: string;
     s3Key: string;
     fwVersion?: string;
+    serialLogLine?: string;
+    logLine?: string;
 }
 export interface TimelineResponse {
     deviceId: string;

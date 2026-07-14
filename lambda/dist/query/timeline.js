@@ -68,6 +68,8 @@ function formatTimelineEvents(records) {
             s3Key: record.s3Key,
         };
         // Add normalized Phase 2A fields if present
+        if (record.eventId)
+            event.eventId = record.eventId;
         if (record.eventType)
             event.eventType = record.eventType;
         if (record.plane)
@@ -91,6 +93,10 @@ function formatTimelineEvents(records) {
             event.occupancy = record.occupancy;
         if (record.dailyOccupancy !== undefined)
             event.dailyOccupancy = record.dailyOccupancy;
+        if (record.serialLogLine)
+            event.serialLogLine = record.serialLogLine;
+        if (record.logLine)
+            event.logLine = record.logLine;
         return event;
     });
 }

@@ -11,6 +11,7 @@
 import { handler } from '../handler';
 import { storeRawEvent } from '../storage/s3';
 import { indexEvent } from '../storage/dynamo';
+import { deviceHasEvents, queryDeviceEvents } from '../storage/dynamo-read';
 import { InboundEvent, QueryEvent } from '../types';
 
 // Mock AWS SDK clients
@@ -20,6 +21,8 @@ jest.mock('../storage/dynamo-read');
 
 const mockStoreRawEvent = storeRawEvent as jest.MockedFunction<typeof storeRawEvent>;
 const mockIndexEvent = indexEvent as jest.MockedFunction<typeof indexEvent>;
+const mockDeviceHasEvents = deviceHasEvents as jest.MockedFunction<typeof deviceHasEvents>;
+const mockQueryDeviceEvents = queryDeviceEvents as jest.MockedFunction<typeof queryDeviceEvents>;
 
 describe('Lambda Handler', () => {
   const originalEnv = process.env;
@@ -416,6 +419,11 @@ describe('Lambda Handler', () => {
     });
 
     describe('GET /device/{deviceId}/timeline', () => {
+      beforeEach(() => {
+        mockDeviceHasEvents.mockResolvedValue(true);
+        mockQueryDeviceEvents.mockResolvedValue([]);
+      });
+
       it('should route GET to query handler without requiring body', async () => {
         const event = createHttpApiV2Event(
           'GET',
@@ -451,6 +459,41 @@ describe('Lambda Handler', () => {
         // Verify ingestion mocks were never called
         expect(mockStoreRawEvent).not.toHaveBeenCalled();
         expect(mockIndexEvent).not.toHaveBeenCalled();
+      });
+
+      it('should include stable event IDs and serial log lines in timeline output', async () => {
+        mockQueryDeviceEvents.mockResolvedValue([{
+          deviceId: 'e00fce6841443bcc0f3178e4',
+          eventTime: '2026-07-14T08:00:04.696Z',
+          eventName: 'serialLog',
+          receivedAt: '2026-07-14T08:00:04.700Z',
+          s3Key: 'particle-events/serial/a.json',
+          dataType: 'string',
+          eventId: 'event-serial-1',
+          eventType: 'serial.log',
+          plane: 'serial',
+          serialLogLine: 'Connecting to Particle Cloud',
+          logLine: 'Connecting to Particle Cloud',
+        }]);
+        const event = createHttpApiV2Event(
+          'GET',
+          '/device/e00fce6841443bcc0f3178e4/timeline',
+          'GET /device/{deviceId}/timeline',
+          { deviceId: 'e00fce6841443bcc0f3178e4' },
+          { hours: '24', limit: '10' },
+          undefined,
+          { 'x-particle-webhook-secret': 'test-secret-123' }
+        );
+
+        const response = await handler(event);
+        const body = JSON.parse(response.body);
+
+        expect(response.statusCode).toBe(200);
+        expect(body.events[0]).toMatchObject({
+          eventId: 'event-serial-1',
+          serialLogLine: 'Connecting to Particle Cloud',
+          logLine: 'Connecting to Particle Cloud',
+        });
       });
     });
 

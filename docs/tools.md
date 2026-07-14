@@ -24,6 +24,7 @@ cd ~/Documents/Maker/AWS/particle-log-monitoring
 ./tools/telemetry devices
 ./tools/telemetry device e00fce68399ee6244a963935
 ./tools/telemetry timeline e00fce68399ee6244a963935 --hours 24
+./tools/telemetry watch P2-NewCode-Dev
 ```
 
 ### Commands
@@ -32,9 +33,58 @@ cd ~/Documents/Maker/AWS/particle-log-monitoring
 ./tools/telemetry devices
 ./tools/telemetry device <name-or-device-id>
 ./tools/telemetry timeline <name-or-device-id> --hours 24 --limit 50
+./tools/telemetry watch <device-selector>
 ```
 
 All commands support `--json`. Device selectors accept a full Particle device ID, exact device name, or unambiguous partial device name. The tool discovers deployed resources from CloudFormation and uses the existing query API for timeline reads.
+
+### Watch Cheat Sheet
+
+```bash
+./tools/telemetry watch P2-NewCode-Dev
+./tools/telemetry watch P2-NewCode-Dev --since 5m
+./tools/telemetry watch P2-NewCode-Dev --interval 3
+./tools/telemetry watch P2-NewCode-Dev --serial-only
+./tools/telemetry watch P2-NewCode-Dev --types serial,lifecycle,runtime
+./tools/telemetry watch P2-NewCode-Dev --exclude serial
+./tools/telemetry watch P2-NewCode-Dev --json
+./tools/telemetry watch P2-NewCode-Dev --raw
+```
+
+`watch` resolves a device name or device ID once at startup, then polls the Timeline API and `DeviceCurrentState`. It displays new activity oldest-first, suppresses duplicates, automatically retries transient API failures, and continues until Ctrl-C. Serial output is near-live cloud-forwarded serial data, not a direct USB serial connection.
+
+Options:
+- `--interval <seconds>`: Polling interval. Default is the implemented V1 default. Minimum one second.
+- `--since <duration>`: Show recent history before beginning the live watch, for example `5m`.
+- `--types <csv>`: Include only selected categories.
+- `--exclude <csv>`: Exclude selected categories.
+- `--serial-only`: Display only cloud-forwarded serial log events.
+- `--json`: Emit machine-readable JSON lines.
+- `--raw` / `--full`: Do not truncate long event or serial-log content.
+
+Categories:
+- `SERIAL`: Cloud-forwarded serial logs.
+- `TELEMETRY`: Normal device telemetry and published measurements.
+- `OCCUPANCY`: Occupancy/count changes where classified separately.
+- `LIFECYCLE`: Particle webhook event named `status`, including reset-related lifecycle information.
+- `RUNTIME`: `device-status` Ledger snapshot changes.
+- `DATA`: `device-data` Ledger snapshot changes.
+- `EVENT`: Other device events.
+- `ERROR`: Error or failure activity.
+
+Firmware development workflow:
+
+```bash
+# Terminal 1
+./tools/telemetry watch P2-NewCode-Dev --since 2m
+
+# Terminal 2
+# Particle firmware build/flash and local development commands
+```
+
+This avoids repeatedly issuing `timeline` during firmware testing while still using the deployed telemetry pipeline.
+
+Planned enhancement: `watch` and `timeline` will later share optional terminal color highlighting, respecting non-TTY output and `NO_COLOR`.
 
 ## Device Timeline Inspector
 

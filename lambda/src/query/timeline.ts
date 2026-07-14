@@ -85,6 +85,7 @@ function formatTimelineEvents(records: DynamoIndexRecord[]): TimelineEvent[] {
     };
 
     // Add normalized Phase 2A fields if present
+    if (record.eventId) event.eventId = record.eventId;
     if (record.eventType) event.eventType = record.eventType;
     if (record.plane) event.plane = record.plane;
     if (record.severity) event.severity = record.severity;
@@ -98,6 +99,8 @@ function formatTimelineEvents(records: DynamoIndexRecord[]): TimelineEvent[] {
     if (record.temperature !== undefined) event.temperature = record.temperature;
     if (record.occupancy !== undefined) event.occupancy = record.occupancy;
     if (record.dailyOccupancy !== undefined) event.dailyOccupancy = record.dailyOccupancy;
+    if (record.serialLogLine) event.serialLogLine = record.serialLogLine;
+    if (record.logLine) event.logLine = record.logLine;
 
     return event;
   });

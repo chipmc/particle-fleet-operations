@@ -8,6 +8,10 @@ const DEFAULT_STACK_NAME = 'InfraStack';
 const DEFAULT_PROJECT_ID = 'generalized-core-counter';
 const DEFAULT_TIMELINE_HOURS = 24;
 const DEFAULT_TIMELINE_LIMIT = 25;
+const DEFAULT_WATCH_INTERVAL_SECONDS = 3;
+const WATCH_TIMELINE_LIMIT = 1000;
+const WATCH_CURSOR_LOOKBACK_MS = 5 * 60 * 1000;
+const WATCH_LINE_MAX_LENGTH = 160;
 const DEVICE_ID_PATTERN = /^[a-fA-F0-9]{24}$/;
 
 async function main() {
@@ -48,6 +52,14 @@ async function main() {
       return;
     }
 
+    if (command === 'watch') {
+      const selector = requireSelector(options.positionals, 'watch');
+      const devices = await loadDeviceInventory(context);
+      const device = resolveDeviceSelector(devices, selector, context);
+      await startWatch(context, device, options);
+      return;
+    }
+
     fail(`Unknown command: ${command}`);
   } catch (err) {
     if (err instanceof OperatorError) {
@@ -64,6 +76,7 @@ function printUsage() {
   ./tools/telemetry devices [--json]
   ./tools/telemetry device <name-or-device-id> [--json]
   ./tools/telemetry timeline <name-or-device-id> [--hours 24] [--limit 50] [--json]
+  ./tools/telemetry watch <name-or-device-id> [--interval 3] [--since 5m] [--serial-only] [--json]
 
 Options:
   --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
@@ -73,6 +86,12 @@ Options:
   --json               Emit JSON output
   --hours <hours>      Timeline lookback window
   --limit <count>      Timeline max events
+  --interval <seconds> Watch polling interval, minimum 1 (default: ${DEFAULT_WATCH_INTERVAL_SECONDS})
+  --since <duration>   Watch initial history window, e.g. 30s, 5m, 1h
+  --types <csv>        Watch categories to include
+  --exclude <csv>      Watch categories to exclude
+  --serial-only        Watch SERIAL lines only
+  --raw, --full        Do not truncate watch summaries
 `);
 }
 
@@ -83,6 +102,12 @@ function parseOptions(args) {
     json: false,
     hours: DEFAULT_TIMELINE_HOURS,
     limit: DEFAULT_TIMELINE_LIMIT,
+    intervalSeconds: DEFAULT_WATCH_INTERVAL_SECONDS,
+    sinceMs: 0,
+    includeTypes: null,
+    excludeTypes: new Set(),
+    serialOnly: false,
+    raw: false,
     awsProfile: process.env.AWS_PROFILE,
     awsRegion: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION,
     positionals: [],
@@ -104,6 +129,19 @@ function parseOptions(args) {
       options.hours = parsePositiveInteger(requireOptionValue(args, ++index, '--hours'), '--hours');
     } else if (arg === '--limit') {
       options.limit = parsePositiveInteger(requireOptionValue(args, ++index, '--limit'), '--limit');
+    } else if (arg === '--interval') {
+      options.intervalSeconds = parseWatchInterval(requireOptionValue(args, ++index, '--interval'));
+    } else if (arg === '--since') {
+      options.sinceMs = parseDurationMs(requireOptionValue(args, ++index, '--since'), '--since');
+    } else if (arg === '--types') {
+      options.includeTypes = parseCategorySet(requireOptionValue(args, ++index, '--types'), '--types');
+    } else if (arg === '--exclude') {
+      options.excludeTypes = parseCategorySet(requireOptionValue(args, ++index, '--exclude'), '--exclude');
+    } else if (arg === '--serial-only') {
+      options.serialOnly = true;
+      options.includeTypes = new Set(['SERIAL']);
+    } else if (arg === '--raw' || arg === '--full') {
+      options.raw = true;
     } else if (arg.startsWith('--')) {
       fail(`Unknown option: ${arg}`);
     } else {
@@ -124,6 +162,28 @@ function parsePositiveInteger(value, option) {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) fail(`${option} must be a positive integer.`);
   return parsed;
+}
+
+function parseWatchInterval(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) fail('--interval must be at least 1 second.');
+  return parsed;
+}
+
+function parseDurationMs(value, option) {
+  const match = String(value).trim().match(/^(\d+(?:\.\d+)?)(s|m|h)?$/i);
+  if (!match) fail(`${option} must be a duration such as 30s, 5m, or 1h.`);
+
+  const amount = Number(match[1]);
+  const unit = (match[2] || 's').toLowerCase();
+  const multiplier = unit === 'h' ? 60 * 60 * 1000 : unit === 'm' ? 60 * 1000 : 1000;
+  return Math.max(0, Math.floor(amount * multiplier));
+}
+
+function parseCategorySet(value, option) {
+  const categories = new Set(String(value).split(',').map(entry => entry.trim().toUpperCase()).filter(Boolean));
+  if (categories.size === 0) fail(`${option} must include at least one category.`);
+  return categories;
 }
 
 function ensureNoSelector(positionals, command) {
@@ -293,8 +353,8 @@ async function fetchTimeline(context, deviceId, options) {
 }
 
 function queryTimelineFromDynamo(context, deviceId, options) {
-  const end = new Date();
-  const start = new Date(end.getTime() - options.hours * 60 * 60 * 1000);
+  const end = options.end ? new Date(options.end) : new Date();
+  const start = options.start ? new Date(options.start) : new Date(end.getTime() - options.hours * 60 * 60 * 1000);
   const page = awsJson(context.options, [
     'dynamodb', 'query',
     '--table-name', context.logEventsTableName,
@@ -309,7 +369,7 @@ function queryTimelineFromDynamo(context, deviceId, options) {
   ]);
   const records = (page.Items || []).map(unmarshall);
 
-  if (records.length === 0) fail(`No data found for device: ${deviceId}`);
+  if (records.length === 0 && !options.allowEmpty) fail(`No data found for device: ${deviceId}`);
 
   return {
     deviceId,
@@ -325,6 +385,7 @@ function formatTimelineRecord(record) {
   return {
     eventTime: record.eventTime,
     eventName: record.eventName,
+    ...(record.eventId && { eventId: record.eventId }),
     ...(record.eventType && { eventType: record.eventType }),
     ...(record.plane && { plane: record.plane }),
     ...(record.severity && { severity: record.severity }),
@@ -336,6 +397,8 @@ function formatTimelineRecord(record) {
     ...(record.temperature !== undefined && { temperature: record.temperature }),
     ...(record.occupancy !== undefined && { occupancy: record.occupancy }),
     ...(record.dailyOccupancy !== undefined && { dailyOccupancy: record.dailyOccupancy }),
+    ...(record.serialLogLine && { serialLogLine: record.serialLogLine }),
+    ...(record.logLine && { logLine: record.logLine }),
     ...(record.s3Key && { s3Key: record.s3Key }),
   };
 }
@@ -399,12 +462,391 @@ function outputTimeline(device, timeline, json) {
 
   const rows = (timeline.events || []).map(event => ({
     TIME: safeIso(event.eventTime),
+    CATEGORY: classifyTimelineEvent(event).category,
     EVENT: safe(event.eventName),
     TYPE: safe(event.eventType),
     PLANE: safe(event.plane),
     FIRMWARE: safe(event.fwVersion),
   }));
-  printTable(rows, ['TIME', 'EVENT', 'TYPE', 'PLANE', 'FIRMWARE']);
+  printTable(rows, ['TIME', 'CATEGORY', 'EVENT', 'TYPE', 'PLANE', 'FIRMWARE']);
+}
+
+async function startWatch(context, device, options) {
+  if (!options.json) {
+    console.log(`Watching ${displayName(device)} (${device.deviceId})`);
+    console.log('Press Ctrl-C to stop.');
+    console.log('');
+  }
+
+  const controller = new AbortController();
+  const onSigint = () => controller.abort();
+  process.once('SIGINT', onSigint);
+
+  try {
+    await runWatchLoop(context, device, options, {
+      signal: controller.signal,
+      write: line => console.log(line),
+      warn: message => console.error(message),
+      sleep,
+      now: () => new Date(),
+    });
+  } finally {
+    process.removeListener('SIGINT', onSigint);
+    if (!options.json) console.log('\nStopped.');
+  }
+}
+
+async function runWatchLoop(context, device, options, deps = {}) {
+  const state = createWatchState(options, deps.now ? deps.now() : new Date());
+  const write = deps.write || (line => console.log(line));
+  const warn = deps.warn || (message => console.error(message));
+  const sleepFn = deps.sleep || sleep;
+  const nowFn = deps.now || (() => new Date());
+  const fetchTimelineFn = deps.fetchTimeline || fetchWatchTimeline;
+  const loadCurrentStateFn = deps.loadCurrentState || loadDeviceCurrentState;
+  const signal = deps.signal;
+  let consecutiveFailures = 0;
+
+  while (!signal || !signal.aborted) {
+    try {
+      const now = nowFn();
+      const timeline = await fetchTimelineFn(context, device.deviceId, state, now);
+      const currentState = await loadCurrentStateFn(context, device.deviceId);
+      const entries = buildWatchEntries(timeline.events || [], currentState, state, options);
+
+      for (const entry of entries) {
+        write(formatWatchEntry(entry, options));
+      }
+
+      consecutiveFailures = 0;
+      await sleepFn(options.intervalSeconds * 1000, signal);
+    } catch (err) {
+      if (signal && signal.aborted) break;
+      consecutiveFailures += 1;
+      const transient = isTransientWatchError(err);
+      if (!transient) throw err;
+      if (consecutiveFailures >= 2) {
+        warn(`WARN: watch reconnecting after ${consecutiveFailures} failed polls: ${err.message}`);
+      }
+      await sleepFn(getWatchBackoffMs(consecutiveFailures), signal);
+    }
+  }
+}
+
+function createWatchState(options, now) {
+  const startMs = options.sinceMs > 0 ? now.getTime() - options.sinceMs : now.getTime() - WATCH_CURSOR_LOOKBACK_MS;
+  return {
+    initialized: options.sinceMs > 0,
+    cursor: null,
+    seenEventIds: new Set(),
+    timelineStart: new Date(startMs).toISOString(),
+    currentStateSnapshot: null,
+  };
+}
+
+async function fetchWatchTimeline(context, deviceId, state, now) {
+  const start = state.cursor ? state.cursor.eventTime : state.timelineStart;
+  const end = now.toISOString();
+  const events = [];
+  let pageEnd = end;
+  const visitedPageEnds = new Set();
+
+  while (true) {
+    if (visitedPageEnds.has(pageEnd)) break;
+    visitedPageEnds.add(pageEnd);
+
+    const page = await fetchTimelinePage(context, deviceId, {
+      start,
+      end: pageEnd,
+      limit: WATCH_TIMELINE_LIMIT,
+    });
+    const pageEvents = page.events || [];
+    events.push(...pageEvents);
+
+    if (pageEvents.length < WATCH_TIMELINE_LIMIT) break;
+
+    const oldest = [...pageEvents].sort(compareWatchEvents)[0];
+    if (!oldest || compareEventToCursor(oldest, state.cursor) <= 0) break;
+    pageEnd = oldest.eventTime;
+  }
+
+  return { events };
+}
+
+async function fetchTimelinePage(context, deviceId, params) {
+  if (!context.webhookSecret) {
+    return queryTimelineFromDynamo(context, deviceId, {
+      start: params.start,
+      end: params.end,
+      limit: params.limit,
+      allowEmpty: true,
+    });
+  }
+
+  const query = new URLSearchParams({
+    start: params.start,
+    end: params.end,
+    limit: String(params.limit),
+  });
+  const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${query.toString()}`;
+  let response;
+  try {
+    response = await fetch(url, {
+      headers: {
+        'x-particle-webhook-secret': context.webhookSecret,
+        Accept: 'application/json',
+      },
+    });
+  } catch (err) {
+    throw new TransientWatchError(`Timeline API unavailable: ${err && err.message ? err.message : String(err)}`);
+  }
+
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    throw new TransientWatchError(`Timeline API returned non-JSON response with HTTP ${response.status}.`);
+  }
+
+  if (!response.ok) {
+    const message = `Timeline API request failed with HTTP ${response.status}: ${payload.message || payload.error || 'unknown error'}`;
+    if (response.status === 429 || response.status >= 500) throw new TransientWatchError(message);
+    fail(message);
+  }
+
+  return payload;
+}
+
+function loadDeviceCurrentState(context, deviceId) {
+  const result = awsJson(context.options, [
+    'dynamodb', 'get-item',
+    '--table-name', context.deviceCurrentStateTableName,
+    '--key', JSON.stringify({
+      projectId: { S: context.options.projectId },
+      deviceId: { S: deviceId },
+    }),
+  ]);
+  return result.Item ? unmarshall(result.Item) : null;
+}
+
+function buildWatchEntries(events, currentState, state, options) {
+  const entries = [];
+  const newEvents = collectNewTimelineEvents(events, state);
+
+  if (!state.initialized) {
+    for (const event of newEvents) markWatchEventSeen(state, event);
+    state.currentStateSnapshot = snapshotCurrentState(currentState);
+    state.initialized = true;
+    return [];
+  }
+
+  for (const event of newEvents) {
+    markWatchEventSeen(state, event);
+    const entry = watchEntryFromEvent(event, options);
+    if (entry && shouldIncludeWatchCategory(entry.category, options)) entries.push(entry);
+  }
+
+  for (const entry of detectCurrentStateChanges(currentState, state.currentStateSnapshot)) {
+    if (shouldIncludeWatchCategory(entry.category, options)) entries.push(entry);
+  }
+  state.currentStateSnapshot = snapshotCurrentState(currentState);
+
+  entries.sort((left, right) => left.time.localeCompare(right.time) || left.category.localeCompare(right.category));
+  return entries;
+}
+
+function collectNewTimelineEvents(events, state) {
+  return [...events]
+    .filter(event => compareEventToCursor(event, state.cursor) > 0 && !state.seenEventIds.has(watchEventId(event)))
+    .sort(compareWatchEvents);
+}
+
+function markWatchEventSeen(state, event) {
+  state.seenEventIds.add(watchEventId(event));
+  if (compareEventToCursor(event, state.cursor) > 0) {
+    state.cursor = { eventTime: event.eventTime, id: watchEventId(event) };
+  }
+}
+
+function compareEventToCursor(event, cursor) {
+  if (!cursor) return 1;
+  const timeCompare = String(event.eventTime || '').localeCompare(cursor.eventTime);
+  if (timeCompare !== 0) return timeCompare;
+  return watchEventId(event).localeCompare(cursor.id);
+}
+
+function compareWatchEvents(left, right) {
+  return String(left.eventTime || '').localeCompare(String(right.eventTime || '')) || watchEventId(left).localeCompare(watchEventId(right));
+}
+
+function watchEventId(event) {
+  return stringValue(event.eventId) || stringValue(event.s3Key) || `${event.eventTime}:${event.eventName}`;
+}
+
+function watchEntryFromEvent(event, options) {
+  const classification = classifyTimelineEvent(event);
+
+  if (classification.category === 'SERIAL') {
+    return {
+      time: event.eventTime,
+      category: classification.category,
+      summary: maybeTruncate(serialLine(event), options),
+      event,
+    };
+  }
+
+  const metrics = compactMetricSummary(event);
+  if (metrics) {
+    return {
+      time: event.eventTime,
+      category: classification.category,
+      summary: metrics,
+      event,
+    };
+  }
+
+  return {
+    time: event.eventTime,
+    category: classification.category,
+    summary: classification.summary,
+    event,
+  };
+}
+
+function classifyTimelineEvent(event) {
+  if (event.eventName === 'status') {
+    return { category: 'LIFECYCLE', summary: safe(event.eventType || event.eventName) };
+  }
+
+  if (isSerialEvent(event)) {
+    return { category: 'SERIAL', summary: serialLine(event) };
+  }
+
+  if (event.severity === 'ERROR') {
+    return { category: 'ERROR', summary: safe(event.eventType || event.eventName) };
+  }
+
+  if (compactMetricSummary(event)) {
+    return { category: 'TELEMETRY', summary: compactMetricSummary(event) };
+  }
+
+  return { category: 'EVENT', summary: safe(event.eventType || event.eventName) };
+}
+
+function isSerialEvent(event) {
+  return event.eventName === 'serialLog' || event.eventType === 'serial.log' || event.plane === 'serial';
+}
+
+function serialLine(event) {
+  return stringValue(event.serialLogLine) || stringValue(event.logLine) || stringValue(event.data) || safe(event.eventName);
+}
+
+function compactMetricSummary(event) {
+  const fields = [
+    ['occupancy', event.occupancy],
+    ['dailyOccupancy', event.dailyOccupancy],
+    ['battery', event.battery],
+    ['temperature', event.temperature],
+    ['connectTime', event.connectTime],
+    ['resetCount', event.resetCount],
+    ['alertCount', event.alertCount],
+  ].filter(([, value]) => value !== undefined && value !== null);
+  if (fields.length === 0) return '';
+  return fields.map(([name, value]) => `${name}=${value}`).join(' ');
+}
+
+function detectCurrentStateChanges(currentState, previousSnapshot) {
+  const nextSnapshot = snapshotCurrentState(currentState);
+  if (!previousSnapshot) return [];
+
+  const entries = [];
+  if (nextSnapshot.deviceStatusLedgerUpdatedAt && nextSnapshot.deviceStatusLedgerUpdatedAt !== previousSnapshot.deviceStatusLedgerUpdatedAt) {
+    entries.push({
+      time: nextSnapshot.deviceStatusLedgerUpdatedAt,
+      category: 'RUNTIME',
+      summary: 'device-status snapshot updated',
+    });
+  }
+  if (nextSnapshot.deviceDataLedgerUpdatedAt && nextSnapshot.deviceDataLedgerUpdatedAt !== previousSnapshot.deviceDataLedgerUpdatedAt) {
+    entries.push({
+      time: nextSnapshot.deviceDataLedgerUpdatedAt,
+      category: 'DATA',
+      summary: 'device-data snapshot updated',
+    });
+  }
+  return entries;
+}
+
+function snapshotCurrentState(currentState) {
+  return {
+    deviceStatusLedgerUpdatedAt: currentState && currentState.deviceStatusLedgerUpdatedAt,
+    deviceDataLedgerUpdatedAt: currentState && currentState.deviceDataLedgerUpdatedAt,
+    updatedAt: currentState && currentState.updatedAt,
+    lastEventTime: currentState && currentState.lastEventTime,
+    lastIngestTime: currentState && currentState.lastIngestTime,
+  };
+}
+
+function shouldIncludeWatchCategory(category, options) {
+  if (options.includeTypes && !options.includeTypes.has(category)) return false;
+  if (options.excludeTypes && options.excludeTypes.has(category)) return false;
+  return true;
+}
+
+function formatWatchEntry(entry, options) {
+  if (options.json) {
+    return JSON.stringify({
+      time: entry.time,
+      category: entry.category,
+      summary: entry.summary,
+      ...(entry.event && { event: entry.event }),
+    });
+  }
+
+  return `${formatLocalTime(entry.time)}  ${entry.category.padEnd(10)} ${entry.summary}`;
+}
+
+function maybeTruncate(value, options) {
+  const text = safe(value);
+  if (options.raw || text.length <= WATCH_LINE_MAX_LENGTH) return text;
+  return `${text.slice(0, WATCH_LINE_MAX_LENGTH - 3)}...`;
+}
+
+function formatLocalTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return safe(value);
+  return date.toLocaleTimeString(undefined, {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    fractionalSecondDigits: 3,
+  });
+}
+
+function isTransientWatchError(err) {
+  return err instanceof TransientWatchError;
+}
+
+function getWatchBackoffMs(consecutiveFailures) {
+  return Math.min(30_000, 1000 * (2 ** Math.min(consecutiveFailures - 1, 5)));
+}
+
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal && signal.aborted) {
+      resolve();
+      return;
+    }
+    const timeout = setTimeout(resolve, ms);
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        clearTimeout(timeout);
+        resolve();
+      }, { once: true });
+    }
+  });
 }
 
 function printTable(rows, columns) {
@@ -490,6 +932,8 @@ class OperatorError extends Error {
   }
 }
 
+class TransientWatchError extends Error {}
+
 function displayName(device) {
   return stringValue(device.deviceName) || '<unknown>';
 }
@@ -517,8 +961,18 @@ if (require.main === module) {
 
 module.exports = {
   OperatorError,
+  TransientWatchError,
+  buildWatchEntries,
+  classifyTimelineEvent,
+  collectNewTimelineEvents,
+  createWatchState,
+  detectCurrentStateChanges,
   enrichDeviceNames,
+  formatWatchEntry,
   isDeviceId,
   loadDeviceInventory,
+  parseOptions,
   resolveDeviceSelector,
+  runWatchLoop,
+  watchEntryFromEvent,
 };
