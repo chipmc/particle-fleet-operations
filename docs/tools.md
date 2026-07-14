@@ -30,13 +30,17 @@ cd ~/Documents/Maker/AWS/particle-log-monitoring
 ### Commands
 
 ```bash
+./tools/telemetry --help
+./tools/telemetry help [command]
 ./tools/telemetry devices
 ./tools/telemetry device <name-or-device-id>
 ./tools/telemetry timeline <name-or-device-id> --hours 24 --limit 50
 ./tools/telemetry watch <device-selector>
 ```
 
-All commands support `--json`. Device selectors accept a full Particle device ID, exact device name, or unambiguous partial device name. The tool discovers deployed resources from CloudFormation and uses the existing query API for timeline reads.
+Use `./tools/telemetry <command> --help` or `./tools/telemetry help <command>` for command-specific help. Help commands run locally and do not require AWS authentication or network access.
+
+All data commands support `--json`. Device selectors accept a full Particle device ID, exact device name, or unambiguous partial device name. The tool discovers deployed resources from CloudFormation and uses the existing query API for timeline reads.
 
 ### Watch Cheat Sheet
 

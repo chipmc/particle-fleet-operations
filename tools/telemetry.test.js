@@ -1,6 +1,8 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
+const path = require('node:path');
 const test = require('node:test');
 
 const {
@@ -18,6 +20,18 @@ const {
   runWatchLoop,
   watchEntryFromEvent,
 } = require('./telemetry');
+
+const telemetryPath = path.join(__dirname, 'telemetry');
+
+function runTelemetry(args) {
+  return spawnSync(process.execPath, [telemetryPath, ...args], {
+    encoding: 'utf8',
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+    },
+  });
+}
 
 function watchOptions(overrides = {}) {
   return {
@@ -45,6 +59,43 @@ function event(overrides = {}) {
     ...overrides,
   };
 }
+
+test('top-level help exits successfully without external configuration', () => {
+  for (const args of [['--help'], ['help']]) {
+    const result = runTelemetry(args);
+
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /Usage:[\s\S]*\.\/tools\/telemetry watch <name-or-device-id>/);
+    assert.doesNotMatch(result.stderr, /AWS|region|credentials/i);
+  }
+});
+
+test('watch help exits successfully without external configuration', () => {
+  for (const args of [['watch', '--help'], ['help', 'watch']]) {
+    const result = runTelemetry(args);
+
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /Usage:[\s\S]*\.\/tools\/telemetry watch <name-or-device-id>/);
+    assert.match(result.stdout, /--interval <seconds>/);
+    assert.doesNotMatch(result.stderr, /AWS|region|credentials/i);
+  }
+});
+
+test('command help exits successfully without external configuration', () => {
+  const result = runTelemetry(['timeline', '--help']);
+
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /Timeline lookback window/);
+  assert.doesNotMatch(result.stderr, /AWS|region|credentials/i);
+});
+
+test('unknown commands fail before external configuration is loaded', () => {
+  const result = runTelemetry(['frobnicate']);
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /ERROR: Unknown command: frobnicate/);
+  assert.doesNotMatch(result.stderr, /AWS region|credentials|CloudFormation/i);
+});
 
 test('Particle-resolved name works for device selector resolution', async () => {
   const originalFetch = global.fetch;

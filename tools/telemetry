@@ -13,17 +13,37 @@ const WATCH_TIMELINE_LIMIT = 1000;
 const WATCH_CURSOR_LOOKBACK_MS = 5 * 60 * 1000;
 const WATCH_LINE_MAX_LENGTH = 160;
 const DEVICE_ID_PATTERN = /^[a-fA-F0-9]{24}$/;
+const COMMANDS = new Set(['devices', 'device', 'timeline', 'watch']);
 
 async function main() {
   const args = process.argv.slice(2);
   const command = args.shift();
 
-  if (!command || command === '--help' || command === '-h') {
-    printUsage();
-    return;
-  }
-
   try {
+    if (!command || command === '--help' || command === '-h') {
+      printUsage();
+      return;
+    }
+
+    if (command === 'help') {
+      const helpCommand = args[0];
+      if (!helpCommand) {
+        printUsage();
+        return;
+      }
+      printCommandHelp(helpCommand);
+      return;
+    }
+
+    if (!COMMANDS.has(command)) {
+      fail(`Unknown command: ${command}`);
+    }
+
+    if (args.includes('--help') || args.includes('-h')) {
+      printCommandHelp(command);
+      return;
+    }
+
     const options = parseOptions(args);
     const context = await loadContext(options);
 
@@ -60,7 +80,6 @@ async function main() {
       return;
     }
 
-    fail(`Unknown command: ${command}`);
   } catch (err) {
     if (err instanceof OperatorError) {
       console.error(`ERROR: ${err.message}`);
@@ -73,10 +92,18 @@ async function main() {
 
 function printUsage() {
   console.log(`Usage:
+  ./tools/telemetry --help
+  ./tools/telemetry help [command]
   ./tools/telemetry devices [--json]
   ./tools/telemetry device <name-or-device-id> [--json]
   ./tools/telemetry timeline <name-or-device-id> [--hours 24] [--limit 50] [--json]
   ./tools/telemetry watch <name-or-device-id> [--interval 3] [--since 5m] [--serial-only] [--json]
+
+Commands:
+  devices     List devices from DeviceCurrentState
+  device      Show one device current-state record
+  timeline    Show recent timeline events for one device
+  watch       Tail near-live timeline and current-state updates
 
 Options:
   --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
@@ -93,6 +120,75 @@ Options:
   --serial-only        Watch SERIAL lines only
   --raw, --full        Do not truncate watch summaries
 `);
+}
+
+function printCommandHelp(command) {
+  if (!COMMANDS.has(command)) fail(`Unknown command: ${command}`);
+
+  const help = {
+    devices: `Usage:
+  ./tools/telemetry devices [--json]
+
+List devices from DeviceCurrentState.
+
+Options:
+  --json               Emit JSON output
+  --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
+  --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
+  --profile <name>     AWS CLI profile
+  --region <region>    AWS region
+`,
+    device: `Usage:
+  ./tools/telemetry device <name-or-device-id> [--json]
+
+Show one device current-state record. Selectors accept a full Particle device ID,
+exact device name, or unambiguous partial device name.
+
+Options:
+  --json               Emit JSON output
+  --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
+  --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
+  --profile <name>     AWS CLI profile
+  --region <region>    AWS region
+`,
+    timeline: `Usage:
+  ./tools/telemetry timeline <name-or-device-id> [--hours 24] [--limit 50] [--json]
+
+Show recent timeline events for one device. Selectors accept a full Particle
+device ID, exact device name, or unambiguous partial device name.
+
+Options:
+  --hours <hours>      Timeline lookback window (default: ${DEFAULT_TIMELINE_HOURS})
+  --limit <count>      Timeline max events (default: ${DEFAULT_TIMELINE_LIMIT})
+  --json               Emit JSON output
+  --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
+  --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
+  --profile <name>     AWS CLI profile
+  --region <region>    AWS region
+`,
+    watch: `Usage:
+  ./tools/telemetry watch <name-or-device-id> [--interval 3] [--since 5m] [--serial-only] [--json]
+
+Tail near-live timeline and current-state updates for one device. Selectors
+accept a full Particle device ID, exact device name, or unambiguous partial
+device name. Press Ctrl-C to stop.
+
+Options:
+  --interval <seconds> Watch polling interval, minimum 1 (default: ${DEFAULT_WATCH_INTERVAL_SECONDS})
+  --since <duration>   Watch initial history window, e.g. 30s, 5m, 1h
+  --types <csv>        Watch categories to include
+  --exclude <csv>      Watch categories to exclude
+  --serial-only        Watch SERIAL lines only
+  --json               Emit JSON lines
+  --raw, --full        Do not truncate watch summaries
+  --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
+  --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
+  --profile <name>     AWS CLI profile
+  --region <region>    AWS region
+`,
+  };
+
+  console.log(help[command]);
 }
 
 function parseOptions(args) {
