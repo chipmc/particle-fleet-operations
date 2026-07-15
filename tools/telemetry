@@ -5,6 +5,10 @@ const { spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const { URLSearchParams } = require('url');
+const {
+  presentEvent,
+  presentObservation,
+} = require('./event-presentation');
 
 const DEFAULT_STACK_NAME = 'InfraStack';
 const DEFAULT_PROJECT_ID = 'generalized-core-counter';
@@ -12,6 +16,7 @@ const DEFAULT_FLEET_PRODUCT_ID = '42131';
 const LOCAL_SECRETS_RELATIVE_PATH = '.particle-log-monitoring/secrets.env';
 const DEFAULT_TIMELINE_HOURS = 24;
 const DEFAULT_TIMELINE_LIMIT = 25;
+const DEFAULT_FLEET_ACTIVITY_LIMIT = 10;
 const DEFAULT_WATCH_INTERVAL_SECONDS = 3;
 const WATCH_TIMELINE_LIMIT = 200;
 const WATCH_DYNAMO_PAGE_LIMIT = 200;
@@ -19,7 +24,7 @@ const WATCH_DYNAMO_MAX_ROWS = 2000;
 const WATCH_CURSOR_LOOKBACK_MS = 5 * 60 * 1000;
 const WATCH_LINE_MAX_LENGTH = 160;
 const DEVICE_ID_PATTERN = /^[a-fA-F0-9]{24}$/;
-const COMMANDS = new Set(['devices', 'device', 'timeline', 'watch', 'fleet']);
+const COMMANDS = new Set(['devices', 'device', 'timeline', 'watch', 'serial', 'fleet']);
 
 async function main() {
   const args = process.argv.slice(2);
@@ -94,6 +99,15 @@ async function main() {
       return;
     }
 
+    if (command === 'serial') {
+      const selector = requireSelector(options.positionals, 'serial');
+      validateSerialOptions(options);
+      const devices = await loadDeviceInventory(context);
+      const device = resolveDeviceSelector(devices, selector, context);
+      await startSerial(context, device, options);
+      return;
+    }
+
   } catch (err) {
     if (err instanceof OperatorError) {
       console.error(`ERROR: ${err.message}`);
@@ -109,10 +123,11 @@ function printUsage() {
   ./tools/telemetry --help
   ./tools/telemetry help [command]
   ./tools/telemetry devices [--json]
-  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--json] [--verbose]
+  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit ${DEFAULT_FLEET_ACTIVITY_LIMIT}] [--json] [--verbose]
   ./tools/telemetry device <name-or-device-id> [--json]
-  ./tools/telemetry timeline <name-or-device-id> [--hours 24] [--limit 50] [--json]
+  ./tools/telemetry timeline <name-or-device-id> [--since 1h | --hours 24] [--limit 50] [--json]
   ./tools/telemetry watch <name-or-device-id> [--interval 3] [--since 5m] [--serial-only] [--json]
+  ./tools/telemetry serial <name-or-device-id> --since 1h [--follow] [--include-collector] [--grep text] [--json]
 
 Commands:
   devices     List devices from DeviceCurrentState
@@ -120,11 +135,13 @@ Commands:
   device      Show one device current-state record
   timeline    Show recent timeline events for one device
   watch       Tail near-live timeline and current-state updates
+  serial      Reconstruct cloud-forwarded serial output from Timeline/EventHistory
 
 Options:
   --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
   --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
   --product-id <id>    Particle product ID for fleet summary (default: ${DEFAULT_FLEET_PRODUCT_ID})
+  --activity-limit <n> Recent Activity row limit (default: ${DEFAULT_FLEET_ACTIVITY_LIMIT})
   --profile <name>     AWS CLI profile
   --region <region>    AWS region
   --json               Emit JSON output
@@ -132,7 +149,11 @@ Options:
   --hours <hours>      Timeline lookback window
   --limit <count>      Timeline max events
   --interval <seconds> Watch polling interval, minimum 1 (default: ${DEFAULT_WATCH_INTERVAL_SECONDS})
-  --since <duration>   Watch initial history window, e.g. 30s, 5m, 1h
+  --since <duration>   Timeline/Watch history window, e.g. 30s, 5m, 1h
+  --until <timestamp>  End timestamp for serial reconstruction window
+  --follow             Continue watching new serial lines after initial history
+  --include-collector  Include Serial Forwarder lifecycle events in serial output
+  --grep <text>        Include only serial lines containing text
   --types <csv>        Watch categories to include
   --exclude <csv>      Watch categories to exclude
   --serial-only        Watch SERIAL lines only
@@ -157,14 +178,35 @@ Options:
   --region <region>    AWS region
 `,
     fleet: `Usage:
-  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--json] [--verbose]
+  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit ${DEFAULT_FLEET_ACTIVITY_LIMIT}] [--json] [--verbose]
 
 Summarize one Particle product fleet by joining Particle product inventory,
 DeviceCurrentState, and the existing runtime projection. This report does not
 infer health.
 
+Terms:
+  CS                  Current State. Indicates that a DeviceCurrentState projection exists for the device.
+  RT                  Runtime Status. Indicates that a device-status Ledger snapshot has been projected.
+  DD                  Device Data. Indicates that a device-data Ledger snapshot has been projected.
+  Cloud               Point-in-time Particle Cloud connection status. Online or Offline is not equivalent to device health because sleeping devices may normally be offline.
+  Last Heard          The most recent time Particle Cloud heard from the device.
+  Firmware            The application firmware version reported by Particle.
+  Device OS           The Particle Device OS version reported by Particle.
+  Runtime             Runtime-status projection presence: Observed, Pending, or Unknown.
+  SOC                 Battery State of Charge. Fleet Summary prefers device-status Ledger SOC and falls back to telemetry battery SOC.
+  Coverage            Evidence completeness across the Particle product inventory.
+  Attention           Factual observations that may warrant operator review; not a derived health classification.
+  Recent Activity     Recent fleet observations, newest first.
+
+Notes:
+  Product inventory is authoritative for fleet membership.
+  CS, RT, and DD are evidence-presence indicators, not health scores.
+  Online/Offline is Particle Cloud connection state, not reporting health.
+  Device Data: Not Enabled means no device in the scoped product currently has a device-data projection.
+
 Options:
   --product-id <id>    Particle product ID (default: ${DEFAULT_FLEET_PRODUCT_ID})
+  --activity-limit <n> Recent Activity row limit (default: ${DEFAULT_FLEET_ACTIVITY_LIMIT})
   --json               Emit fleet-summary.v1 JSON output
   --verbose            Include additional per-device metadata
   --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
@@ -186,12 +228,25 @@ Options:
   --region <region>    AWS region
 `,
     timeline: `Usage:
-  ./tools/telemetry timeline <name-or-device-id> [--hours 24] [--limit 50] [--json]
+  ./tools/telemetry timeline <name-or-device-id> [--since 1h | --hours 24] [--limit 50] [--json]
 
 Show recent timeline events for one device. Selectors accept a full Particle
 device ID, exact device name, or unambiguous partial device name.
+Mixed output uses TIME | KIND | SUMMARY. SERIAL-only output uses TIME | SERIAL LOG.
+
+Kinds:
+  SERIAL              Firmware-generated serial output.
+  COLLECTOR           Serial Forwarder transport and USB lifecycle observations.
+  TELEMETRY           Application measurements and normal published events.
+  LIFECYCLE           Particle application event named status.
+  RUNTIME             device-status Ledger snapshot activity.
+  DATA                device-data Ledger snapshot activity.
+  WATCHDOG            Explicit watchdog or fault evidence.
+  ERROR               Other error or critical canonical events.
+  EVENT               Other canonical events.
 
 Options:
+  --since <duration>   Timeline lookback, e.g. 30m or 1h. Overrides --hours.
   --hours <hours>      Timeline lookback window (default: ${DEFAULT_TIMELINE_HOURS})
   --limit <count>      Timeline max events (default: ${DEFAULT_TIMELINE_LIMIT})
   --json               Emit JSON output
@@ -207,6 +262,10 @@ Tail near-live timeline and current-state updates for one device. Selectors
 accept a full Particle device ID, exact device name, or unambiguous partial
 device name. Press Ctrl-C to stop.
 
+Kinds include SERIAL firmware output, COLLECTOR forwarder observations,
+LIFECYCLE Particle status events, RUNTIME device-status snapshots, DATA
+device-data snapshots, TELEMETRY measurements, WATCHDOG evidence, ERROR, and EVENT.
+
 Options:
   --interval <seconds> Watch polling interval, minimum 1 (default: ${DEFAULT_WATCH_INTERVAL_SECONDS})
   --since <duration>   Watch initial history window, e.g. 30s, 5m, 1h
@@ -215,6 +274,33 @@ Options:
   --serial-only        Watch SERIAL lines only
   --json               Emit JSON lines
   --raw, --full        Do not truncate watch summaries
+  --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
+  --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
+  --profile <name>     AWS CLI profile
+  --region <region>    AWS region
+`,
+    serial: `Usage:
+  ./tools/telemetry serial <name-or-device-id> --since 1h [--until <ISO timestamp>] [--follow] [--include-collector] [--grep <text>] [--json]
+  ./tools/telemetry serial <name-or-device-id> --follow [--include-collector] [--grep <text>] [--json]
+
+Reconstruct cloud-forwarded serial output for one device from existing
+Timeline/EventHistory data. This is not direct USB/UART capture.
+
+By default, output includes only canonical eventType=serial.log firmware output.
+Use --include-collector to add Serial Forwarder lifecycle observations.
+SERIAL means firmware-generated output; COLLECTOR means forwarder transport or
+USB lifecycle evidence and is not automatically a forwarder defect.
+
+Options:
+  --since <duration>   History window, e.g. 30s, 5m, 1h. Required unless --follow starts from now.
+  --until <timestamp>  End timestamp for the initial window. Defaults to now.
+  --follow             Continue watching new serial lines after initial history.
+  --include-collector  Include COLLECTOR lifecycle events and show KIND in output.
+  --grep <text>        Include only serial lines containing text.
+  --limit <count>      Maximum serial rows for the initial reconstruction window (default: ${DEFAULT_TIMELINE_LIMIT}).
+  --interval <seconds> Follow polling interval, minimum 1 (default: ${DEFAULT_WATCH_INTERVAL_SECONDS})
+  --json               Emit JSON lines
+  --raw, --full        Do not truncate serial lines
   --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
   --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
   --profile <name>     AWS CLI profile
@@ -232,10 +318,15 @@ function parseOptions(args) {
     json: false,
     verbose: false,
     productId: process.env.TELEMETRY_PRODUCT_ID || DEFAULT_FLEET_PRODUCT_ID,
+    activityLimit: DEFAULT_FLEET_ACTIVITY_LIMIT,
     hours: DEFAULT_TIMELINE_HOURS,
     limit: DEFAULT_TIMELINE_LIMIT,
     intervalSeconds: DEFAULT_WATCH_INTERVAL_SECONDS,
     sinceMs: 0,
+    until: null,
+    follow: false,
+    includeCollector: false,
+    grep: null,
     includeTypes: null,
     excludeTypes: new Set(),
     serialOnly: false,
@@ -257,6 +348,8 @@ function parseOptions(args) {
       options.projectId = requireOptionValue(args, ++index, '--project-id');
     } else if (arg === '--product-id') {
       options.productId = requireOptionValue(args, ++index, '--product-id');
+    } else if (arg === '--activity-limit') {
+      options.activityLimit = parseNonNegativeInteger(requireOptionValue(args, ++index, '--activity-limit'), '--activity-limit');
     } else if (arg === '--profile') {
       options.awsProfile = requireOptionValue(args, ++index, '--profile');
     } else if (arg === '--region') {
@@ -269,6 +362,14 @@ function parseOptions(args) {
       options.intervalSeconds = parseWatchInterval(requireOptionValue(args, ++index, '--interval'));
     } else if (arg === '--since') {
       options.sinceMs = parseDurationMs(requireOptionValue(args, ++index, '--since'), '--since');
+    } else if (arg === '--until') {
+      options.until = parseIsoTimestamp(requireOptionValue(args, ++index, '--until'), '--until');
+    } else if (arg === '--follow') {
+      options.follow = true;
+    } else if (arg === '--include-collector') {
+      options.includeCollector = true;
+    } else if (arg === '--grep') {
+      options.grep = requireOptionValue(args, ++index, '--grep');
     } else if (arg === '--types') {
       options.includeTypes = parseCategorySet(requireOptionValue(args, ++index, '--types'), '--types');
     } else if (arg === '--exclude') {
@@ -300,6 +401,12 @@ function parsePositiveInteger(value, option) {
   return parsed;
 }
 
+function parseNonNegativeInteger(value, option) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) fail(`${option} must be a non-negative integer.`);
+  return parsed;
+}
+
 function parseWatchInterval(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 1) fail('--interval must be at least 1 second.');
@@ -314,6 +421,12 @@ function parseDurationMs(value, option) {
   const unit = (match[2] || 's').toLowerCase();
   const multiplier = unit === 'h' ? 60 * 60 * 1000 : unit === 'm' ? 60 * 1000 : 1000;
   return Math.max(0, Math.floor(amount * multiplier));
+}
+
+function parseIsoTimestamp(value, option) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) fail(`${option} must be a valid ISO timestamp.`);
+  return date.toISOString();
 }
 
 function formatDuration(ms) {
@@ -596,7 +709,7 @@ async function fetchTimeline(context, deviceId, options) {
   if (!context.webhookSecret) return queryTimelineFromDynamo(context, deviceId, options);
 
   const params = new URLSearchParams({
-    hours: String(options.hours),
+    hours: String(timelineLookbackHours(options)),
     limit: String(options.limit),
   });
   const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${params.toString()}`;
@@ -622,7 +735,7 @@ async function fetchTimeline(context, deviceId, options) {
 
 function queryTimelineFromDynamo(context, deviceId, options) {
   const end = options.end ? new Date(options.end) : new Date();
-  const start = options.start ? new Date(options.start) : new Date(end.getTime() - options.hours * 60 * 60 * 1000);
+  const start = options.start ? new Date(options.start) : new Date(end.getTime() - timelineLookbackHours(options) * 60 * 60 * 1000);
   const records = queryTimelineRecordsFromDynamo(context, deviceId, start.toISOString(), end.toISOString(), options);
 
   if (records.length === 0 && !options.allowEmpty) fail(`No data found for device: ${deviceId}`);
@@ -635,6 +748,10 @@ function queryTimelineFromDynamo(context, deviceId, options) {
     events: records.map(formatTimelineRecord),
     source: 'dynamodb',
   };
+}
+
+function timelineLookbackHours(options) {
+  return options.sinceMs > 0 ? options.sinceMs / (60 * 60 * 1000) : options.hours;
 }
 
 function queryTimelineRecordsFromDynamo(context, deviceId, start, end, options) {
@@ -749,17 +866,21 @@ function buildFleetSummary(devices, options = {}) {
   const currentState = summaryDevices.filter(device => device.coverage.currentState).length;
   const runtimeStatus = summaryDevices.filter(device => device.coverage.runtimeStatus).length;
   const deviceData = summaryDevices.filter(device => device.coverage.deviceData).length;
+  const coverage = {
+    inventory,
+    currentState,
+    runtimeStatus,
+    deviceData,
+  };
+  const attention = buildFleetAttention(summaryDevices, coverage, options);
+  const recentActivity = buildFleetRecentActivity(summaryDevices, options);
+  const batterySoc = buildBatterySocOverview(summaryDevices, inventory);
 
   return {
     schema: 'fleet-summary.v1',
     generatedAt: options.generatedAt || new Date().toISOString(),
     productId: String(options.productId || DEFAULT_FLEET_PRODUCT_ID),
-    coverage: {
-      inventory,
-      currentState,
-      runtimeStatus,
-      deviceData,
-    },
+    coverage,
     connected: {
       connected: summaryDevices.filter(device => device.connected === true).length,
       disconnected: summaryDevices.filter(device => device.connected === false).length,
@@ -769,6 +890,9 @@ function buildFleetSummary(devices, options = {}) {
       firmware: buildDistribution(summaryDevices.map(device => device.firmwareVersion)),
       deviceOs: buildDistribution(summaryDevices.map(device => device.deviceOsVersion)),
     },
+    batterySoc,
+    attention,
+    recentActivity,
     devices: summaryDevices,
   };
 }
@@ -779,6 +903,7 @@ function buildFleetSummaryDevice(device) {
   const connected = extractParticleConnected(particle, runtimeConnectionState);
   const firmwareVersion = extractFirmwareVersion(device);
   const deviceOsVersion = extractDeviceOsVersion(device);
+  const socObservation = extractSocObservation(device);
 
   return {
     deviceId: device.deviceId,
@@ -788,6 +913,9 @@ function buildFleetSummaryDevice(device) {
     firmwareVersion,
     deviceOsVersion,
     runtimeConnectionState,
+    socPercent: socObservation.socPercent,
+    socObservedAt: socObservation.socObservedAt,
+    socSource: socObservation.socSource,
     lastEventTime: device.lastEventTime || null,
     lastHeard: stringValue(particle.last_heard) || stringValue(particle.lastHeard) || null,
     coverage: {
@@ -797,9 +925,12 @@ function buildFleetSummaryDevice(device) {
       deviceData: hasDeviceDataProjection(device),
     },
     metadata: {
+      lastEventName: device.lastEventName || device.eventName || null,
       lastEventType: device.lastEventType || null,
       lastIngestTime: device.lastIngestTime || null,
       lastPlane: device.lastPlane || null,
+      lastSourceType: device.lastSourceType || null,
+      lastSeverity: device.severity || null,
       networkState: device.networkState || null,
       deviceStatusLedgerUpdatedAt: device.deviceStatusLedgerUpdatedAt || null,
       deviceStatusLedgerFetchedAt: device.deviceStatusLedgerFetchedAt || null,
@@ -839,8 +970,56 @@ function extractRuntimeConnectionState(device) {
   return stringValue(getNested(device.deviceStatusLedgerData, ['connection', 'state'])) || null;
 }
 
+function extractSocObservation(device) {
+  const ledgerSoc = socValue(getNested(device.deviceStatusLedgerData, ['battery', 'soc']));
+  if (ledgerSoc !== null) {
+    return {
+      socPercent: ledgerSoc,
+      socObservedAt: device.deviceStatusLedgerUpdatedAt || null,
+      socSource: 'device-status',
+    };
+  }
+
+  const telemetrySoc = socValue(device.battery);
+  if (telemetrySoc !== null) {
+    return {
+      socPercent: telemetrySoc,
+      socObservedAt: device.lastEventTime || null,
+      socSource: 'telemetry',
+    };
+  }
+
+  return { socPercent: null, socObservedAt: null, socSource: null };
+}
+
+function socValue(value) {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100) return value;
+  return null;
+}
+
 function hasRuntimeStatusProjection(device) {
   return Boolean(device.deviceStatusLedgerData || device.deviceStatusLedgerUpdatedAt || device.deviceStatusLedgerFetchedAt);
+}
+
+function buildBatterySocOverview(devices, inventory) {
+  const values = devices
+    .map(device => device.socPercent)
+    .filter(value => typeof value === 'number' && Number.isFinite(value))
+    .sort((left, right) => left - right);
+
+  return {
+    observed: values.length,
+    inventory,
+    unknown: Math.max(0, inventory - values.length),
+    lowest: values.length > 0 ? values[0] : null,
+    median: values.length > 0 ? median(values) : null,
+  };
+}
+
+function median(sortedValues) {
+  const middle = Math.floor(sortedValues.length / 2);
+  if (sortedValues.length % 2 === 1) return sortedValues[middle];
+  return (sortedValues[middle - 1] + sortedValues[middle]) / 2;
 }
 
 function hasDeviceDataProjection(device) {
@@ -868,45 +1047,56 @@ function outputFleetSummary(summary, options) {
     return;
   }
 
-  console.log(`Fleet Summary: Product ${summary.productId}`);
-  console.log(`Schema: ${summary.schema}`);
-  console.log(`Generated: ${summary.generatedAt}`);
-  console.log('');
-  console.log('Coverage:');
-  console.log(`  Inventory:      ${summary.coverage.inventory}`);
-  console.log(`  Current state:  ${summary.coverage.currentState}`);
-  console.log(`  Runtime status: ${summary.coverage.runtimeStatus}`);
-  console.log(`  Device data:    ${summary.coverage.deviceData}`);
-  console.log('');
-  console.log('Connected:');
-  console.log(`  Connected:    ${summary.connected.connected}`);
-  console.log(`  Disconnected: ${summary.connected.disconnected}`);
-  console.log(`  Unknown:      ${summary.connected.unknown}`);
-  console.log('');
-  printDistribution('Firmware distribution', summary.distributions.firmware);
-  printDistribution('Device OS distribution', summary.distributions.deviceOs);
-  console.log('');
-
-  const rows = summary.devices.map(device => fleetSummaryTextRow(device, options));
-  const columns = options.verbose
-    ? ['NAME', 'DEVICE ID', 'CONNECTED', 'FIRMWARE', 'DEVICE OS', 'LAST SEEN', 'RUNTIME', 'LAST HEARD', 'LEDGER UPDATED', 'LAST EVENT']
-    : ['NAME', 'DEVICE ID', 'CONNECTED', 'FIRMWARE', 'DEVICE OS', 'LAST SEEN', 'RUNTIME'];
-  printTable(rows, columns);
+  for (const line of renderFleetSummary(summary, options)) console.log(line);
 }
 
-function fleetSummaryTextRow(device, options) {
+function renderFleetSummary(summary, options = {}) {
+  const color = shouldUseColor(options);
+  const lines = [];
+  const inventory = summary.coverage.inventory;
+
+  lines.push(`Fleet Summary: Product ${summary.productId}`);
+  lines.push(`Schema: ${summary.schema}`);
+  lines.push(`Generated: ${summary.generatedAt}`);
+  lines.push('');
+  lines.push(...formatFleetOverview(summary, options));
+  lines.push('');
+  lines.push('Devices Requiring Attention');
+  lines.push('---------------------------');
+  lines.push(...formatFleetAttention(summary.attention || buildFleetAttention(summary.devices, summary.coverage, options)));
+  lines.push('');
+
+  const rows = summary.devices.map(device => fleetSummaryTextRow(device, options, color));
+  const columns = options.verbose
+    ? ['NAME', 'DEVICE ID', 'CS', 'RT', 'DD', 'CLOUD', 'FIRMWARE', 'DEVICE OS', 'SOC', 'LAST HEARD', 'RUNTIME', 'SOC OBSERVED', 'SOC SOURCE', 'PARTICLE HEARD', 'LEDGER UPDATED', 'LAST EVENT']
+    : ['NAME', 'DEVICE ID', 'CS', 'RT', 'DD', 'CLOUD', 'FIRMWARE', 'DEVICE OS', 'SOC', 'LAST HEARD', 'RUNTIME'];
+  lines.push(...formatTable(rows, columns));
+  lines.push('');
+  lines.push('Recent Activity');
+  lines.push('---------------');
+  lines.push(...formatRecentActivity(summary.recentActivity || buildFleetRecentActivity(summary.devices, options), options));
+  return lines;
+}
+
+function fleetSummaryTextRow(device, options, color) {
   const row = {
     NAME: safe(device.deviceName),
     'DEVICE ID': safe(device.deviceId),
-    CONNECTED: device.connected === null ? 'unknown' : String(device.connected),
+    CS: evidenceCell(device.coverage.currentState, color),
+    RT: evidenceCell(device.coverage.runtimeStatus, color),
+    DD: evidenceCell(device.coverage.deviceData, color),
+    CLOUD: cloudCell(device.connected, color),
     FIRMWARE: safe(device.firmwareVersion),
     'DEVICE OS': safe(device.deviceOsVersion),
-    'LAST SEEN': safeIso(device.lastEventTime),
-    RUNTIME: safe(device.runtimeConnectionState),
+    SOC: formatSocPercent(device.socPercent),
+    'LAST HEARD': formatFleetTime(fleetDeviceLastHeardTime(device), options),
+    RUNTIME: runtimeStatusCell(device, color),
   };
 
   if (options.verbose) {
-    row['LAST HEARD'] = safeIso(device.lastHeard);
+    row['SOC OBSERVED'] = safeIso(device.socObservedAt);
+    row['SOC SOURCE'] = safe(device.socSource);
+    row['PARTICLE HEARD'] = safeIso(device.lastHeard);
     row['LEDGER UPDATED'] = safeIso(device.metadata.deviceStatusLedgerUpdatedAt);
     row['LAST EVENT'] = safe(device.metadata.lastEventType);
   }
@@ -914,10 +1104,331 @@ function fleetSummaryTextRow(device, options) {
 }
 
 function printDistribution(label, distribution) {
-  console.log(`${label}:`);
-  for (const entry of distribution) {
-    console.log(`  ${entry.value}: ${entry.count}`);
+  for (const line of formatDistribution(label, distribution)) console.log(line);
+}
+
+function formatFleetOverview(summary, options = {}) {
+  const sections = buildFleetOverviewSections(summary);
+  if (terminalWidth(options) < 100) return formatStackedOverview(sections);
+  return formatHorizontalOverview(sections);
+}
+
+function buildFleetOverviewSections(summary) {
+  const inventory = summary.coverage.inventory;
+  return [
+    {
+      title: 'COVERAGE',
+      rows: [
+        ['Inventory', formatCompactCoverage(summary.coverage.inventory, inventory)],
+        ['Current State', formatCompactCoverage(summary.coverage.currentState, inventory)],
+        ['Runtime Status', formatCompactCoverage(summary.coverage.runtimeStatus, inventory)],
+        ['Device Data', formatDeviceDataCoverage(summary.coverage, inventory)],
+      ],
+    },
+    {
+      title: 'CLOUD',
+      rows: [
+        ['Online', summary.connected.connected],
+        ['Offline', summary.connected.disconnected],
+        ['Unknown', summary.connected.unknown],
+      ],
+    },
+    {
+      title: 'FIRMWARE',
+      rows: summary.distributions.firmware.map(entry => [entry.value, entry.count]),
+    },
+    {
+      title: 'DEVICE OS',
+      rows: summary.distributions.deviceOs.map(entry => [entry.value, entry.count]),
+    },
+    {
+      title: 'BATTERY SOC',
+      rows: batterySocOverviewRows(summary.batterySoc || buildBatterySocOverview(summary.devices, inventory)),
+    },
+  ];
+}
+
+function batterySocOverviewRows(batterySoc) {
+  return [
+    ['Observed', formatCompactCoverage(batterySoc.observed, batterySoc.inventory)],
+    ['Lowest', formatSocPercent(batterySoc.lowest)],
+    ['Median', formatSocPercent(batterySoc.median)],
+    ['Unknown', batterySoc.unknown],
+  ];
+}
+
+function formatHorizontalOverview(sections) {
+  const rendered = sections.map(renderOverviewSection);
+  const widths = rendered.map(section => Math.max(section.title.length, ...section.rows.map(row => row.length)));
+  const maxRows = Math.max(...rendered.map(section => section.rows.length));
+  const lines = [rendered.map((section, index) => section.title.padEnd(widths[index])).join('   ')];
+
+  for (let rowIndex = 0; rowIndex < maxRows; rowIndex += 1) {
+    lines.push(rendered.map((section, index) => (section.rows[rowIndex] || '').padEnd(widths[index])).join('   ').trimEnd());
   }
+  return lines;
+}
+
+function formatStackedOverview(sections) {
+  const lines = [];
+  for (const section of sections) {
+    if (lines.length > 0) lines.push('');
+    lines.push(...formatCountBlock(section.title, section.rows));
+  }
+  return lines;
+}
+
+function renderOverviewSection(section) {
+  const labelWidth = Math.max(1, ...section.rows.map(([label]) => String(label).length));
+  return {
+    title: section.title,
+    rows: section.rows.map(([label, value]) => `${String(label).padEnd(labelWidth)}  ${value}`),
+  };
+}
+
+function terminalWidth(options) {
+  if (Number.isInteger(options.terminalWidth)) return options.terminalWidth;
+  return process.stdout.columns || 120;
+}
+
+function formatDistribution(label, distribution) {
+  return formatCountBlock(label, distribution.map(entry => [entry.value, entry.count]));
+}
+
+function formatCountBlock(label, entries) {
+  const width = Math.max(1, ...entries.map(([name]) => String(name).length));
+  return [
+    label,
+    '-'.repeat(label.length),
+    ...entries.map(([name, count]) => `${String(name).padEnd(width)}  ${count}`),
+  ];
+}
+
+function formatCoverage(count, inventory) {
+  if (inventory === 0) return `${count} / 0 (-)`;
+  return `${count} / ${inventory} (${formatPercent(count / inventory)})`;
+}
+
+function formatCompactCoverage(count, inventory) {
+  if (inventory === 0) return `${count} / 0`;
+  return `${count} / ${inventory}`;
+}
+
+function formatDeviceDataCoverage(coverage, inventory) {
+  if (coverage.deviceData === 0) return 'Not Enabled';
+  return formatCoverage(coverage.deviceData, inventory);
+}
+
+function formatPercent(ratio) {
+  const percent = ratio * 100;
+  return `${Number.isInteger(percent) ? percent.toFixed(0) : percent.toFixed(1)}%`;
+}
+
+function formatSocPercent(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
+  return `${Math.round(value)}%`;
+}
+
+function buildFleetAttention(devices, coverage, options = {}) {
+  const deviceDataEnabled = coverage.deviceData > 0;
+  const now = options.now || new Date();
+  return devices.map((device) => {
+    const observations = [];
+    const waitingForTelemetry = device.coverage.productInventory && device.connected === true && !device.coverage.currentState && !device.coverage.runtimeStatus;
+
+    if (waitingForTelemetry) {
+      observations.push('Cloud connected');
+      observations.push('Waiting for first telemetry');
+    } else {
+      if (!device.coverage.currentState) observations.push('No Current State');
+      if (observations.length > 0 || !device.coverage.runtimeStatus) {
+        observations.push(`Last heard ${formatLongRelativeDuration(fleetDeviceLastHeardTime(device), now)} ago`);
+      }
+      if (!device.coverage.runtimeStatus) observations.push('Runtime status not yet observed');
+    }
+
+    if (deviceDataEnabled && !device.coverage.deviceData) observations.push('Device Data not observed');
+    if (device.socPercent !== null && device.socObservedAt && isOlderThan(device.socObservedAt, now, 6 * 60 * 60 * 1000)) {
+      observations.push(`Last reported SOC ${formatSocPercent(device.socPercent)}`);
+      observations.push(`SOC observation is ${formatRelativeDuration(device.socObservedAt, now)} old`);
+    }
+    if (hasRecentSerialActivityWithOlderParticleLastHeard(device, now)) {
+      observations.push(`Recent serial activity; Particle last heard ${formatRelativeDuration(device.lastHeard, now)} ago`);
+    }
+    return {
+      deviceId: device.deviceId,
+      deviceName: device.deviceName,
+      observations,
+    };
+  }).filter(entry => entry.observations.length > 0);
+}
+
+function formatFleetAttention(attention) {
+  const lines = [];
+  for (const entry of attention) {
+    if (lines.length > 0) lines.push('');
+    lines.push(safe(entry.deviceName));
+    for (const observation of entry.observations) {
+      lines.push(`  - ${observation}`);
+    }
+  }
+  return lines;
+}
+
+function buildFleetRecentActivity(devices, options = {}) {
+  const limit = options.activityLimit ?? DEFAULT_FLEET_ACTIVITY_LIMIT;
+  if (limit === 0) return [];
+
+  return devices.map((device) => {
+    const reportedAt = stringValue(device.lastEventTime);
+    if (reportedAt) {
+      const presentation = presentEvent({
+        eventTime: reportedAt,
+        deviceId: device.deviceId,
+        deviceName: device.deviceName,
+        eventName: device.metadata?.lastEventName,
+        eventType: device.metadata?.lastEventType,
+        plane: device.metadata?.lastPlane,
+        sourceType: device.metadata?.lastSourceType,
+        severity: device.metadata?.lastSeverity,
+      });
+      return {
+        ...presentation,
+        source: 'DeviceCurrentState',
+        authority: 'EventHistory projection',
+        ...(device.lastHeard && { particleLastHeard: device.lastHeard }),
+      };
+    }
+
+    const cloudTime = stringValue(device.lastHeard);
+    if (device.connected === true && cloudTime) {
+      return {
+        ...presentObservation('EVENT', {
+          time: cloudTime,
+          deviceId: device.deviceId,
+          deviceName: device.deviceName,
+          summary: 'Connected to Particle Cloud',
+          sourceType: 'particle-product-api',
+        }),
+        source: 'Particle Product API',
+        authority: 'Particle Product API',
+      };
+    }
+
+    return null;
+  }).filter(Boolean)
+    .sort((left, right) => compareIso(right.time, left.time) || safe(left.deviceName).localeCompare(safe(right.deviceName)))
+    .slice(0, limit);
+}
+
+function isSerialActivity(lastEventName, lastEventType, lastPlane) {
+  return presentEvent({
+    eventName: lastEventName,
+    eventType: lastEventType,
+    plane: lastPlane,
+  }).kind === 'SERIAL';
+}
+
+function hasRecentSerialActivityWithOlderParticleLastHeard(device, now) {
+  const lastEventName = stringValue(device.metadata?.lastEventName);
+  const lastEventType = stringValue(device.metadata?.lastEventType);
+  const lastPlane = stringValue(device.metadata?.lastPlane);
+  if (!isSerialActivity(lastEventName, lastEventType, lastPlane)) return false;
+
+  const eventTime = new Date(device.lastEventTime || 0).getTime();
+  const lastHeardTime = new Date(device.lastHeard || 0).getTime();
+  if (!device.lastEventTime || !device.lastHeard || Number.isNaN(eventTime) || Number.isNaN(lastHeardTime)) return false;
+  return eventTime > lastHeardTime + 5 * 60 * 1000 && eventTime >= new Date(now).getTime() - 60 * 60 * 1000;
+}
+
+function formatRecentActivity(activity, options) {
+  return activity.map(entry => `${formatActivityTime(entry.time, options)}  ${safe(entry.kind).padEnd(10)} ${safe(entry.deviceName)} ${entry.summary}`);
+}
+
+function formatActivityTime(value, options) {
+  if (options.verbose) return safeIso(value);
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return safe(value);
+  return date.toLocaleTimeString(undefined, {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function fleetDeviceLastHeardTime(device) {
+  return device.lastHeard || device.lastEventTime;
+}
+
+function formatFleetTime(value, options) {
+  if (options.verbose) return safeIso(value);
+  return formatRelativeTime(value, options.now || new Date());
+}
+
+function formatRelativeTime(value, now) {
+  const duration = formatRelativeDuration(value, now);
+  return duration === 'unknown' ? safe(value) : `${duration} ago`;
+}
+
+function formatRelativeDuration(value, now) {
+  const time = new Date(value).getTime();
+  const nowTime = new Date(now).getTime();
+  if (!value || Number.isNaN(time) || Number.isNaN(nowTime)) return 'unknown';
+  const deltaSeconds = Math.max(0, Math.floor((nowTime - time) / 1000));
+  if (deltaSeconds < 60) return `${deltaSeconds} sec`;
+  const deltaMinutes = Math.floor(deltaSeconds / 60);
+  if (deltaMinutes < 60) return `${deltaMinutes} min`;
+  const deltaHours = Math.floor(deltaMinutes / 60);
+  if (deltaHours < 48) return `${deltaHours} hr`;
+  const deltaDays = Math.floor(deltaHours / 24);
+  return `${deltaDays} day${deltaDays === 1 ? '' : 's'}`;
+}
+
+function formatLongRelativeDuration(value, now) {
+  return formatRelativeDuration(value, now)
+    .replace(/\bhr\b/g, 'hours')
+    .replace(/\bmin\b/g, 'minutes');
+}
+
+function isOlderThan(value, now, thresholdMs) {
+  const time = new Date(value).getTime();
+  const nowTime = new Date(now).getTime();
+  if (!value || Number.isNaN(time) || Number.isNaN(nowTime)) return false;
+  return nowTime - time >= thresholdMs;
+}
+
+function evidenceCell(value, color) {
+  return value ? colorText('Y', 'green', color) : colorText('-', 'dim', color);
+}
+
+function cloudCell(value, color) {
+  if (value === true) return colorText('Online', 'green', color);
+  if (value === false) return colorText('Offline', 'red', color);
+  return colorText('Unknown', 'dim', color);
+}
+
+function runtimeStatusCell(device, color) {
+  if (device.coverage.runtimeStatus) return colorText('Observed', 'green', color);
+  if (device.coverage.currentState) return colorText('Pending', 'dim', color);
+  return colorText('Unknown', 'dim', color);
+}
+
+function shouldUseColor(options) {
+  if (options.json) return false;
+  if (options.color === true) return true;
+  if (options.color === false || process.env.NO_COLOR) return false;
+  return Boolean(process.stdout.isTTY);
+}
+
+function colorText(value, color, enabled) {
+  if (!enabled) return value;
+  const codes = {
+    green: ['\x1b[32m', '\x1b[39m'],
+    red: ['\x1b[31m', '\x1b[39m'],
+    dim: ['\x1b[2m', '\x1b[22m'],
+  };
+  const pair = codes[color];
+  return pair ? `${pair[0]}${value}${pair[1]}` : value;
 }
 
 function fleetSummaryJson(summary, options) {
@@ -939,15 +1450,30 @@ function outputTimeline(device, timeline, json) {
   console.log(`Events: ${timeline.count}`);
   console.log('');
 
-  const rows = (timeline.events || []).map(event => ({
-    TIME: safeIso(event.eventTime),
-    CATEGORY: classifyTimelineEvent(event).category,
-    EVENT: safe(event.eventName),
-    TYPE: safe(event.eventType),
-    PLANE: safe(event.plane),
-    FIRMWARE: safe(event.fwVersion),
+  const { rows, columns } = timelinePresentationRows(device, timeline);
+  printTable(rows, columns);
+}
+
+function timelinePresentationRows(device, timeline) {
+  const presentations = (timeline.events || []).map(event => presentEvent(event, {
+    deviceId: device.deviceId,
+    deviceName: displayName(device),
   }));
-  printTable(rows, ['TIME', 'CATEGORY', 'EVENT', 'TYPE', 'PLANE', 'FIRMWARE']);
+  const serialOnly = presentations.length > 0 && presentations.every(item => item.kind === 'SERIAL');
+
+  if (serialOnly) {
+    return {
+      rows: presentations.map(item => ({ TIME: safeIso(item.time), 'SERIAL LOG': item.summary })),
+      columns: ['TIME', 'SERIAL LOG'],
+      presentations,
+    };
+  }
+
+  return {
+    rows: presentations.map(item => ({ TIME: safeIso(item.time), KIND: item.kind, SUMMARY: item.summary })),
+    columns: ['TIME', 'KIND', 'SUMMARY'],
+    presentations,
+  };
 }
 
 async function startWatch(context, device, options) {
@@ -973,9 +1499,167 @@ async function startWatch(context, device, options) {
   }
 }
 
+async function startSerial(context, device, options) {
+  const write = line => console.log(line);
+  const warn = message => console.error(message);
+  if (!options.json) {
+    const collectorNote = options.includeCollector ? ' plus Serial Forwarder lifecycle observations' : '';
+    warn(`Source: cloud-forwarded serial output${collectorNote} for ${displayName(device)} (${device.deviceId}); not direct USB/UART capture.`);
+  }
+
+  const controller = new AbortController();
+  const onSigint = () => controller.abort();
+  process.once('SIGINT', onSigint);
+
+  try {
+    await runSerialLoop(context, device, options, {
+      signal: controller.signal,
+      write,
+      warn,
+      sleep,
+      now: () => new Date(),
+    });
+  } finally {
+    process.removeListener('SIGINT', onSigint);
+    if (options.follow && !options.json) warn('Stopped.');
+  }
+}
+
+async function runSerialLoop(context, device, options, deps = {}) {
+  validateSerialOptions(options);
+  const write = deps.write || (line => console.log(line));
+  const warn = deps.warn || (message => console.error(message));
+  const sleepFn = deps.sleep || sleep;
+  const nowFn = deps.now || (() => new Date());
+  const fetchTimelineFn = deps.fetchTimeline || fetchSerialTimeline;
+  const signal = deps.signal;
+  const initialEnd = options.until ? new Date(options.until) : nowFn();
+  const state = createSerialState(options, initialEnd);
+  const renderer = createSerialRenderer(options);
+  let consecutiveFailures = 0;
+
+  while (!signal || !signal.aborted) {
+    try {
+      const now = state.initialized ? nowFn() : initialEnd;
+      const timeline = await fetchTimelineFn(context, device.deviceId, state, now, options);
+      const entries = buildSerialEntries(timeline.events || [], state, options);
+
+      for (const entry of entries) {
+        for (const line of renderer.format(entry)) write(line);
+      }
+      consecutiveFailures = 0;
+
+      if (!options.follow) break;
+      await sleepFn(options.intervalSeconds * 1000, signal);
+    } catch (err) {
+      if (signal && signal.aborted) break;
+      consecutiveFailures += 1;
+      const transient = isTransientWatchError(err);
+      if (!transient) throw err;
+      if (consecutiveFailures >= 2) {
+        warn(`WARN: serial reconnecting after ${consecutiveFailures} failed polls: ${err.message}`);
+      }
+      await sleepFn(getWatchBackoffMs(consecutiveFailures), signal);
+    }
+  }
+}
+
+function validateSerialOptions(options) {
+  if (!options.follow && !options.sinceMs) fail('serial requires --since unless --follow starts from now.');
+}
+
+function createSerialState(options, now) {
+  const state = createWatchState(options, now);
+  state.includeInitialTimeline = options.sinceMs > 0;
+  state.serialRowsEmitted = 0;
+  return state;
+}
+
+async function fetchSerialTimeline(context, deviceId, state, now, options) {
+  return fetchWatchTimeline(context, deviceId, state, now, options.limit || DEFAULT_TIMELINE_LIMIT);
+}
+
+function buildSerialEntries(events, state, options) {
+  const entries = [];
+  const newEvents = collectNewTimelineEvents(events, state);
+
+  for (const event of newEvents) {
+    markWatchEventSeen(state, event);
+    if (!state.includeInitialTimeline && !state.initialized) continue;
+    const entry = watchEntryFromEvent(event, options);
+    if (!entry || (entry.kind !== 'SERIAL' && !(options.includeCollector && entry.kind === 'COLLECTOR'))) continue;
+    if (options.grep && !entry.summary.includes(options.grep)) continue;
+    if (!options.follow && state.serialRowsEmitted >= options.limit) continue;
+    entries.push(entry);
+    state.serialRowsEmitted += 1;
+  }
+
+  state.initialized = true;
+  entries.sort((left, right) => String(left.time || '').localeCompare(String(right.time || '')) || watchEventId(left.event).localeCompare(watchEventId(right.event)));
+  return entries;
+}
+
+function formatSerialEntry(entry, options) {
+  if (options.json) {
+    return JSON.stringify({
+      time: entry.time,
+      line: entry.summary,
+      source: entry.kind === 'COLLECTOR' ? 'serial-forwarder' : 'cloud-forwarded serial',
+      kind: entry.kind,
+      severity: entry.severity,
+      event: entry.event,
+    });
+  }
+
+  const kind = options.includeCollector ? `${entry.kind.padEnd(10)} ` : '';
+  if (options.verbose) return `${safeIso(entry.time)}  ${kind}${entry.summary}`;
+  return `${formatLocalTime(entry.time, options)}  ${kind}${entry.summary}`;
+}
+
+function createSerialRenderer(options = {}) {
+  let wroteHeader = false;
+  let currentDate = null;
+  return {
+    format(entry) {
+      const formatted = formatSerialEntry(entry, options);
+      if (options.json || options.verbose) return [formatted];
+
+      const lines = [];
+      if (!wroteHeader) {
+        lines.push(`Timezone: ${serialTimeZoneLabel(options)}`);
+        wroteHeader = true;
+      }
+
+      const date = formatLocalDate(entry.time, options);
+      if (date && date !== currentDate) {
+        lines.push(`--- ${date} ---`);
+        currentDate = date;
+      }
+      lines.push(formatted);
+      return lines;
+    },
+  };
+}
+
+function serialTimeZoneLabel(options = {}) {
+  return options.timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'local';
+}
+
+function formatLocalDate(value, options = {}) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleDateString('en-CA', {
+    timeZone: options.timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+}
+
 function getWatchBannerLines(device, options) {
   const lines = [
     `Watching ${displayName(device)} (${device.deviceId}) ${options.sinceMs > 0 ? `since ${formatDuration(options.sinceMs)}` : 'from now'}`,
+    `Timezone: ${serialTimeZoneLabel(options)}`,
   ];
   if (options.sinceMs === 0) lines.push('Use --since <duration> to include recent history.');
   lines.push('Press Ctrl-C to stop.');
@@ -1032,7 +1716,7 @@ function createWatchState(options, now) {
   };
 }
 
-async function fetchWatchTimeline(context, deviceId, state, now) {
+async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_TIMELINE_LIMIT) {
   const start = state.cursor ? state.cursor.eventTime : state.timelineStart;
   const end = now.toISOString();
   const events = [];
@@ -1046,12 +1730,12 @@ async function fetchWatchTimeline(context, deviceId, state, now) {
     const page = await fetchTimelinePage(context, deviceId, {
       start,
       end: pageEnd,
-      limit: WATCH_TIMELINE_LIMIT,
+      limit,
     });
     const pageEvents = page.events || [];
     events.push(...pageEvents);
 
-    if (pageEvents.length < WATCH_TIMELINE_LIMIT) break;
+    if (pageEvents.length < limit) break;
 
     const oldest = [...pageEvents].sort(compareWatchEvents)[0];
     if (!oldest || compareEventToCursor(oldest, state.cursor) <= 0) break;
@@ -1187,75 +1871,23 @@ function watchEventId(event) {
 }
 
 function watchEntryFromEvent(event, options) {
-  const classification = classifyTimelineEvent(event);
-
-  if (classification.category === 'SERIAL') {
-    return {
-      time: event.eventTime,
-      category: classification.category,
-      summary: maybeTruncate(serialLine(event), options),
-      event,
-    };
-  }
-
-  const metrics = compactMetricSummary(event);
-  if (metrics) {
-    return {
-      time: event.eventTime,
-      category: classification.category,
-      summary: metrics,
-      event,
-    };
-  }
-
+  const presentation = presentEvent(event);
   return {
-    time: event.eventTime,
-    category: classification.category,
-    summary: classification.summary,
+    ...presentation,
+    category: presentation.kind,
+    summary: maybeTruncate(presentation.summary, options),
     event,
   };
 }
 
 function classifyTimelineEvent(event) {
-  if (event.eventName === 'status') {
-    return { category: 'LIFECYCLE', summary: safe(event.eventType || event.eventName) };
-  }
-
-  if (isSerialEvent(event)) {
-    return { category: 'SERIAL', summary: serialLine(event) };
-  }
-
-  if (event.severity === 'ERROR') {
-    return { category: 'ERROR', summary: safe(event.eventType || event.eventName) };
-  }
-
-  if (compactMetricSummary(event)) {
-    return { category: 'TELEMETRY', summary: compactMetricSummary(event) };
-  }
-
-  return { category: 'EVENT', summary: safe(event.eventType || event.eventName) };
-}
-
-function isSerialEvent(event) {
-  return event.eventName === 'serialLog' || event.eventType === 'serial.log' || event.plane === 'serial';
-}
-
-function serialLine(event) {
-  return stringValue(event.serialLogLine) || stringValue(event.logLine) || stringValue(event.data) || safe(event.eventName);
-}
-
-function compactMetricSummary(event) {
-  const fields = [
-    ['occupancy', event.occupancy],
-    ['dailyOccupancy', event.dailyOccupancy],
-    ['battery', event.battery],
-    ['temperature', event.temperature],
-    ['connectTime', event.connectTime],
-    ['resetCount', event.resetCount],
-    ['alertCount', event.alertCount],
-  ].filter(([, value]) => value !== undefined && value !== null);
-  if (fields.length === 0) return '';
-  return fields.map(([name, value]) => `${name}=${value}`).join(' ');
+  const presentation = presentEvent(event);
+  return {
+    category: presentation.kind,
+    kind: presentation.kind,
+    summary: presentation.summary,
+    severity: presentation.severity,
+  };
 }
 
 function detectCurrentStateChanges(currentState, previousSnapshot) {
@@ -1264,18 +1896,16 @@ function detectCurrentStateChanges(currentState, previousSnapshot) {
 
   const entries = [];
   if (nextSnapshot.deviceStatusLedgerUpdatedAt && nextSnapshot.deviceStatusLedgerUpdatedAt !== previousSnapshot.deviceStatusLedgerUpdatedAt) {
-    entries.push({
+    entries.push(watchObservation('RUNTIME', {
       time: nextSnapshot.deviceStatusLedgerUpdatedAt,
-      category: 'RUNTIME',
       summary: 'device-status snapshot updated',
-    });
+    }));
   }
   if (nextSnapshot.deviceDataLedgerUpdatedAt && nextSnapshot.deviceDataLedgerUpdatedAt !== previousSnapshot.deviceDataLedgerUpdatedAt) {
-    entries.push({
+    entries.push(watchObservation('DATA', {
       time: nextSnapshot.deviceDataLedgerUpdatedAt,
-      category: 'DATA',
       summary: 'device-data snapshot updated',
-    });
+    }));
   }
   return entries;
 }
@@ -1284,20 +1914,23 @@ function initialCurrentStateEntries(currentState) {
   const snapshot = snapshotCurrentState(currentState);
   const entries = [];
   if (snapshot.deviceStatusLedgerUpdatedAt) {
-    entries.push({
+    entries.push(watchObservation('RUNTIME', {
       time: snapshot.deviceStatusLedgerUpdatedAt,
-      category: 'RUNTIME',
       summary: 'device-status snapshot available',
-    });
+    }));
   }
   if (snapshot.deviceDataLedgerUpdatedAt) {
-    entries.push({
+    entries.push(watchObservation('DATA', {
       time: snapshot.deviceDataLedgerUpdatedAt,
-      category: 'DATA',
       summary: 'device-data snapshot available',
-    });
+    }));
   }
   return entries;
+}
+
+function watchObservation(kind, input) {
+  const presentation = presentObservation(kind, input);
+  return { ...presentation, category: presentation.kind };
 }
 
 function snapshotCurrentState(currentState) {
@@ -1321,12 +1954,21 @@ function formatWatchEntry(entry, options) {
     return JSON.stringify({
       time: entry.time,
       category: entry.category,
+      kind: entry.kind || entry.category,
       summary: entry.summary,
+      severity: entry.severity ?? null,
+      sourcePlane: entry.sourcePlane ?? null,
+      eventName: entry.eventName ?? null,
+      eventType: entry.eventType ?? null,
+      sourceType: entry.sourceType ?? null,
+      eventId: entry.eventId ?? null,
+      s3Key: entry.s3Key ?? null,
       ...(entry.event && { event: entry.event }),
     });
   }
 
-  return `${formatLocalTime(entry.time)}  ${entry.category.padEnd(10)} ${entry.summary}`;
+  if (options.serialOnly && entry.kind === 'SERIAL') return formatSerialEntry(entry, options);
+  return `${formatLocalTime(entry.time, options)}  ${(entry.kind || entry.category).padEnd(10)} ${entry.summary}`;
 }
 
 function maybeTruncate(value, options) {
@@ -1335,10 +1977,11 @@ function maybeTruncate(value, options) {
   return `${text.slice(0, WATCH_LINE_MAX_LENGTH - 3)}...`;
 }
 
-function formatLocalTime(value) {
+function formatLocalTime(value, options = {}) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return safe(value);
   return date.toLocaleTimeString(undefined, {
+    timeZone: options.timeZone,
     hour12: false,
     hour: '2-digit',
     minute: '2-digit',
@@ -1372,21 +2015,38 @@ function sleep(ms, signal) {
 }
 
 function printTable(rows, columns) {
+  for (const line of formatTable(rows, columns)) console.log(line);
+}
+
+function formatTable(rows, columns) {
   if (rows.length === 0) {
-    console.log('No rows.');
-    return;
+    return ['No rows.'];
   }
 
   const widths = Object.fromEntries(columns.map(column => [
     column,
-    Math.max(column.length, ...rows.map(row => String(row[column] || '-').length)),
+    Math.max(column.length, ...rows.map(row => visibleLength(String(row[column] || '-')))),
   ]));
 
-  console.log(columns.map(column => column.padEnd(widths[column])).join(' | '));
-  console.log(columns.map(column => '-'.repeat(widths[column])).join('-|-'));
+  const lines = [];
+  lines.push(columns.map(column => column.padEnd(widths[column])).join(' | '));
+  lines.push(columns.map(column => '-'.repeat(widths[column])).join('-|-'));
   for (const row of rows) {
-    console.log(columns.map(column => String(row[column] || '-').padEnd(widths[column])).join(' | '));
+    lines.push(columns.map(column => padVisible(String(row[column] || '-'), widths[column])).join(' | '));
   }
+  return lines;
+}
+
+function padVisible(value, width) {
+  return value + ' '.repeat(Math.max(0, width - visibleLength(value)));
+}
+
+function visibleLength(value) {
+  return stripAnsi(value).length;
+}
+
+function stripAnsi(value) {
+  return String(value).replace(/\x1b\[[0-9;]*m/g, '');
 }
 
 function awsJson(options, args, settings = {}) {
@@ -1515,14 +2175,21 @@ module.exports = {
   OperatorError,
   TransientWatchError,
   buildWatchEntries,
+  buildSerialEntries,
   buildFleetSummary,
   classifyTimelineEvent,
   collectNewTimelineEvents,
+  createSerialState,
   createWatchState,
   detectCurrentStateChanges,
   enrichDeviceNames,
   formatDuration,
+  formatRelativeTime,
+  formatSerialEntry,
+  createSerialRenderer,
   formatWatchEntry,
+  fetchTimeline,
+  fetchSerialTimeline,
   fleetSummaryJson,
   getWatchBannerLines,
   isDeviceId,
@@ -1531,7 +2198,11 @@ module.exports = {
   parseEnvFile,
   parseOptions,
   queryTimelineFromDynamo,
+  renderFleetSummary,
   resolveDeviceSelector,
+  runSerialLoop,
   runWatchLoop,
+  timelineLookbackHours,
+  timelinePresentationRows,
   watchEntryFromEvent,
 };

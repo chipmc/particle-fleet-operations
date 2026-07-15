@@ -28,6 +28,7 @@ cd ~/Documents/Maker/AWS/particle-log-monitoring
 ./tools/telemetry fleet
 ./tools/telemetry device e00fce68399ee6244a963935
 ./tools/telemetry timeline e00fce68399ee6244a963935 --hours 24
+./tools/telemetry serial Boron-Dev-09 --since 1h
 ./tools/telemetry watch P2-NewCode-Dev
 ```
 
@@ -53,6 +54,7 @@ After installation, operators can run the CLI from any directory:
 telemetry --help
 telemetry fleet
 telemetry watch Boron-Dev-09
+telemetry serial Boron-Dev-09 --since 1h
 telemetry timeline Boron-Dev-09
 fleetops fleet
 ```
@@ -68,6 +70,8 @@ If `/usr/local/bin` is not writable, rerun the installer with `sudo ./tools/inst
 ./tools/telemetry fleet --product-id 42131
 ./tools/telemetry device <name-or-device-id>
 ./tools/telemetry timeline <name-or-device-id> --hours 24 --limit 50
+./tools/telemetry timeline <name-or-device-id> --since 1h --limit 50
+./tools/telemetry serial <name-or-device-id> --since 1h
 ./tools/telemetry watch <device-selector>
 ```
 
@@ -98,7 +102,7 @@ The confirmation command reports only whether a token is set; it does not expose
 
 The text report includes:
 - Fleet header
-- Compact overview with Coverage, Cloud, Firmware, and Device OS shown side by side in normal-width terminals
+- Compact overview with Coverage, Cloud, Firmware, Device OS, and Battery SOC shown side by side in normal-width terminals
 - Devices Requiring Attention section with factual per-device observations
 - Device table with compact evidence columns: `CS` for current state, `RT` for runtime status, and `DD` for device data
 - Recent Activity section derived from existing fleet summary/current-state evidence
@@ -110,11 +114,11 @@ Fleet Summary: Product 42131
 Schema: fleet-summary.v1
 Generated: 2026-07-14T12:01:38.528Z
 
-COVERAGE                  CLOUD             FIRMWARE          DEVICE OS
-Inventory       6 / 6     Online       5    20          5     6.4.1       6
-Current State   5 / 6     Offline      1    <unknown>   1
-Runtime Status  4 / 6     Unknown      0
-Device Data     Not Enabled
+COVERAGE                  CLOUD             FIRMWARE          DEVICE OS     BATTERY SOC
+Inventory       6 / 6     Online       5    20          5     6.4.1   6     Observed  4 / 6
+Current State   5 / 6     Offline      1    <unknown>   1                  Lowest    18%
+Runtime Status  4 / 6     Unknown      0                                  Median    54%
+Device Data     Not Enabled                                                Unknown   2
 ```
 
 For narrow terminals, the overview falls back to stacked sections so values remain readable and are not silently truncated.
@@ -133,6 +137,7 @@ Terminology:
 - `Last Heard`: The most recent time Particle Cloud heard from the device.
 - `Firmware`: The application firmware version reported by Particle.
 - `Device OS`: The Particle Device OS version reported by Particle.
+- `SOC`: Battery State of Charge. Fleet Summary prefers the `device-status` Ledger SOC value and falls back to telemetry-derived battery SOC when needed.
 - `Runtime`: Human-readable presence state for the runtime-status projection: `Observed`, `Pending`, or `Unknown`.
 - `Coverage`: Evidence completeness across the Particle product inventory.
 - `Attention`: Factual observations that may warrant operator review. This is not a derived health classification.
@@ -140,9 +145,9 @@ Terminology:
 
 Product inventory is authoritative for fleet membership. `CS`, `RT`, and `DD` are evidence-presence indicators, not health scores. `Device Data: Not Enabled` means no device in the scoped product currently has a `device-data` projection.
 
-Devices Requiring Attention groups factual observations by device. For an online device that has not reported telemetry yet, the section says `Cloud connected` and `Waiting for first telemetry` instead of listing low-level missing projections. For devices with existing telemetry but missing runtime projection evidence, observations use factual wording such as `Last heard 6 hours ago` and `Runtime status not yet observed`. An empty section means no observations apply in the current snapshot.
+Devices Requiring Attention groups factual observations by device. For an online device that has not reported telemetry yet, the section says `Cloud connected` and `Waiting for first telemetry` instead of listing low-level missing projections. For devices with existing telemetry but missing runtime projection evidence, observations use factual wording such as `Last heard 6 hours ago` and `Runtime status not yet observed`. Stale SOC evidence is reported factually, for example `Last reported SOC 18%` and `SOC observation is 7 hr old`; Fleet Summary does not label SOC as healthy, low, warning, or critical. An empty section means no observations apply in the current snapshot.
 
-Recent Activity is newest-first and intentionally lightweight. It is derived from the existing Fleet Summary object: devices with Current State appear as `reported`, and online inventory-only devices with Particle last-heard time appear as `connected to Particle Cloud`. Use `--activity-limit <n>` to control the row count. No additional backend APIs are used.
+Recent Activity is newest-first and intentionally lightweight. It uses the shared event presentation layer to classify projected latest-event metadata as `SERIAL`, `COLLECTOR`, `TELEMETRY`, `LIFECYCLE`, or a neutral `EVENT`. Online inventory-only devices with Particle last-heard time appear as an `EVENT` with summary `Connected to Particle Cloud`. Use `--activity-limit <n>` to control the row count. No additional backend APIs are used.
 
 Interactive terminal output may use ANSI color for compact status cues. Color is automatically disabled for redirected output, `--json`, or when `NO_COLOR` is set.
 
@@ -150,7 +155,7 @@ Options:
 - `--product-id <id>`: Particle product ID. Default is `42131`.
 - `--activity-limit <n>`: Recent Activity row limit. Default is `10`; use `0` to hide activity rows.
 - `--json`: Emit stable `fleet-summary.v1` JSON.
-- `--verbose`: Include additional per-device metadata, such as Particle last-heard time, Ledger update time, and last event type.
+- `--verbose`: Include additional per-device metadata, such as exact SOC observation timestamp/source, Particle last-heard time, Ledger update time, and last event type.
 
 `fleet --json` uses the same internal Fleet Summary object as the text renderer. `fleet --verbose --json` includes the additional per-device metadata in the JSON device records.
 
@@ -164,6 +169,29 @@ Coverage in `fleet-summary.v1` JSON is reported with stable keys:
     "runtimeStatus": 10,
     "deviceData": 9
   }
+}
+```
+
+Battery SOC in `fleet-summary.v1` JSON is additive. Missing SOC remains `null` per device and contributes to the fleet unknown count:
+
+```json
+{
+  "batterySoc": {
+    "observed": 4,
+    "inventory": 6,
+    "unknown": 2,
+    "lowest": 18,
+    "median": 54
+  },
+  "devices": [
+    {
+      "deviceId": "e00fce68399ee6244a963935",
+      "deviceName": "SAMIT-TRAIL02",
+      "socPercent": 18,
+      "socObservedAt": "2026-07-14T05:00:00.000Z",
+      "socSource": "device-status"
+    }
+  ]
 }
 ```
 
@@ -193,11 +221,78 @@ JSON may also include additive `recentActivity` rows:
       "time": "2026-07-14T11:58:00.000Z",
       "deviceId": "e00fce68399ee6244a963935",
       "deviceName": "Morrisville-Tennis-MAFC-1",
-      "summary": "reported"
+      "kind": "TELEMETRY",
+      "summary": "Occupancy report",
+      "severity": null,
+      "eventType": "telemetry.occupancy",
+      "sourcePlane": "telemetry"
     }
   ]
 }
 ```
+
+### Shared Event Presentation
+
+`timeline`, `watch`, `serial`, and Fleet Summary Recent Activity translate canonical events through one operator-facing presentation record. Canonical fields remain unchanged in command JSON; presentation adds a concise `kind`, evidence-only `summary`, normalized `severity`, and source identity when the read model supplies it.
+
+Kinds:
+- `SERIAL`: Firmware-generated serial output (`eventType=serial.log`).
+- `COLLECTOR`: Serial Forwarder transport and USB lifecycle observations.
+- `LIFECYCLE`: Particle application event named `status`.
+- `RUNTIME`: `device-status` Ledger snapshot activity.
+- `DATA`: `device-data` Ledger snapshot activity.
+- `TELEMETRY`: Application measurements and normal published events.
+- `WATCHDOG`: Explicit watchdog or fault evidence.
+- `ERROR`: Other canonical events with error or critical severity.
+- `EVENT`: Other canonical events not otherwise classified.
+
+`kind` is an operator grouping, not a health assessment. `summary` is concise evidence, not a causal diagnosis.
+
+Human `timeline` output uses `TIME | KIND | SUMMARY` for mixed events. If every row is firmware serial output, it uses the streamlined `TIME | SERIAL LOG` layout. Timeline JSON retains the existing canonical response shape.
+
+Timeline accepts either `--hours <number>` or `--since <duration>`. `--since` supports values such as `30m` and `1h` and takes precedence over `--hours`, including the default 24-hour value.
+
+### Serial Reconstruction
+
+```bash
+./tools/telemetry serial Boron-soak-1 --since 1h
+./tools/telemetry serial Boron-soak-1 --since 1h --follow
+./tools/telemetry serial Boron-soak-1 --follow
+./tools/telemetry serial Boron-soak-1 --since 1h --include-collector
+./tools/telemetry serial Boron-soak-1 --since 1h --grep ERROR
+./tools/telemetry serial Boron-soak-1 --since 1h --json
+```
+
+`serial` reconstructs cloud-forwarded serial output for one device from existing Timeline/EventHistory data. It is not direct USB/UART capture. The command reuses the same device selector resolution as `device`, `timeline`, and `watch`.
+
+By default, serial rows include only canonical `eventType=serial.log` firmware output. Collector lifecycle records such as `serial.lifecycle.connected`, `serial.lifecycle.disconnected`, and `serial.lifecycle.missing` are excluded. A compatibility rule also recognizes a path-only `/dev/serial/by-id/...` forwarder record as `COLLECTOR` even when the legacy forwarder labeled it `serial.log`. Text output is oldest-first and intentionally log-like:
+
+```text
+2026-07-14T11:03:22.100Z  boot complete
+2026-07-14T11:03:23.004Z  modem connecting
+```
+
+Use `--include-collector` to include both `SERIAL` and `COLLECTOR` records. Combined output shows the kind explicitly:
+
+```text
+13:11:07.833  SERIAL     Connect: fail elapsed=660001ms
+13:11:08.763  COLLECTOR  Serial device disconnected
+13:11:11.646  COLLECTOR  Serial device connected
+```
+
+Collector disconnects can be expected when a device resets, sleeps, or USB CDC re-enumerates. A `COLLECTOR` record is operational evidence and does not by itself establish a Serial Forwarder defect.
+
+The command preserves distinct rows by `eventTime + eventId`, with `s3Key` as the event identity fallback. `--since` is required for reconstruction unless `--follow` is used by itself, in which case the command starts from now and prints only new serial lines.
+
+Options:
+- `--since <duration>`: Reconstruction window, for example `30s`, `5m`, or `1h`. Required unless `--follow` starts from now.
+- `--until <ISO timestamp>`: End timestamp for the initial reconstruction window. Defaults to now.
+- `--follow`: Continue watching new serial lines after the initial reconstruction window.
+- `--include-collector`: Include Serial Forwarder lifecycle observations and show `KIND` in combined output.
+- `--grep <text>`: Include only serial lines containing the given text.
+- `--limit <n>`: Maximum serial rows for the initial reconstruction window.
+- `--json`: Emit JSON lines with `time`, `line`, `source`, and the original event.
+- `--raw`, `--full`: Do not truncate long serial lines.
 
 ### Watch Cheat Sheet
 
@@ -212,7 +307,7 @@ JSON may also include additive `recentActivity` rows:
 ./tools/telemetry watch P2-NewCode-Dev --raw
 ```
 
-`watch` resolves a device name or device ID once at startup, then polls the Timeline API and `DeviceCurrentState`. It displays new activity oldest-first, suppresses duplicates, automatically retries transient API failures, and continues until Ctrl-C. Serial output is near-live cloud-forwarded serial data, not a direct USB serial connection.
+`watch` resolves a device name or device ID once at startup, then polls the Timeline API and `DeviceCurrentState`. It displays new activity oldest-first, suppresses duplicates, automatically retries transient API failures, and continues until Ctrl-C. Serial output is near-live cloud-forwarded serial data, not a direct USB serial connection. The startup banner identifies the timezone used for every Timeline and synthesized Ledger timestamp.
 
 Options:
 - `--interval <seconds>`: Polling interval. Default is the implemented V1 default. Minimum one second.
@@ -224,14 +319,15 @@ Options:
 - `--raw` / `--full`: Do not truncate long event or serial-log content.
 
 Categories:
-- `SERIAL`: Cloud-forwarded serial logs.
+- `SERIAL`: Firmware-generated, cloud-forwarded serial logs.
+- `COLLECTOR`: Serial Forwarder transport and USB lifecycle observations.
 - `TELEMETRY`: Normal device telemetry and published measurements.
-- `OCCUPANCY`: Occupancy/count changes where classified separately.
 - `LIFECYCLE`: Particle webhook event named `status`, including reset-related lifecycle information.
 - `RUNTIME`: `device-status` Ledger snapshot changes.
 - `DATA`: `device-data` Ledger snapshot changes.
+- `WATCHDOG`: Explicit watchdog or fault evidence.
 - `EVENT`: Other device events.
-- `ERROR`: Error or failure activity.
+- `ERROR`: Other canonical events with error or critical severity.
 
 Firmware development workflow:
 
