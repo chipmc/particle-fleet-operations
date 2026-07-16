@@ -17,6 +17,7 @@ const LOCAL_SECRETS_RELATIVE_PATH = '.particle-log-monitoring/secrets.env';
 const DEFAULT_TIMELINE_HOURS = 24;
 const DEFAULT_TIMELINE_LIMIT = 25;
 const DEFAULT_FLEET_ACTIVITY_LIMIT = 10;
+const DEFAULT_TRANSPORT_ALLOWANCE_SECONDS = 60;
 const DEFAULT_WATCH_INTERVAL_SECONDS = 3;
 const WATCH_TIMELINE_LIMIT = 200;
 const WATCH_DYNAMO_PAGE_LIMIT = 200;
@@ -69,7 +70,11 @@ async function main() {
     if (command === 'fleet') {
       ensureNoSelector(options.positionals, 'fleet');
       const devices = await loadDeviceInventory(context, { productId: options.productId });
-      const summary = buildFleetSummary(devices, { productId: options.productId });
+      const summary = buildFleetSummary(devices, {
+        productId: options.productId,
+        activityLimit: options.activityLimit,
+        transportAllowanceSeconds: options.transportAllowanceSeconds,
+      });
       outputFleetSummary(summary, options);
       return;
     }
@@ -123,7 +128,7 @@ function printUsage() {
   ./tools/telemetry --help
   ./tools/telemetry help [command]
   ./tools/telemetry devices [--json]
-  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit ${DEFAULT_FLEET_ACTIVITY_LIMIT}] [--json] [--verbose]
+  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit ${DEFAULT_FLEET_ACTIVITY_LIMIT}] [--transport-allowance 60s] [--json] [--verbose]
   ./tools/telemetry device <name-or-device-id> [--json]
   ./tools/telemetry timeline <name-or-device-id> [--since 1h | --hours 24] [--limit 50] [--json]
   ./tools/telemetry watch <name-or-device-id> [--interval 3] [--since 5m] [--serial-only] [--json]
@@ -142,6 +147,8 @@ Options:
   --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
   --product-id <id>    Particle product ID for fleet summary (default: ${DEFAULT_FLEET_PRODUCT_ID})
   --activity-limit <n> Recent Activity row limit (default: ${DEFAULT_FLEET_ACTIVITY_LIMIT})
+  --transport-allowance <duration>
+                       Expected-report delivery allowance (default: 60s)
   --profile <name>     AWS CLI profile
   --region <region>    AWS region
   --json               Emit JSON output
@@ -178,7 +185,7 @@ Options:
   --region <region>    AWS region
 `,
     fleet: `Usage:
-  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit ${DEFAULT_FLEET_ACTIVITY_LIMIT}] [--json] [--verbose]
+  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit ${DEFAULT_FLEET_ACTIVITY_LIMIT}] [--transport-allowance 60s] [--json] [--verbose]
 
 Summarize one Particle product fleet by joining Particle product inventory,
 DeviceCurrentState, and the existing runtime projection. This report does not
@@ -194,6 +201,7 @@ Terms:
   Device OS           The Particle Device OS version reported by Particle.
   Runtime             Runtime-status projection presence: Observed, Pending, or Unknown.
   SOC                 Battery State of Charge. Fleet Summary prefers device-status Ledger SOC and falls back to telemetry battery SOC.
+  Expected            Next application report derived from effective Ledger configuration and the last application report.
   Coverage            Evidence completeness across the Particle product inventory.
   Attention           Factual observations that may warrant operator review; not a derived health classification.
   Recent Activity     Recent fleet observations, newest first.
@@ -207,6 +215,8 @@ Notes:
 Options:
   --product-id <id>    Particle product ID (default: ${DEFAULT_FLEET_PRODUCT_ID})
   --activity-limit <n> Recent Activity row limit (default: ${DEFAULT_FLEET_ACTIVITY_LIMIT})
+  --transport-allowance <duration>
+                       Fleet-side delivery allowance added after the reporting interval and connection budget (default: 60s)
   --json               Emit fleet-summary.v1 JSON output
   --verbose            Include additional per-device metadata
   --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
@@ -319,6 +329,7 @@ function parseOptions(args) {
     verbose: false,
     productId: process.env.TELEMETRY_PRODUCT_ID || DEFAULT_FLEET_PRODUCT_ID,
     activityLimit: DEFAULT_FLEET_ACTIVITY_LIMIT,
+    transportAllowanceSeconds: parseConfiguredTransportAllowance(process.env.FLEET_TRANSPORT_ALLOWANCE_SECONDS),
     hours: DEFAULT_TIMELINE_HOURS,
     limit: DEFAULT_TIMELINE_LIMIT,
     intervalSeconds: DEFAULT_WATCH_INTERVAL_SECONDS,
@@ -350,6 +361,8 @@ function parseOptions(args) {
       options.productId = requireOptionValue(args, ++index, '--product-id');
     } else if (arg === '--activity-limit') {
       options.activityLimit = parseNonNegativeInteger(requireOptionValue(args, ++index, '--activity-limit'), '--activity-limit');
+    } else if (arg === '--transport-allowance') {
+      options.transportAllowanceSeconds = parseDurationMs(requireOptionValue(args, ++index, '--transport-allowance'), '--transport-allowance') / 1000;
     } else if (arg === '--profile') {
       options.awsProfile = requireOptionValue(args, ++index, '--profile');
     } else if (arg === '--region') {
@@ -405,6 +418,12 @@ function parseNonNegativeInteger(value, option) {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 0) fail(`${option} must be a non-negative integer.`);
   return parsed;
+}
+
+function parseConfiguredTransportAllowance(value) {
+  if (value === undefined || value === '') return DEFAULT_TRANSPORT_ALLOWANCE_SECONDS;
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : DEFAULT_TRANSPORT_ALLOWANCE_SECONDS;
 }
 
 function parseWatchInterval(value) {
@@ -861,7 +880,11 @@ function outputDevice(device, json) {
 }
 
 function buildFleetSummary(devices, options = {}) {
-  const summaryDevices = devices.map(buildFleetSummaryDevice);
+  const now = options.now || new Date();
+  const summaryDevices = devices.map(device => buildFleetSummaryDevice(device, {
+    ...options,
+    now,
+  }));
   const inventory = summaryDevices.filter(device => device.coverage.productInventory).length;
   const currentState = summaryDevices.filter(device => device.coverage.currentState).length;
   const runtimeStatus = summaryDevices.filter(device => device.coverage.runtimeStatus).length;
@@ -878,7 +901,7 @@ function buildFleetSummary(devices, options = {}) {
 
   return {
     schema: 'fleet-summary.v1',
-    generatedAt: options.generatedAt || new Date().toISOString(),
+    generatedAt: options.generatedAt || new Date(now).toISOString(),
     productId: String(options.productId || DEFAULT_FLEET_PRODUCT_ID),
     coverage,
     connected: {
@@ -897,13 +920,14 @@ function buildFleetSummary(devices, options = {}) {
   };
 }
 
-function buildFleetSummaryDevice(device) {
+function buildFleetSummaryDevice(device, options = {}) {
   const particle = device.particle || {};
   const runtimeConnectionState = extractRuntimeConnectionState(device);
   const connected = extractParticleConnected(particle, runtimeConnectionState);
   const firmwareVersion = extractFirmwareVersion(device);
   const deviceOsVersion = extractDeviceOsVersion(device);
   const socObservation = extractSocObservation(device);
+  const reportingExpectation = buildReportingExpectation(device, options);
 
   return {
     deviceId: device.deviceId,
@@ -916,6 +940,7 @@ function buildFleetSummaryDevice(device) {
     socPercent: socObservation.socPercent,
     socObservedAt: socObservation.socObservedAt,
     socSource: socObservation.socSource,
+    ...reportingExpectation,
     lastEventTime: device.lastEventTime || null,
     lastHeard: stringValue(particle.last_heard) || stringValue(particle.lastHeard) || null,
     coverage: {
@@ -934,11 +959,103 @@ function buildFleetSummaryDevice(device) {
       networkState: device.networkState || null,
       deviceStatusLedgerUpdatedAt: device.deviceStatusLedgerUpdatedAt || null,
       deviceStatusLedgerFetchedAt: device.deviceStatusLedgerFetchedAt || null,
+      productDefaultsLedgerUpdatedAt: device.productDefaultsLedgerUpdatedAt || null,
+      productDefaultsLedgerFetchedAt: device.productDefaultsLedgerFetchedAt || null,
+      deviceSettingsLedgerUpdatedAt: device.deviceSettingsLedgerUpdatedAt || null,
+      deviceSettingsLedgerFetchedAt: device.deviceSettingsLedgerFetchedAt || null,
       currentStateUpdatedAt: device.updatedAt || null,
       particlePlatformId: particle.platform_id ?? particle.platformId ?? null,
       particleLastIpAddress: particle.last_ip_address || particle.lastIpAddress || null,
     },
   };
+}
+
+function buildReportingExpectation(device, options = {}) {
+  const effectiveConfiguration = overlayConfiguration(
+    device.productDefaultsLedgerData,
+    device.deviceSettingsLedgerData
+  );
+  const reportingIntervalSeconds = configurationSeconds(effectiveConfiguration, [
+    ['timing', 'reportingIntervalSec'],
+    ['reporting', 'intervalSeconds'],
+    ['reporting', 'intervalSec'],
+  ]) ?? configurationMinutesAsSeconds(effectiveConfiguration, [['reporting', 'intervalMinutes']]);
+  const connectionBudgetSeconds = configurationSeconds(effectiveConfiguration, [
+    ['timing', 'connectAttemptBudgetSec'],
+    ['connection', 'connectAttemptBudgetSec'],
+    ['connection', 'budgetSeconds'],
+    ['reporting', 'connectionBudgetSeconds'],
+  ]);
+  const transportAllowanceSeconds = Number.isFinite(options.transportAllowanceSeconds) && options.transportAllowanceSeconds >= 0
+    ? options.transportAllowanceSeconds
+    : DEFAULT_TRANSPORT_ALLOWANCE_SECONDS;
+  const lastApplicationReportAt = stringValue(device.lastApplicationReportAt) ||
+    (device.lastPlane === 'telemetry' ? stringValue(device.lastEventTime) : '') ||
+    null;
+  const lastApplicationReportMs = new Date(lastApplicationReportAt || 0).getTime();
+
+  if (
+    !lastApplicationReportAt ||
+    Number.isNaN(lastApplicationReportMs) ||
+    reportingIntervalSeconds === null ||
+    connectionBudgetSeconds === null
+  ) {
+    return {
+      lastApplicationReportAt,
+      reportingIntervalSeconds,
+      connectionBudgetSeconds,
+      transportAllowanceSeconds,
+      expectedNextReport: null,
+      expectationStatus: 'unknown',
+    };
+  }
+
+  const expectedNextReport = new Date(lastApplicationReportMs + (
+    reportingIntervalSeconds + connectionBudgetSeconds + transportAllowanceSeconds
+  ) * 1000).toISOString();
+  const nowMs = new Date(options.now || new Date()).getTime();
+
+  return {
+    lastApplicationReportAt,
+    reportingIntervalSeconds,
+    connectionBudgetSeconds,
+    transportAllowanceSeconds,
+    expectedNextReport,
+    expectationStatus: !Number.isNaN(nowMs) && nowMs > new Date(expectedNextReport).getTime()
+      ? 'overdue'
+      : 'upcoming',
+  };
+}
+
+function overlayConfiguration(productDefaults, deviceSettings) {
+  const defaults = isPlainObject(productDefaults) ? productDefaults : {};
+  const overrides = isPlainObject(deviceSettings) ? deviceSettings : {};
+  const effective = { ...defaults };
+
+  for (const [key, overrideValue] of Object.entries(overrides)) {
+    const defaultValue = effective[key];
+    effective[key] = isPlainObject(defaultValue) && isPlainObject(overrideValue)
+      ? overlayConfiguration(defaultValue, overrideValue)
+      : overrideValue;
+  }
+  return effective;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function configurationSeconds(configuration, paths) {
+  for (const path of paths) {
+    const value = getNested(configuration, path);
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+  }
+  return null;
+}
+
+function configurationMinutesAsSeconds(configuration, paths) {
+  const minutes = configurationSeconds(configuration, paths);
+  return minutes === null ? null : minutes * 60;
 }
 
 function extractFirmwareVersion(device) {
@@ -1068,8 +1185,8 @@ function renderFleetSummary(summary, options = {}) {
 
   const rows = summary.devices.map(device => fleetSummaryTextRow(device, options, color));
   const columns = options.verbose
-    ? ['NAME', 'DEVICE ID', 'CS', 'RT', 'DD', 'CLOUD', 'FIRMWARE', 'DEVICE OS', 'SOC', 'LAST HEARD', 'RUNTIME', 'SOC OBSERVED', 'SOC SOURCE', 'PARTICLE HEARD', 'LEDGER UPDATED', 'LAST EVENT']
-    : ['NAME', 'DEVICE ID', 'CS', 'RT', 'DD', 'CLOUD', 'FIRMWARE', 'DEVICE OS', 'SOC', 'LAST HEARD', 'RUNTIME'];
+    ? ['NAME', 'DEVICE ID', 'CS', 'RT', 'DD', 'CLOUD', 'FIRMWARE', 'DEVICE OS', 'SOC', 'EXPECTED', 'LAST HEARD', 'RUNTIME', 'SOC OBSERVED', 'SOC SOURCE', 'PARTICLE HEARD', 'LEDGER UPDATED', 'LAST EVENT']
+    : ['NAME', 'DEVICE ID', 'CS', 'RT', 'DD', 'CLOUD', 'FIRMWARE', 'DEVICE OS', 'SOC', 'EXPECTED', 'LAST HEARD', 'RUNTIME'];
   lines.push(...formatTable(rows, columns));
   lines.push('');
   lines.push('Recent Activity');
@@ -1089,6 +1206,7 @@ function fleetSummaryTextRow(device, options, color) {
     FIRMWARE: safe(device.firmwareVersion),
     'DEVICE OS': safe(device.deviceOsVersion),
     SOC: formatSocPercent(device.socPercent),
+    EXPECTED: expectedReportCell(device, options.now || new Date(), color),
     'LAST HEARD': formatFleetTime(fleetDeviceLastHeardTime(device), options),
     RUNTIME: runtimeStatusCell(device, color),
   };
@@ -1255,6 +1373,9 @@ function buildFleetAttention(devices, coverage, options = {}) {
     if (hasRecentSerialActivityWithOlderParticleLastHeard(device, now)) {
       observations.push(`Recent serial activity; Particle last heard ${formatRelativeDuration(device.lastHeard, now)} ago`);
     }
+    if (device.expectationStatus === 'overdue' && device.expectedNextReport) {
+      observations.push(`Expected application report ${formatLongRelativeDuration(device.expectedNextReport, now)} ago`);
+    }
     return {
       deviceId: device.deviceId,
       deviceName: device.deviceName,
@@ -1411,6 +1532,21 @@ function runtimeStatusCell(device, color) {
   if (device.coverage.runtimeStatus) return colorText('Observed', 'green', color);
   if (device.coverage.currentState) return colorText('Pending', 'dim', color);
   return colorText('Unknown', 'dim', color);
+}
+
+function expectedReportCell(device, now, color) {
+  if (!device.expectedNextReport || device.expectationStatus === 'unknown') {
+    return colorText('-', 'dim', color);
+  }
+
+  const expectedMs = new Date(device.expectedNextReport).getTime();
+  const nowMs = new Date(now).getTime();
+  if (Number.isNaN(expectedMs) || Number.isNaN(nowMs)) return colorText('-', 'dim', color);
+  const deltaMs = expectedMs - nowMs;
+  const reference = new Date(nowMs - Math.abs(deltaMs));
+  const duration = formatRelativeDuration(reference, new Date(nowMs));
+  if (deltaMs < 0) return colorText(`${duration} overdue`, 'red', color);
+  return colorText(deltaMs < 1000 ? 'due now' : `in ${duration}`, 'green', color);
 }
 
 function shouldUseColor(options) {
@@ -2177,6 +2313,7 @@ module.exports = {
   buildWatchEntries,
   buildSerialEntries,
   buildFleetSummary,
+  buildReportingExpectation,
   classifyTimelineEvent,
   collectNewTimelineEvents,
   createSerialState,
@@ -2195,6 +2332,7 @@ module.exports = {
   isDeviceId,
   loadDeviceInventory,
   loadLocalOperatorConfig,
+  overlayConfiguration,
   parseEnvFile,
   parseOptions,
   queryTimelineFromDynamo,

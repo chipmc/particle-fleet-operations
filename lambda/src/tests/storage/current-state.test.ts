@@ -7,8 +7,11 @@ import {
   buildCurrentState,
   determineHealthStatus,
   ddb,
+  projectMissingDeviceSettingsLedger,
   queryDeviceCurrentStates,
+  updateDeviceSettingsLedgerSnapshot,
   updateDeviceStatusLedgerSnapshot,
+  updateProductDefaultsLedgerSnapshot,
   updateDeviceCurrentState,
 } from '../../storage/current-state';
 import { normalizeEvent, safeParseData } from '../../utils/parse';
@@ -152,6 +155,7 @@ describe('DeviceCurrentState storage', () => {
     expect(updateCommand.input.ExpressionAttributeValues).toMatchObject({
       ':lastEventType': 'telemetry.occupancy',
       ':lastPlane': 'telemetry',
+      ':lastApplicationReportAt': '2026-07-01T12:00:00.000Z',
       ':battery': 88,
       ':connectTime': 18,
       ':resetCount': 2,
@@ -252,6 +256,56 @@ describe('DeviceCurrentState storage', () => {
     )).resolves.toBe('stale');
   });
 
+  it('should project product-defaults and device-settings snapshots with distinct field names', async () => {
+    mockDdbSend.mockResolvedValue({});
+    const defaults = { timing: { reportingIntervalSec: 3600, connectAttemptBudgetSec: 300 } };
+    const overrides = { timing: { reportingIntervalSec: 1800 } };
+
+    await updateProductDefaultsLedgerSnapshot('current-state-table', 'generalized-core-counter', 'device123', {
+      updatedAt: '2026-07-13T09:00:00.000Z',
+      fetchedAt: '2026-07-13T10:10:00.000Z',
+      data: defaults,
+    });
+    await updateDeviceSettingsLedgerSnapshot('current-state-table', 'generalized-core-counter', 'device123', {
+      updatedAt: '2026-07-13T09:30:00.000Z',
+      fetchedAt: '2026-07-13T10:10:00.000Z',
+      data: overrides,
+    });
+
+    const defaultsCommand = mockDdbSend.mock.calls[0][0] as UpdateCommand;
+    const settingsCommand = mockDdbSend.mock.calls[1][0] as UpdateCommand;
+    expect(defaultsCommand.input.ExpressionAttributeNames).toMatchObject({
+      '#ledgerUpdatedAt': 'productDefaultsLedgerUpdatedAt',
+      '#ledgerFetchedAt': 'productDefaultsLedgerFetchedAt',
+      '#ledgerData': 'productDefaultsLedgerData',
+    });
+    expect(settingsCommand.input.ExpressionAttributeNames).toMatchObject({
+      '#ledgerUpdatedAt': 'deviceSettingsLedgerUpdatedAt',
+      '#ledgerFetchedAt': 'deviceSettingsLedgerFetchedAt',
+      '#ledgerData': 'deviceSettingsLedgerData',
+    });
+  });
+
+  it('should project an optional missing device-settings Ledger by clearing old overrides', async () => {
+    mockDdbSend.mockResolvedValueOnce({});
+
+    await expect(projectMissingDeviceSettingsLedger(
+      'current-state-table',
+      'generalized-core-counter',
+      'device123',
+      '2026-07-13T10:10:00.000Z'
+    )).resolves.toBe('updated');
+
+    const command = mockDdbSend.mock.calls[0][0] as UpdateCommand;
+    expect(command.input.UpdateExpression).toBe(
+      'SET #ledgerFetchedAt = :fetchedAt REMOVE #ledgerUpdatedAt, #ledgerSizeBytes, #ledgerData'
+    );
+    expect(command.input.ExpressionAttributeNames).toMatchObject({
+      '#ledgerFetchedAt': 'deviceSettingsLedgerFetchedAt',
+      '#ledgerData': 'deviceSettingsLedgerData',
+    });
+  });
+
   it('should update current state from serial event without health metrics', () => {
     const state = buildCurrentState({
       projectId: 'generalized-core-counter',
@@ -331,6 +385,7 @@ describe('DeviceCurrentState storage', () => {
         lastIngestTime: '2026-06-26T13:30:05.000Z',
         lastEventType: 'telemetry.health',
         lastPlane: 'telemetry',
+        lastApplicationReportAt: '2026-06-26T13:30:00.000Z',
         severity: 'ERROR',
         serialCategory: 'modem',
         battery: 24,
@@ -347,6 +402,7 @@ describe('DeviceCurrentState storage', () => {
       lastPlane: 'serial',
       lastSourceType: 'serial-forwarder',
       lastEventType: 'serial.lifecycle.connected',
+      lastApplicationReportAt: '2026-06-26T13:30:00.000Z',
       severity: null,
       serialCategory: null,
       networkState: 'connected',

@@ -85,6 +85,7 @@ All data commands support `--json`. Device selectors accept a full Particle devi
 ./tools/telemetry fleet
 ./tools/telemetry fleet --product-id 42131
 ./tools/telemetry fleet --activity-limit 5
+./tools/telemetry fleet --transport-allowance 90s
 ./tools/telemetry fleet --json
 ./tools/telemetry fleet --verbose
 ```
@@ -104,7 +105,7 @@ The text report includes:
 - Fleet header
 - Compact overview with Coverage, Cloud, Firmware, Device OS, and Battery SOC shown side by side in normal-width terminals
 - Devices Requiring Attention section with factual per-device observations
-- Device table with compact evidence columns: `CS` for current state, `RT` for runtime status, and `DD` for device data
+- Device table with compact evidence columns, battery `SOC`, and a human-readable `Expected` application-report time
 - Recent Activity section derived from existing fleet summary/current-state evidence
 
 Compact overview example:
@@ -138,6 +139,7 @@ Terminology:
 - `Firmware`: The application firmware version reported by Particle.
 - `Device OS`: The Particle Device OS version reported by Particle.
 - `SOC`: Battery State of Charge. Fleet Summary prefers the `device-status` Ledger SOC value and falls back to telemetry-derived battery SOC when needed.
+- `Expected`: The next application report, derived from the last application report plus the effective reporting interval, connection-attempt budget, and Fleet Operations transport allowance. Upcoming expectations are green and overdue expectations are red in color-enabled terminals.
 - `Runtime`: Human-readable presence state for the runtime-status projection: `Observed`, `Pending`, or `Unknown`.
 - `Coverage`: Evidence completeness across the Particle product inventory.
 - `Attention`: Factual observations that may warrant operator review. This is not a derived health classification.
@@ -145,7 +147,9 @@ Terminology:
 
 Product inventory is authoritative for fleet membership. `CS`, `RT`, and `DD` are evidence-presence indicators, not health scores. `Device Data: Not Enabled` means no device in the scoped product currently has a `device-data` projection.
 
-Devices Requiring Attention groups factual observations by device. For an online device that has not reported telemetry yet, the section says `Cloud connected` and `Waiting for first telemetry` instead of listing low-level missing projections. For devices with existing telemetry but missing runtime projection evidence, observations use factual wording such as `Last heard 6 hours ago` and `Runtime status not yet observed`. Stale SOC evidence is reported factually, for example `Last reported SOC 18%` and `SOC observation is 7 hr old`; Fleet Summary does not label SOC as healthy, low, warning, or critical. An empty section means no observations apply in the current snapshot.
+Devices Requiring Attention groups factual observations by device. For an online device that has not reported telemetry yet, the section says `Cloud connected` and `Waiting for first telemetry` instead of listing low-level missing projections. For devices with existing telemetry but missing runtime projection evidence, observations use factual wording such as `Last heard 6 hours ago` and `Runtime status not yet observed`. Stale SOC evidence is reported factually, for example `Last reported SOC 18%` and `SOC observation is 7 hr old`. Overdue expectations are also stated as operational facts, for example `Expected application report 12 minutes ago`. Fleet Summary does not convert these facts into health scores or healthy, low, warning, or critical labels. An empty section means no observations apply in the current snapshot.
+
+Expected reporting uses the existing configuration hierarchy. Fleet Operations deep-overlays the optional `device-settings` projection onto `default-settings`, then reads `timing.reportingIntervalSec` and `timing.connectAttemptBudgetSec` from that internal effective configuration. The merged object is not written back to Particle or exposed as a new firmware/cloud contract. The default transport allowance is 60 seconds and can be changed with `--transport-allowance <duration>` or `FLEET_TRANSPORT_ALLOWANCE_SECONDS`.
 
 Recent Activity is newest-first and intentionally lightweight. It uses the shared event presentation layer to classify projected latest-event metadata as `SERIAL`, `COLLECTOR`, `TELEMETRY`, `LIFECYCLE`, or a neutral `EVENT`. Online inventory-only devices with Particle last-heard time appear as an `EVENT` with summary `Connected to Particle Cloud`. Use `--activity-limit <n>` to control the row count. No additional backend APIs are used.
 
@@ -154,6 +158,7 @@ Interactive terminal output may use ANSI color for compact status cues. Color is
 Options:
 - `--product-id <id>`: Particle product ID. Default is `42131`.
 - `--activity-limit <n>`: Recent Activity row limit. Default is `10`; use `0` to hide activity rows.
+- `--transport-allowance <duration>`: Fleet-side delivery allowance added after the configured interval and connection budget. Default is `60s`.
 - `--json`: Emit stable `fleet-summary.v1` JSON.
 - `--verbose`: Include additional per-device metadata, such as exact SOC observation timestamp/source, Particle last-heard time, Ledger update time, and last event type.
 

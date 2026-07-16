@@ -1,6 +1,15 @@
 import { resolveParticleDeviceProductId } from './integrations/particle-api';
-import { ParticleLedgerClient, ParticleLedgerNames } from './integrations/particle-ledger';
-import { updateDeviceStatusLedgerSnapshot } from './storage/current-state';
+import {
+  ParticleLedgerClient,
+  ParticleLedgerNames,
+  ParticleLedgerResult,
+} from './integrations/particle-ledger';
+import {
+  projectMissingDeviceSettingsLedger,
+  updateDeviceSettingsLedgerSnapshot,
+  updateDeviceStatusLedgerSnapshot,
+  updateProductDefaultsLedgerSnapshot,
+} from './storage/current-state';
 import { DeviceCurrentState, ParticleWebhook } from './types';
 
 export type DeviceStatusLedgerRefreshResult =
@@ -93,7 +102,19 @@ async function executeDeviceStatusLedgerRefresh(
     }
 
     const ledgerClient = input.ledgerClient || new ParticleLedgerClient();
-    const ledgerResult = await ledgerClient.getDeviceStatus(productId, input.deviceId);
+    const [ledgerResult, productDefaultsResult, deviceSettingsResult] = await Promise.all([
+      ledgerClient.getDeviceStatus(productId, input.deviceId),
+      ledgerClient.getProductDefaults(productId),
+      ledgerClient.getDeviceSettings(productId, input.deviceId),
+    ]);
+    const fetchedAt = (input.fetchedAt || new Date()).toISOString();
+
+    await projectConfigurationLedgers(
+      input,
+      productDefaultsResult,
+      deviceSettingsResult,
+      fetchedAt
+    );
 
     if (!ledgerResult.ok) {
       logLedgerRefresh({
@@ -119,7 +140,7 @@ async function executeDeviceStatusLedgerRefresh(
 
     const updateResult = await updateDeviceStatusLedgerSnapshot(input.tableName, input.projectId, input.deviceId, {
       updatedAt: ledgerUpdatedAt,
-      fetchedAt: (input.fetchedAt || new Date()).toISOString(),
+      fetchedAt,
       sizeBytes: ledgerResult.instance.size_bytes,
       data: ledgerResult.data,
     });
@@ -135,6 +156,38 @@ async function executeDeviceStatusLedgerRefresh(
   } catch (err) {
     logLedgerRefresh({ deviceId: input.deviceId, result: 'failed', elapsedMs: elapsedMs(), errorKind: 'exception' });
     return 'not_found_or_failed';
+  }
+}
+
+async function projectConfigurationLedgers(
+  input: RefreshDeviceStatusLedgerInput,
+  productDefaultsResult: ParticleLedgerResult,
+  deviceSettingsResult: ParticleLedgerResult,
+  fetchedAt: string
+): Promise<void> {
+  if (productDefaultsResult.ok && productDefaultsResult.instance.updated_at) {
+    await updateProductDefaultsLedgerSnapshot(input.tableName, input.projectId, input.deviceId, {
+      updatedAt: productDefaultsResult.instance.updated_at,
+      fetchedAt,
+      sizeBytes: productDefaultsResult.instance.size_bytes,
+      data: productDefaultsResult.data,
+    });
+  }
+
+  if (deviceSettingsResult.ok && deviceSettingsResult.instance.updated_at) {
+    await updateDeviceSettingsLedgerSnapshot(input.tableName, input.projectId, input.deviceId, {
+      updatedAt: deviceSettingsResult.instance.updated_at,
+      fetchedAt,
+      sizeBytes: deviceSettingsResult.instance.size_bytes,
+      data: deviceSettingsResult.data,
+    });
+  } else if (!deviceSettingsResult.ok && deviceSettingsResult.error.kind === 'missing_ledger') {
+    await projectMissingDeviceSettingsLedger(
+      input.tableName,
+      input.projectId,
+      input.deviceId,
+      fetchedAt
+    );
   }
 }
 

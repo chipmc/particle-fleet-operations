@@ -11,6 +11,9 @@ exports.ddb = void 0;
 exports.updateDeviceCurrentState = updateDeviceCurrentState;
 exports.getDeviceCurrentState = getDeviceCurrentState;
 exports.updateDeviceStatusLedgerSnapshot = updateDeviceStatusLedgerSnapshot;
+exports.updateProductDefaultsLedgerSnapshot = updateProductDefaultsLedgerSnapshot;
+exports.updateDeviceSettingsLedgerSnapshot = updateDeviceSettingsLedgerSnapshot;
+exports.projectMissingDeviceSettingsLedger = projectMissingDeviceSettingsLedger;
 exports.queryDeviceCurrentStates = queryDeviceCurrentStates;
 exports.buildCurrentState = buildCurrentState;
 exports.determineHealthStatus = determineHealthStatus;
@@ -53,15 +56,25 @@ async function getDeviceCurrentState(tableName, projectId, deviceId) {
     return result.Item || null;
 }
 async function updateDeviceStatusLedgerSnapshot(tableName, projectId, deviceId, snapshot) {
+    return updateProjectedLedgerSnapshot(tableName, projectId, deviceId, 'deviceStatus', snapshot);
+}
+async function updateProductDefaultsLedgerSnapshot(tableName, projectId, deviceId, snapshot) {
+    return updateProjectedLedgerSnapshot(tableName, projectId, deviceId, 'productDefaults', snapshot);
+}
+async function updateDeviceSettingsLedgerSnapshot(tableName, projectId, deviceId, snapshot) {
+    return updateProjectedLedgerSnapshot(tableName, projectId, deviceId, 'deviceSettings', snapshot);
+}
+async function updateProjectedLedgerSnapshot(tableName, projectId, deviceId, ledger, snapshot) {
+    const prefix = ledger;
     const assignments = [
         '#ledgerUpdatedAt = :incomingUpdatedAt',
         '#ledgerFetchedAt = :fetchedAt',
         '#ledgerData = :ledgerData',
     ];
     const names = {
-        '#ledgerUpdatedAt': 'deviceStatusLedgerUpdatedAt',
-        '#ledgerFetchedAt': 'deviceStatusLedgerFetchedAt',
-        '#ledgerData': 'deviceStatusLedgerData',
+        '#ledgerUpdatedAt': `${prefix}LedgerUpdatedAt`,
+        '#ledgerFetchedAt': `${prefix}LedgerFetchedAt`,
+        '#ledgerData': `${prefix}LedgerData`,
     };
     const values = {
         ':incomingUpdatedAt': snapshot.updatedAt,
@@ -69,7 +82,7 @@ async function updateDeviceStatusLedgerSnapshot(tableName, projectId, deviceId, 
         ':ledgerData': snapshot.data,
     };
     if (snapshot.sizeBytes !== undefined) {
-        names['#ledgerSizeBytes'] = 'deviceStatusLedgerSizeBytes';
+        names['#ledgerSizeBytes'] = `${prefix}LedgerSizeBytes`;
         values[':sizeBytes'] = snapshot.sizeBytes;
         assignments.push('#ledgerSizeBytes = :sizeBytes');
     }
@@ -88,6 +101,29 @@ async function updateDeviceStatusLedgerSnapshot(tableName, projectId, deviceId, 
         if (err instanceof Error && err.name === 'ConditionalCheckFailedException') {
             return 'stale';
         }
+        throw err;
+    }
+}
+async function projectMissingDeviceSettingsLedger(tableName, projectId, deviceId, fetchedAt) {
+    try {
+        await ddb.send(new lib_dynamodb_1.UpdateCommand({
+            TableName: tableName,
+            Key: { projectId, deviceId },
+            UpdateExpression: 'SET #ledgerFetchedAt = :fetchedAt REMOVE #ledgerUpdatedAt, #ledgerSizeBytes, #ledgerData',
+            ConditionExpression: 'attribute_not_exists(#ledgerFetchedAt) OR #ledgerFetchedAt < :fetchedAt',
+            ExpressionAttributeNames: {
+                '#ledgerUpdatedAt': 'deviceSettingsLedgerUpdatedAt',
+                '#ledgerFetchedAt': 'deviceSettingsLedgerFetchedAt',
+                '#ledgerSizeBytes': 'deviceSettingsLedgerSizeBytes',
+                '#ledgerData': 'deviceSettingsLedgerData',
+            },
+            ExpressionAttributeValues: { ':fetchedAt': fetchedAt },
+        }));
+        return 'updated';
+    }
+    catch (err) {
+        if (err instanceof Error && err.name === 'ConditionalCheckFailedException')
+            return 'stale';
         throw err;
     }
 }
@@ -122,6 +158,9 @@ function buildCurrentState(input) {
         deviceNameResolvedAt: input.previous?.deviceNameResolvedAt || input.deviceNameResolution?.deviceNameResolvedAt,
         deviceNameSource: input.previous?.deviceNameSource || input.deviceNameResolution?.deviceNameSource,
         lastEventTime: input.eventTime,
+        lastApplicationReportAt: input.normalized?.plane === 'telemetry'
+            ? input.eventTime
+            : input.previous?.lastApplicationReportAt,
         lastIngestTime: input.parsed.receivedAt,
         lastEventType: input.normalized?.eventType || input.body.eventType || input.eventName,
         lastPlane: input.normalized?.plane || input.previous?.lastPlane,

@@ -506,11 +506,12 @@ test('timeline API request sends the --since lookback instead of default hours',
   }
 });
 
-test('fleet option parsing supports product id and verbose', () => {
-  const options = parseOptions(['--product-id', '42131', '--activity-limit', '4', '--verbose', '--json']);
+test('fleet option parsing supports product id, transport allowance, and verbose', () => {
+  const options = parseOptions(['--product-id', '42131', '--activity-limit', '4', '--transport-allowance', '2m', '--verbose', '--json']);
 
   assert.equal(options.productId, '42131');
   assert.equal(options.activityLimit, 4);
+  assert.equal(options.transportAllowanceSeconds, 120);
   assert.equal(options.verbose, true);
   assert.equal(options.json, true);
 });
@@ -611,6 +612,104 @@ test('fleet summary joins product inventory, current state, and runtime projecti
     { value: '5.8.0', count: 1 },
   ]);
   assert.equal(summary.devices[0].runtimeConnectionState, 'connected');
+});
+
+test('fleet summary overlays device settings and derives upcoming and overdue application reports', () => {
+  const now = new Date('2026-07-14T08:40:00.000Z');
+  const productDefaultsLedgerData = {
+    timing: {
+      reportingIntervalSec: 3600,
+      connectAttemptBudgetSec: 300,
+      openHour: 6,
+    },
+  };
+  const summary = buildFleetSummary([
+    {
+      projectId: 'generalized-core-counter',
+      deviceId: 'device-upcoming',
+      deviceName: 'Upcoming Counter',
+      hasProductInventory: true,
+      hasCurrentState: true,
+      lastApplicationReportAt: '2026-07-14T08:10:00.000Z',
+      lastEventTime: '2026-07-14T08:25:00.000Z',
+      lastPlane: 'serial',
+      productDefaultsLedgerData,
+      deviceSettingsLedgerData: { timing: { reportingIntervalSec: 1800 } },
+      particle: { connected: true },
+    },
+    {
+      projectId: 'generalized-core-counter',
+      deviceId: 'device-overdue',
+      deviceName: 'Overdue Counter',
+      hasProductInventory: true,
+      hasCurrentState: true,
+      lastApplicationReportAt: '2026-07-14T07:30:00.000Z',
+      lastEventTime: '2026-07-14T07:30:00.000Z',
+      lastPlane: 'telemetry',
+      productDefaultsLedgerData,
+      particle: { connected: false },
+    },
+  ], {
+    productId: '42131',
+    generatedAt: now.toISOString(),
+    now,
+    transportAllowanceSeconds: 60,
+  });
+
+  assert.deepEqual({
+    reportingIntervalSeconds: summary.devices[0].reportingIntervalSeconds,
+    connectionBudgetSeconds: summary.devices[0].connectionBudgetSeconds,
+    transportAllowanceSeconds: summary.devices[0].transportAllowanceSeconds,
+    expectedNextReport: summary.devices[0].expectedNextReport,
+    expectationStatus: summary.devices[0].expectationStatus,
+  }, {
+    reportingIntervalSeconds: 1800,
+    connectionBudgetSeconds: 300,
+    transportAllowanceSeconds: 60,
+    expectedNextReport: '2026-07-14T08:46:00.000Z',
+    expectationStatus: 'upcoming',
+  });
+  assert.equal(summary.devices[0].lastApplicationReportAt, '2026-07-14T08:10:00.000Z');
+  assert.equal(summary.devices[1].expectedNextReport, '2026-07-14T08:36:00.000Z');
+  assert.equal(summary.devices[1].expectationStatus, 'overdue');
+  assert.ok(summary.attention.find(entry => entry.deviceId === 'device-overdue').observations.includes(
+    'Expected application report 4 minutes ago'
+  ));
+
+  const plain = renderFleetSummary(summary, { color: false, now, terminalWidth: 180 }).join('\n');
+  assert.match(plain, /SOC\s+\| EXPECTED/);
+  assert.match(plain, /Upcoming Counter[\s\S]*in 6 min/);
+  assert.match(plain, /Overdue Counter[\s\S]*4 min overdue/);
+  assert.doesNotMatch(summary.attention.flatMap(entry => entry.observations).join(' '), /health|score|warning|critical/i);
+});
+
+test('fleet summary colorizes upcoming expectations green and overdue expectations red', () => {
+  const now = new Date('2026-07-14T08:30:00.000Z');
+  const defaults = { timing: { reportingIntervalSec: 3600, connectAttemptBudgetSec: 300 } };
+  const summary = buildFleetSummary([
+    {
+      deviceId: 'upcoming',
+      deviceName: 'Upcoming',
+      hasProductInventory: true,
+      hasCurrentState: true,
+      lastApplicationReportAt: '2026-07-14T08:00:00.000Z',
+      productDefaultsLedgerData: defaults,
+      particle: { connected: true },
+    },
+    {
+      deviceId: 'overdue',
+      deviceName: 'Overdue',
+      hasProductInventory: true,
+      hasCurrentState: true,
+      lastApplicationReportAt: '2026-07-14T07:20:00.000Z',
+      productDefaultsLedgerData: defaults,
+      particle: { connected: false },
+    },
+  ], { now, transportAllowanceSeconds: 60 });
+
+  const output = renderFleetSummary(summary, { color: true, now, terminalWidth: 180 }).join('\n');
+  assert.match(output, /\x1b\[32min 36 min\x1b\[39m/);
+  assert.match(output, /\x1b\[31m4 min overdue\x1b\[39m/);
 });
 
 test('fleet summary JSON omits verbose metadata by default', () => {

@@ -1,7 +1,12 @@
 import { clearDeviceProductIdCacheForTests, refreshDeviceStatusLedger } from '../ledger-refresh';
 import { resolveParticleDeviceProductId } from '../integrations/particle-api';
 import { ParticleLedgerClient, ParticleLedgerNames, ParticleLedgerResult } from '../integrations/particle-ledger';
-import { updateDeviceStatusLedgerSnapshot } from '../storage/current-state';
+import {
+  projectMissingDeviceSettingsLedger,
+  updateDeviceSettingsLedgerSnapshot,
+  updateDeviceStatusLedgerSnapshot,
+  updateProductDefaultsLedgerSnapshot,
+} from '../storage/current-state';
 import { DeviceCurrentState, ParticleWebhook } from '../types';
 
 jest.mock('../integrations/particle-api');
@@ -9,6 +14,9 @@ jest.mock('../storage/current-state');
 
 const mockResolveProductId = resolveParticleDeviceProductId as jest.MockedFunction<typeof resolveParticleDeviceProductId>;
 const mockUpdateSnapshot = updateDeviceStatusLedgerSnapshot as jest.MockedFunction<typeof updateDeviceStatusLedgerSnapshot>;
+const mockUpdateProductDefaults = updateProductDefaultsLedgerSnapshot as jest.MockedFunction<typeof updateProductDefaultsLedgerSnapshot>;
+const mockUpdateDeviceSettings = updateDeviceSettingsLedgerSnapshot as jest.MockedFunction<typeof updateDeviceSettingsLedgerSnapshot>;
+const mockProjectMissingDeviceSettings = projectMissingDeviceSettingsLedger as jest.MockedFunction<typeof projectMissingDeviceSettingsLedger>;
 const infoSpy = jest.spyOn(console, 'info').mockImplementation(() => undefined);
 
 const originalEnv = process.env;
@@ -44,6 +52,13 @@ function createPrevious(ledgerUpdatedAt?: string): DeviceCurrentState {
 function createClient(result: ParticleLedgerResult | Promise<ParticleLedgerResult>): ParticleLedgerClient {
   return {
     getDeviceStatus: jest.fn().mockResolvedValue(result),
+    getProductDefaults: jest.fn().mockResolvedValue(configurationSuccess(
+      ParticleLedgerNames.productDefault,
+      productId,
+      { timing: { reportingIntervalSec: 3600, connectAttemptBudgetSec: 300 } },
+      '2026-07-13T09:00:00.000Z'
+    )),
+    getDeviceSettings: jest.fn().mockResolvedValue(failureResult('missing_ledger')),
   } as unknown as ParticleLedgerClient;
 }
 
@@ -52,7 +67,35 @@ function createClientWithImplementation(
 ): ParticleLedgerClient {
   return {
     getDeviceStatus: jest.fn(implementation),
+    getProductDefaults: jest.fn().mockResolvedValue(configurationSuccess(
+      ParticleLedgerNames.productDefault,
+      productId,
+      { timing: { reportingIntervalSec: 3600, connectAttemptBudgetSec: 300 } },
+      '2026-07-13T09:00:00.000Z'
+    )),
+    getDeviceSettings: jest.fn().mockResolvedValue(failureResult('missing_ledger')),
   } as unknown as ParticleLedgerClient;
+}
+
+function configurationSuccess(
+  ledgerName: typeof ParticleLedgerNames.productDefault | typeof ParticleLedgerNames.deviceSettings,
+  scopeValue: string,
+  data: Record<string, unknown>,
+  updatedAt: string
+): ParticleLedgerResult {
+  return {
+    ok: true,
+    ledgerName,
+    productId,
+    scopeValue,
+    data,
+    instance: {
+      name: ledgerName,
+      data,
+      updated_at: updatedAt,
+      size_bytes: 128,
+    },
+  };
 }
 
 function successResult(updatedAt: string, resultProductId: string = productId, resultDeviceId: string = deviceId): ParticleLedgerResult {
@@ -123,6 +166,9 @@ describe('device-status Ledger refresh', () => {
     };
     clearDeviceProductIdCacheForTests();
     mockUpdateSnapshot.mockResolvedValue('updated');
+    mockUpdateProductDefaults.mockResolvedValue('updated');
+    mockUpdateDeviceSettings.mockResolvedValue('updated');
+    mockProjectMissingDeviceSettings.mockResolvedValue('updated');
   });
 
   afterEach(() => {
@@ -148,6 +194,56 @@ describe('device-status Ledger refresh', () => {
     await expect(refresh({ ledgerClient: client })).resolves.toBe('updated');
 
     expect(client.getDeviceStatus).toHaveBeenCalledWith(productId, deviceId);
+  });
+
+  it('should project product defaults and device settings into DeviceCurrentState', async () => {
+    const client = createClient(successResult('2026-07-13T10:05:00.000Z'));
+    const deviceSettings = { timing: { reportingIntervalSec: 1800 } };
+    (client.getDeviceSettings as jest.Mock).mockResolvedValue(configurationSuccess(
+      ParticleLedgerNames.deviceSettings,
+      deviceId,
+      deviceSettings,
+      '2026-07-13T09:30:00.000Z'
+    ));
+
+    await expect(refresh({ ledgerClient: client })).resolves.toBe('updated');
+
+    expect(client.getProductDefaults).toHaveBeenCalledWith(productId);
+    expect(client.getDeviceSettings).toHaveBeenCalledWith(productId, deviceId);
+    expect(mockUpdateProductDefaults).toHaveBeenCalledWith(
+      'current-state-table',
+      'generalized-core-counter',
+      deviceId,
+      expect.objectContaining({
+        updatedAt: '2026-07-13T09:00:00.000Z',
+        data: { timing: { reportingIntervalSec: 3600, connectAttemptBudgetSec: 300 } },
+      })
+    );
+    expect(mockUpdateDeviceSettings).toHaveBeenCalledWith(
+      'current-state-table',
+      'generalized-core-counter',
+      deviceId,
+      expect.objectContaining({
+        updatedAt: '2026-07-13T09:30:00.000Z',
+        data: deviceSettings,
+      })
+    );
+    expect(mockProjectMissingDeviceSettings).not.toHaveBeenCalled();
+  });
+
+  it('should record an optional missing device-settings Ledger without removing product defaults', async () => {
+    const client = createClient(successResult('2026-07-13T10:05:00.000Z'));
+
+    await expect(refresh({ ledgerClient: client })).resolves.toBe('updated');
+
+    expect(mockUpdateProductDefaults).toHaveBeenCalledTimes(1);
+    expect(mockUpdateDeviceSettings).not.toHaveBeenCalled();
+    expect(mockProjectMissingDeviceSettings).toHaveBeenCalledWith(
+      'current-state-table',
+      'generalized-core-counter',
+      deviceId,
+      startTime.toISOString()
+    );
   });
 
   it('should refresh when the device is explicitly allow-listed and no product list is configured', async () => {

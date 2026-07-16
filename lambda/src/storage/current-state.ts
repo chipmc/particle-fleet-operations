@@ -84,21 +84,52 @@ export interface DeviceStatusLedgerSnapshot {
   data: Record<string, unknown>;
 }
 
+export type ProjectedLedger = 'deviceStatus' | 'productDefaults' | 'deviceSettings';
+
 export async function updateDeviceStatusLedgerSnapshot(
   tableName: string,
   projectId: string,
   deviceId: string,
   snapshot: DeviceStatusLedgerSnapshot
 ): Promise<'updated' | 'stale'> {
+  return updateProjectedLedgerSnapshot(tableName, projectId, deviceId, 'deviceStatus', snapshot);
+}
+
+export async function updateProductDefaultsLedgerSnapshot(
+  tableName: string,
+  projectId: string,
+  deviceId: string,
+  snapshot: DeviceStatusLedgerSnapshot
+): Promise<'updated' | 'stale'> {
+  return updateProjectedLedgerSnapshot(tableName, projectId, deviceId, 'productDefaults', snapshot);
+}
+
+export async function updateDeviceSettingsLedgerSnapshot(
+  tableName: string,
+  projectId: string,
+  deviceId: string,
+  snapshot: DeviceStatusLedgerSnapshot
+): Promise<'updated' | 'stale'> {
+  return updateProjectedLedgerSnapshot(tableName, projectId, deviceId, 'deviceSettings', snapshot);
+}
+
+async function updateProjectedLedgerSnapshot(
+  tableName: string,
+  projectId: string,
+  deviceId: string,
+  ledger: ProjectedLedger,
+  snapshot: DeviceStatusLedgerSnapshot
+): Promise<'updated' | 'stale'> {
+  const prefix = ledger;
   const assignments = [
     '#ledgerUpdatedAt = :incomingUpdatedAt',
     '#ledgerFetchedAt = :fetchedAt',
     '#ledgerData = :ledgerData',
   ];
   const names: Record<string, string> = {
-    '#ledgerUpdatedAt': 'deviceStatusLedgerUpdatedAt',
-    '#ledgerFetchedAt': 'deviceStatusLedgerFetchedAt',
-    '#ledgerData': 'deviceStatusLedgerData',
+    '#ledgerUpdatedAt': `${prefix}LedgerUpdatedAt`,
+    '#ledgerFetchedAt': `${prefix}LedgerFetchedAt`,
+    '#ledgerData': `${prefix}LedgerData`,
   };
   const values: Record<string, unknown> = {
     ':incomingUpdatedAt': snapshot.updatedAt,
@@ -107,7 +138,7 @@ export async function updateDeviceStatusLedgerSnapshot(
   };
 
   if (snapshot.sizeBytes !== undefined) {
-    names['#ledgerSizeBytes'] = 'deviceStatusLedgerSizeBytes';
+    names['#ledgerSizeBytes'] = `${prefix}LedgerSizeBytes`;
     values[':sizeBytes'] = snapshot.sizeBytes;
     assignments.push('#ledgerSizeBytes = :sizeBytes');
   }
@@ -128,6 +159,33 @@ export async function updateDeviceStatusLedgerSnapshot(
       return 'stale';
     }
 
+    throw err;
+  }
+}
+
+export async function projectMissingDeviceSettingsLedger(
+  tableName: string,
+  projectId: string,
+  deviceId: string,
+  fetchedAt: string
+): Promise<'updated' | 'stale'> {
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: tableName,
+      Key: { projectId, deviceId },
+      UpdateExpression: 'SET #ledgerFetchedAt = :fetchedAt REMOVE #ledgerUpdatedAt, #ledgerSizeBytes, #ledgerData',
+      ConditionExpression: 'attribute_not_exists(#ledgerFetchedAt) OR #ledgerFetchedAt < :fetchedAt',
+      ExpressionAttributeNames: {
+        '#ledgerUpdatedAt': 'deviceSettingsLedgerUpdatedAt',
+        '#ledgerFetchedAt': 'deviceSettingsLedgerFetchedAt',
+        '#ledgerSizeBytes': 'deviceSettingsLedgerSizeBytes',
+        '#ledgerData': 'deviceSettingsLedgerData',
+      },
+      ExpressionAttributeValues: { ':fetchedAt': fetchedAt },
+    }));
+    return 'updated';
+  } catch (err) {
+    if (err instanceof Error && err.name === 'ConditionalCheckFailedException') return 'stale';
     throw err;
   }
 }
@@ -184,6 +242,9 @@ function buildCurrentState(input: BuildStateInput): DeviceCurrentState {
     deviceNameResolvedAt: input.previous?.deviceNameResolvedAt || input.deviceNameResolution?.deviceNameResolvedAt,
     deviceNameSource: input.previous?.deviceNameSource || input.deviceNameResolution?.deviceNameSource,
     lastEventTime: input.eventTime,
+    lastApplicationReportAt: input.normalized?.plane === 'telemetry'
+      ? input.eventTime
+      : input.previous?.lastApplicationReportAt,
     lastIngestTime: input.parsed.receivedAt,
     lastEventType: input.normalized?.eventType || input.body.eventType || input.eventName,
     lastPlane: input.normalized?.plane || input.previous?.lastPlane,

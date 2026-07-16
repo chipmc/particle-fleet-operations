@@ -21,7 +21,11 @@ export interface DeviceStatusLedgerSnapshot {
     sizeBytes?: number;
     data: Record<string, unknown>;
 }
+export type ProjectedLedger = 'deviceStatus' | 'productDefaults' | 'deviceSettings';
 export declare function updateDeviceStatusLedgerSnapshot(tableName: string, projectId: string, deviceId: string, snapshot: DeviceStatusLedgerSnapshot): Promise<'updated' | 'stale'>;
+export declare function updateProductDefaultsLedgerSnapshot(tableName: string, projectId: string, deviceId: string, snapshot: DeviceStatusLedgerSnapshot): Promise<'updated' | 'stale'>;
+export declare function updateDeviceSettingsLedgerSnapshot(tableName: string, projectId: string, deviceId: string, snapshot: DeviceStatusLedgerSnapshot): Promise<'updated' | 'stale'>;
+export declare function projectMissingDeviceSettingsLedger(tableName: string, projectId: string, deviceId: string, fetchedAt: string): Promise<'updated' | 'stale'>;
 export declare function queryDeviceCurrentStates(tableName: string, projectId: string, limit?: number): Promise<DeviceCurrentState[]>;
 interface BuildStateInput {
     projectId: string;

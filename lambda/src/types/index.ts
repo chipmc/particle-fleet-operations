@@ -318,6 +318,7 @@ export interface DeviceCurrentState {
   deviceNameResolvedAt?: string;
   deviceNameSource?: 'particle-api';
   lastEventTime: string;
+  lastApplicationReportAt?: string;
   lastIngestTime: string;
   lastEventType: string;
   lastPlane?: EventPlane;
@@ -346,6 +347,14 @@ export interface DeviceCurrentState {
   deviceStatusLedgerFetchedAt?: string;
   deviceStatusLedgerSizeBytes?: number;
   deviceStatusLedgerData?: Record<string, unknown>;
+  productDefaultsLedgerUpdatedAt?: string;
+  productDefaultsLedgerFetchedAt?: string;
+  productDefaultsLedgerSizeBytes?: number;
+  productDefaultsLedgerData?: Record<string, unknown>;
+  deviceSettingsLedgerUpdatedAt?: string;
+  deviceSettingsLedgerFetchedAt?: string;
+  deviceSettingsLedgerSizeBytes?: number;
+  deviceSettingsLedgerData?: Record<string, unknown>;
   updatedAt: string;
 }
 

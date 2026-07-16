@@ -59,7 +59,13 @@ async function executeDeviceStatusLedgerRefresh(input) {
             return 'missing_product_id';
         }
         const ledgerClient = input.ledgerClient || new particle_ledger_1.ParticleLedgerClient();
-        const ledgerResult = await ledgerClient.getDeviceStatus(productId, input.deviceId);
+        const [ledgerResult, productDefaultsResult, deviceSettingsResult] = await Promise.all([
+            ledgerClient.getDeviceStatus(productId, input.deviceId),
+            ledgerClient.getProductDefaults(productId),
+            ledgerClient.getDeviceSettings(productId, input.deviceId),
+        ]);
+        const fetchedAt = (input.fetchedAt || new Date()).toISOString();
+        await projectConfigurationLedgers(input, productDefaultsResult, deviceSettingsResult, fetchedAt);
         if (!ledgerResult.ok) {
             logLedgerRefresh({
                 deviceId: input.deviceId,
@@ -81,7 +87,7 @@ async function executeDeviceStatusLedgerRefresh(input) {
         }
         const updateResult = await (0, current_state_1.updateDeviceStatusLedgerSnapshot)(input.tableName, input.projectId, input.deviceId, {
             updatedAt: ledgerUpdatedAt,
-            fetchedAt: (input.fetchedAt || new Date()).toISOString(),
+            fetchedAt,
             sizeBytes: ledgerResult.instance.size_bytes,
             data: ledgerResult.data,
         });
@@ -97,6 +103,27 @@ async function executeDeviceStatusLedgerRefresh(input) {
     catch (err) {
         logLedgerRefresh({ deviceId: input.deviceId, result: 'failed', elapsedMs: elapsedMs(), errorKind: 'exception' });
         return 'not_found_or_failed';
+    }
+}
+async function projectConfigurationLedgers(input, productDefaultsResult, deviceSettingsResult, fetchedAt) {
+    if (productDefaultsResult.ok && productDefaultsResult.instance.updated_at) {
+        await (0, current_state_1.updateProductDefaultsLedgerSnapshot)(input.tableName, input.projectId, input.deviceId, {
+            updatedAt: productDefaultsResult.instance.updated_at,
+            fetchedAt,
+            sizeBytes: productDefaultsResult.instance.size_bytes,
+            data: productDefaultsResult.data,
+        });
+    }
+    if (deviceSettingsResult.ok && deviceSettingsResult.instance.updated_at) {
+        await (0, current_state_1.updateDeviceSettingsLedgerSnapshot)(input.tableName, input.projectId, input.deviceId, {
+            updatedAt: deviceSettingsResult.instance.updated_at,
+            fetchedAt,
+            sizeBytes: deviceSettingsResult.instance.size_bytes,
+            data: deviceSettingsResult.data,
+        });
+    }
+    else if (!deviceSettingsResult.ok && deviceSettingsResult.error.kind === 'missing_ledger') {
+        await (0, current_state_1.projectMissingDeviceSettingsLedger)(input.tableName, input.projectId, input.deviceId, fetchedAt);
     }
 }
 function logLedgerRefresh(input) {
