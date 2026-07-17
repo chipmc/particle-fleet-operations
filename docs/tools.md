@@ -2,6 +2,40 @@
 
 Local inspection and diagnostic tools for particle-fleet-operations.
 
+## Safe Git Commit Helper
+
+`tools/commit` provides a reviewed local commit workflow without pushing or deploying. It resolves the repository root through Git, so it may be invoked from the repository root or a subdirectory. The executable is included with the repository and requires no installation step beyond a normal checkout.
+
+```bash
+./tools/commit "Describe the change"
+./tools/commit --full "Describe the change"
+```
+
+Before staging, the helper verifies the `chipmc/particle-fleet-operations` origin, reports the repository and branch, rejects merge/rebase conflicts and clean worktrees, and presents one status-grouped change summary with file and line totals. A non-`main` branch requires explicit confirmation, and untracked files produce a warning.
+
+Validation is selected from all currently changed paths. Successful checks are reported as short `OK` lines; command output is shown only when a check fails:
+
+- `tools/`: `node --check tools/telemetry` and `node --test tools/telemetry.test.js`
+- `lambda/`: `npm run build` and `npm test` from `lambda/`
+- `scripts/`: `npm test` from `scripts/`
+- `infra/`: `npm run build` and `npm test` from `infra/`
+- Documentation-only or other paths: `git diff --check`
+
+`--full` runs every validation group. Any failure stops before the helper stages or commits changes.
+
+After validation, the helper lists every changed and untracked file before asking how to prepare the commit:
+
+- `all`: stage every listed file after confirmation.
+- `files`: display a numbered list and stage only the selected files.
+- `changes`: review and choose individual changes interactively.
+- `cancel`: leave Git state unchanged.
+
+The common path is `all`: validate, review the explicit file list, confirm staging, review the staged summary, and commit. Use `files` when the worktree contains unrelated files; use `changes` only when a file itself needs to be split. The helper checks the staged diff for whitespace errors, shows the proposed message, lists the five most recent commit subjects, reports whether the branch is ahead of or up to date with `origin`, and asks for final confirmation before committing.
+
+The helper never amends, pushes, deploys, invokes `sudo`, or accesses secret-file contents. After a successful commit it recalculates the ahead-of-origin status and prints a concise confirmation followed by `git push origin main` as a separate next step; the operator runs that command independently.
+
+Future extension point: a separate `tools/push` helper may provide an independently confirmed publish step. `tools/commit` must not invoke it. The operator-controlled sequence remains local commit, optional push, and a separate future deployment action.
+
 ## Telemetry Operator CLI
 
 ### Purpose

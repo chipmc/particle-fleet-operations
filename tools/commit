@@ -1,0 +1,313 @@
+#!/usr/bin/env sh
+set -eu
+
+EXPECTED_REMOTE_PATTERN='(^|[:/])chipmc/particle-fleet-operations(\.git)?$'
+FULL_VALIDATION=no
+
+fail() {
+  printf 'ERROR: %s\n' "$1" >&2
+  exit 1
+}
+
+usage() {
+  printf '%s\n' 'Usage:'
+  printf '%s\n' '  ./tools/commit "Commit message"'
+  printf '%s\n' '  ./tools/commit --full "Commit message"'
+}
+
+confirm() {
+  prompt="$1"
+  printf '%s [y/N] ' "${prompt}"
+  IFS= read -r answer || return 1
+  case "${answer}" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+run_validation_group() {
+  label="$1"
+  directory="$2"
+  shift 2
+
+  validation_log="${TEMP_DIR}/validation.log"
+  if ! (cd "${REPO_ROOT}/${directory}" && "$@") >"${validation_log}" 2>&1; then
+    printf '\nValidation failed: %s\n' "${label}" >&2
+    cat "${validation_log}" >&2
+    fail "${label} validation failed. Nothing was staged or committed by this helper."
+  fi
+  passed_count=''
+  if [ "${label}" = 'CLI tests' ]; then
+    passed_count="$(sed -n 's/.*tests \([0-9][0-9]*\).*/\1/p' "${validation_log}" | tail -1)"
+  fi
+  if [ -n "${passed_count}" ]; then
+    printf '✓ %s (%s passed)\n' "${label}" "${passed_count}"
+  else
+    printf '✓ %s\n' "${label}"
+  fi
+}
+
+has_changed_path() {
+  prefix="$1"
+  printf '%s\n' "${CHANGED_PATHS}" | grep -Eq "^${prefix}"
+}
+
+list_changed_paths() {
+  {
+    git diff --name-only HEAD
+    git ls-files --others --exclude-standard
+  } | sed '/^$/d' | sort -u
+}
+
+print_change_group() {
+  title="$1"
+  category="$2"
+  matches="$(awk -v requested="${category}" '
+    {
+      status = substr($0, 1, 2)
+      if (status == "??" || status ~ /A/) current = "new"
+      else if (status ~ /R/) current = "renamed"
+      else if (status ~ /D/) current = "deleted"
+      else current = "modified"
+      if (current == requested) print "  " substr($0, 4)
+    }
+  ' "${TEMP_DIR}/status")"
+  if [ -n "${matches}" ]; then
+    printf '\n%s\n%s\n' "${title}" "${matches}"
+  fi
+}
+
+print_change_summary() {
+  git status --porcelain > "${TEMP_DIR}/status"
+  print_change_group 'Modified' 'modified'
+  print_change_group 'New' 'new'
+  print_change_group 'Deleted' 'deleted'
+  print_change_group 'Renamed' 'renamed'
+
+  file_count="$(list_changed_paths | wc -l | tr -d '[:space:]')"
+  printf '\n%s file%s changed\n' "${file_count}" "$( [ "${file_count}" = 1 ] || printf 's' )"
+
+  numstat="${TEMP_DIR}/numstat"
+  git diff --numstat HEAD > "${numstat}"
+  git ls-files --others --exclude-standard | while IFS= read -r path; do
+    if [ -f "${path}" ]; then
+      lines="$(wc -l < "${path}" | tr -d '[:space:]')"
+      printf '%s\t0\t%s\n' "${lines}" "${path}" >> "${numstat}"
+    fi
+  done
+  awk '
+    $1 ~ /^[0-9]+$/ { insertions += $1 }
+    $2 ~ /^[0-9]+$/ { deletions += $2 }
+    END {
+      if (insertions == 1) printf "1 insertion\n"
+      else if (insertions > 1) printf "%d insertions\n", insertions
+      if (deletions == 1) printf "1 deletion\n"
+      else if (deletions > 1) printf "%d deletions\n", deletions
+    }
+  ' "${numstat}"
+}
+
+check_whitespace() {
+  scope="$1"
+  shift
+  whitespace_log="${TEMP_DIR}/whitespace.log"
+  if ! "$@" >"${whitespace_log}" 2>&1; then
+    printf '\nWhitespace issues detected.\n\nGit reported:\n\n' >&2
+    cat "${whitespace_log}" >&2
+    printf '\nNo commit was created.\n\nPlease correct the whitespace issues above and run the helper again.\n' >&2
+    fail "${scope} whitespace check failed."
+  fi
+}
+
+print_recent_commits() {
+  printf '\nRecent commits\n\n'
+  git log -5 --format='%s' | awk '{ printf "%d. %s\n", NR, $0 }'
+}
+
+print_repository_status() {
+  printf '\nRepository status\n\n'
+  remote_ref="refs/remotes/origin/${BRANCH}"
+  if ! git rev-parse -q --verify "${remote_ref}" >/dev/null 2>&1; then
+    printf '%s\n' 'Origin status unavailable'
+    return
+  fi
+
+  ahead="$(git rev-list --count "${remote_ref}..HEAD")"
+  behind="$(git rev-list --count "HEAD..${remote_ref}")"
+  if [ "${ahead}" -gt 0 ] && [ "${behind}" -gt 0 ]; then
+    printf 'Diverged from origin: %s ahead, %s behind\n' "${ahead}" "${behind}"
+  elif [ "${ahead}" -gt 0 ]; then
+    printf 'Ahead of origin by %s commit%s\n' "${ahead}" "$( [ "${ahead}" = 1 ] || printf 's' )"
+  elif [ "${behind}" -gt 0 ]; then
+    printf 'Behind origin by %s commit%s\n' "${behind}" "$( [ "${behind}" = 1 ] || printf 's' )"
+  else
+    printf '%s\n' 'Up to date with origin'
+  fi
+}
+
+stage_selected_files() {
+  numbered_paths="${TEMP_DIR}/changed-paths"
+  list_changed_paths > "${numbered_paths}"
+  awk '{ printf "%d. %s\n", NR, $0 }' "${numbered_paths}"
+  printf '\nEnter numbers separated by spaces.\n\nExample:\n1 3\n\nor type:\n\ncancel\n\nSelection: '
+  IFS= read -r selections || fail 'No file selection was provided.'
+
+  if [ "${selections}" = cancel ]; then
+    printf '%s\n' 'Cancelled without changing Git state.'
+    exit 0
+  fi
+
+  [ -n "${selections}" ] || fail 'No files were selected.'
+  selected_count=0
+  for selection in ${selections}; do
+    case "${selection}" in
+      *[!0-9]*|'') fail "Invalid file number: ${selection}" ;;
+    esac
+    selected_path="$(sed -n "${selection}p" "${numbered_paths}")"
+    [ -n "${selected_path}" ] || fail "File number is out of range: ${selection}"
+    git add -- "${selected_path}"
+    selected_count=$((selected_count + 1))
+  done
+
+  [ "${selected_count}" -gt 0 ] || fail 'No files were selected.'
+}
+
+if [ "${1:-}" = '--full' ]; then
+  FULL_VALIDATION=yes
+  shift
+fi
+
+if [ "$#" -ne 1 ]; then
+  usage >&2
+  fail 'A non-empty commit message is required.'
+fi
+
+COMMIT_MESSAGE="$1"
+if [ -z "$(printf '%s' "${COMMIT_MESSAGE}" | tr -d '[:space:]')" ]; then
+  fail 'A non-empty commit message is required.'
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || fail 'No Git repository was found.'
+cd "${REPO_ROOT}"
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/particle-commit.XXXXXX")"
+trap 'rm -rf "${TEMP_DIR}"' EXIT HUP INT TERM
+
+REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null)" || fail 'Git remote origin was not found.'
+if ! printf '%s\n' "${REMOTE_URL}" | grep -Eq "${EXPECTED_REMOTE_PATTERN}"; then
+  fail "Git remote origin does not correspond to chipmc/particle-fleet-operations."
+fi
+
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || fail 'Current Git branch could not be determined.'
+printf 'Repository: %s\n' "$(basename "${REPO_ROOT}")"
+printf 'Branch: %s\n' "${BRANCH}"
+
+if [ "${BRANCH}" = HEAD ]; then
+  fail 'Detached HEAD is not supported.'
+fi
+
+if [ "${BRANCH}" != main ]; then
+  printf 'WARNING: current branch is not main.\n' >&2
+  confirm "Continue from branch ${BRANCH}?" || fail 'Commit cancelled on non-main branch.'
+fi
+
+if [ -d "$(git rev-parse --git-path rebase-merge)" ] ||
+   [ -d "$(git rev-parse --git-path rebase-apply)" ] ||
+   git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 ||
+   [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+  fail 'A merge, rebase, or unresolved conflict is in progress.'
+fi
+
+if [ -z "$(git status --porcelain)" ]; then
+  fail 'There are no changes to commit.'
+fi
+
+if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+  printf 'WARNING: untracked files exist and will require an explicit staging choice.\n' >&2
+fi
+
+printf '\nSummary\n'
+printf '%s\n' '-------'
+print_change_summary
+check_whitespace 'Working-tree' git diff --check
+check_whitespace 'Staged' git diff --cached --check
+
+CHANGED_PATHS="$(list_changed_paths)"
+
+printf '\nValidation\n'
+printf '%s\n' '----------'
+if [ "${FULL_VALIDATION}" = yes ] || has_changed_path 'tools/'; then
+  run_validation_group 'CLI syntax' '.' node --check tools/telemetry
+  run_validation_group 'CLI tests' '.' node --test tools/telemetry.test.js
+fi
+
+if [ "${FULL_VALIDATION}" = yes ] || has_changed_path 'lambda/'; then
+  run_validation_group 'Lambda build' 'lambda' npm run build
+  run_validation_group 'Lambda tests' 'lambda' npm test
+fi
+
+if [ "${FULL_VALIDATION}" = yes ] || has_changed_path 'scripts/'; then
+  run_validation_group 'Scripts tests' 'scripts' npm test
+fi
+
+if [ "${FULL_VALIDATION}" = yes ] || has_changed_path 'infra/'; then
+  run_validation_group 'Infrastructure build' 'infra' npm run build
+  run_validation_group 'Infrastructure tests' 'infra' npm test
+fi
+
+printf '%s\n' '✓ Whitespace'
+
+printf '\nHow would you like to prepare this commit?\n'
+printf '%s\n' '  all      Stage every file listed above'
+printf '%s\n' '  files    Choose files by number'
+printf '%s\n' '  changes  Review and choose individual changes'
+printf '%s\n' '  cancel   Leave Git state unchanged'
+printf '%s' 'Selection: '
+IFS= read -r staging_choice || fail 'No staging choice was provided.'
+
+case "${staging_choice}" in
+  all)
+    confirm 'Stage every listed file?' || fail 'Staging cancelled; Git state was not changed.'
+    git add --all
+    ;;
+  files)
+    printf '\nChoose files\n'
+    printf '%s\n' '------------'
+    stage_selected_files
+    ;;
+  changes)
+    git add -p
+    ;;
+  cancel)
+    printf '%s\n' 'Cancelled without changing Git state.'
+    exit 0
+    ;;
+  *)
+    fail 'Unknown staging choice; Git state was not changed.'
+    ;;
+esac
+
+if git diff --cached --quiet; then
+  fail 'Nothing is staged for commit.'
+fi
+
+check_whitespace 'Staged' git diff --cached --check
+
+printf '\nReady to commit\n\nFiles\n\n'
+git diff --cached --name-status
+printf '\nSummary\n\n'
+git diff --cached --shortstat
+printf '\nCommit message\n\n%s\n' "${COMMIT_MESSAGE}"
+print_recent_commits
+print_repository_status
+confirm 'Create this commit?' || fail 'Commit cancelled. Staged changes were preserved.'
+
+commit_log="${TEMP_DIR}/commit.log"
+if ! git commit -m "${COMMIT_MESSAGE}" >"${commit_log}" 2>&1; then
+  cat "${commit_log}" >&2
+  fail 'Commit was not created.'
+fi
+
+printf '\n%s\n' 'Commit created successfully.'
+print_repository_status
+printf '\n%s\n' 'Next step'
+printf '%s\n' 'git push origin main'
