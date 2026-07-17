@@ -6,6 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const { URLSearchParams } = require('url');
 const {
+  isRoutineSerialLifecycleEvent,
   presentEvent,
   presentObservation,
 } = require('./event-presentation');
@@ -1409,7 +1410,7 @@ function buildFleetRecentActivity(devices, options = {}) {
   return devices.map((device) => {
     const reportedAt = stringValue(device.lastEventTime);
     if (reportedAt) {
-      const presentation = presentEvent({
+      const event = {
         eventTime: reportedAt,
         deviceId: device.deviceId,
         deviceName: device.deviceName,
@@ -1418,7 +1419,10 @@ function buildFleetRecentActivity(devices, options = {}) {
         plane: device.metadata?.lastPlane,
         sourceType: device.metadata?.lastSourceType,
         severity: device.metadata?.lastSeverity,
-      });
+      };
+      if (isRoutineSerialLifecycleEvent(event)) return null;
+
+      const presentation = presentEvent(event);
       return {
         ...presentation,
         source: 'DeviceCurrentState',

@@ -59,6 +59,25 @@ function presentObservation(kind, input = {}, options = {}) {
   });
 }
 
+function isRoutineSerialLifecycleEvent(event = {}) {
+  const severity = normalizeSeverity(event.severity);
+  if (severity === 'warning' || severity === 'error' || severity === 'critical') return false;
+
+  const identities = [event.eventType, event.eventName, event.sourceEventType]
+    .map(value => text(value).toUpperCase())
+    .filter(Boolean);
+  return identities.some(value =>
+    value === 'SERIAL_CONNECTING' ||
+    value === 'SERIAL_CONNECTED' ||
+    value === 'SERIAL_DISCONNECTED' ||
+    value === 'SERIAL_MISSING' ||
+    value === 'SERIAL.LIFECYCLE.CONNECTING' ||
+    value === 'SERIAL.LIFECYCLE.CONNECTED' ||
+    value === 'SERIAL.LIFECYCLE.DISCONNECTED' ||
+    value === 'SERIAL.LIFECYCLE.MISSING'
+  );
+}
+
 function presentationRecord(input) {
   const record = {
     time: nullable(input.time),
@@ -245,6 +264,7 @@ function text(value) {
 module.exports = {
   PRESENTATION_KINDS,
   compactMetricSummary,
+  isRoutineSerialLifecycleEvent,
   normalizeSeverity,
   presentEvent,
   presentObservation,

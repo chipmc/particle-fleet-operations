@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
+  isRoutineSerialLifecycleEvent,
   normalizeSeverity,
   presentEvent,
   presentObservation,
@@ -1201,7 +1202,77 @@ test('fleet summary classifies telemetry, lifecycle, and unknown latest events f
   assert.deepEqual(summary.attention, []);
 });
 
-test('fleet Recent Activity presents collector lifecycle without calling it telemetry or firmware serial', () => {
+test('routine serial lifecycle classification covers canonical and legacy identities', () => {
+  for (const eventType of [
+    'serial.lifecycle.connecting',
+    'serial.lifecycle.connected',
+    'serial.lifecycle.disconnected',
+    'serial.lifecycle.missing',
+    'SERIAL_CONNECTING',
+    'SERIAL_CONNECTED',
+    'SERIAL_DISCONNECTED',
+    'SERIAL_MISSING',
+  ]) {
+    assert.equal(isRoutineSerialLifecycleEvent({ eventType }), true, eventType);
+  }
+  assert.equal(isRoutineSerialLifecycleEvent({ sourceEventType: 'SERIAL_MISSING' }), true);
+  assert.equal(isRoutineSerialLifecycleEvent({ eventName: 'SERIAL_CONNECTED' }), true);
+  assert.equal(isRoutineSerialLifecycleEvent({ eventType: 'collector.post.failed' }), false);
+  assert.equal(isRoutineSerialLifecycleEvent({ eventType: 'serial.lifecycle.disconnected', severity: 'ERROR' }), false);
+});
+
+test('fleet Recent Activity omits routine collector lifecycle and fills the limit with meaningful activity', () => {
+  const devices = [
+    ['connecting', 'serial.lifecycle.connecting', '2026-07-14T11:14:00.000Z'],
+    ['connected', 'serial.lifecycle.connected', '2026-07-14T11:13:00.000Z'],
+    ['disconnected', 'serial.lifecycle.disconnected', '2026-07-14T11:12:00.000Z'],
+    ['missing', 'serial.lifecycle.missing', '2026-07-14T11:11:00.000Z'],
+  ].map(([deviceId, lastEventType, lastEventTime]) => ({
+    projectId: 'generalized-core-counter',
+    deviceId,
+    deviceName: deviceId,
+    hasProductInventory: true,
+    hasCurrentState: true,
+    lastEventTime,
+    lastEventType,
+    lastPlane: 'serial',
+    lastSourceType: 'serial-forwarder',
+    particle: { connected: false },
+  }));
+  devices.push(
+    {
+      projectId: 'generalized-core-counter',
+      deviceId: 'serial-device',
+      deviceName: 'Serial Device',
+      hasProductInventory: true,
+      hasCurrentState: true,
+      lastEventTime: '2026-07-14T11:10:00.000Z',
+      lastEventType: 'serial.log',
+      lastPlane: 'serial',
+      particle: { connected: false },
+    },
+    {
+      projectId: 'generalized-core-counter',
+      deviceId: 'telemetry-device',
+      deviceName: 'Telemetry Device',
+      hasProductInventory: true,
+      hasCurrentState: true,
+      lastEventTime: '2026-07-14T11:09:00.000Z',
+      lastEventType: 'telemetry.occupancy',
+      lastPlane: 'telemetry',
+      particle: { connected: true },
+    }
+  );
+
+  const summary = buildFleetSummary(devices, { productId: '42131', activityLimit: 2 });
+
+  assert.deepEqual(summary.recentActivity.map(entry => [entry.deviceName, entry.kind, entry.summary]), [
+    ['Serial Device', 'SERIAL', 'Serial log event'],
+    ['Telemetry Device', 'TELEMETRY', 'Occupancy report'],
+  ]);
+});
+
+test('fleet Recent Activity keeps collector failures and detailed timelines keep routine lifecycle events', () => {
   const summary = buildFleetSummary([{
     projectId: 'generalized-core-counter',
     deviceId: 'collector-device',
@@ -1209,15 +1280,25 @@ test('fleet Recent Activity presents collector lifecycle without calling it tele
     hasProductInventory: true,
     hasCurrentState: true,
     lastEventTime: '2026-07-14T11:11:00.000Z',
-    lastEventType: 'serial.lifecycle.disconnected',
+    lastEventType: 'collector.post.failed',
     lastPlane: 'serial',
     lastSourceType: 'serial-forwarder',
-    deviceStatusLedgerUpdatedAt: '2026-07-14T11:11:30.000Z',
-    particle: { connected: false, last_heard: '2026-07-14T11:10:00.000Z' },
+    severity: 'ERROR',
+    particle: { connected: false },
   }], { productId: '42131' });
+  const timeline = timelinePresentationRows({ deviceId: 'collector-device', deviceName: 'Collector Device' }, {
+    events: [event({
+      eventName: 'serialLog',
+      eventType: 'serial.lifecycle.disconnected',
+      plane: 'serial',
+    })],
+  });
 
-  assert.deepEqual(summary.recentActivity.map(entry => [entry.kind, entry.summary, entry.sourceType]), [
-    ['COLLECTOR', 'Serial device disconnected', 'serial-forwarder'],
+  assert.deepEqual(summary.recentActivity.map(entry => [entry.kind, entry.eventType]), [
+    ['COLLECTOR', 'collector.post.failed'],
+  ]);
+  assert.deepEqual(timeline.presentations.map(entry => [entry.kind, entry.summary]), [
+    ['COLLECTOR', 'Serial device disconnected'],
   ]);
 });
 
