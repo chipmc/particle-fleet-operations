@@ -19,6 +19,8 @@ If your AWS CLI profile does not have a default region, pass `--region <region>`
 
 Particle credentials are local operator credentials. The CLI prefers `PARTICLE_ACCESS_TOKEN` from the current shell and then reads `~/.particle-log-monitoring/secrets.env` if present. It does not use the deployed Lambda environment as the normal Particle credential source and never prints token values.
 
+Particle Product inventory is the canonical source for displayed fleet identity. Data commands resolve the Product inventory name before rendering device selectors, summaries, timelines, watch banners, serial reconstruction source labels, and recent activity. Historical `DeviceCurrentState.deviceName` values and Serial Forwarder metadata remain correlation evidence; they do not override the displayed Product name. If Product inventory has no name for a device, the CLI displays the Device ID.
+
 ### Quick Start
 
 ```bash
@@ -90,7 +92,7 @@ All data commands support `--json`. Device selectors accept a full Particle devi
 ./tools/telemetry fleet --verbose
 ```
 
-`fleet` is the first Fleet Operations summary command. It scopes the report to one Particle product, defaulting to Product `42131`, and joins Particle product inventory, `DeviceCurrentState`, and the existing runtime projection. It does not infer health.
+`fleet` is the first Fleet Operations summary command. It scopes the report to one Particle product, defaulting to Product `42131`, and joins Particle product inventory, `DeviceCurrentState`, and the existing runtime projection. Product inventory is authoritative for displayed device names. It does not infer health.
 
 `fleet` requires a local Particle operator token because Product inventory comes from the Particle API. Source the local operator cache before running if the token is not already in your shell:
 
@@ -145,7 +147,7 @@ Terminology:
 - `Attention`: Factual observations that may warrant operator review. This is not a derived health classification.
 - `Recent Activity`: Recent fleet observations, newest first.
 
-Product inventory is authoritative for fleet membership. `CS`, `RT`, and `DD` are evidence-presence indicators, not health scores. `Device Data: Not Enabled` means no device in the scoped product currently has a `device-data` projection.
+Product inventory is authoritative for fleet membership and displayed fleet identity. `CS`, `RT`, and `DD` are evidence-presence indicators, not health scores. `Device Data: Not Enabled` means no device in the scoped product currently has a `device-data` projection.
 
 Devices Requiring Attention groups factual observations by device. For an online device that has not reported telemetry yet, the section says `Cloud connected` and `Waiting for first telemetry` instead of listing low-level missing projections. For devices with existing telemetry but missing runtime projection evidence, observations use factual wording such as `Last heard 6 hours ago` and `Runtime status not yet observed`. Stale SOC evidence is reported factually, for example `Last reported SOC 18%` and `SOC observation is 7 hr old`. Overdue expectations are also stated as operational facts, for example `Expected application report 12 minutes ago`. Fleet Summary does not convert these facts into health scores or healthy, low, warning, or critical labels. An empty section means no observations apply in the current snapshot.
 
@@ -268,7 +270,7 @@ Timeline accepts either `--hours <number>` or `--since <duration>`. `--since` su
 ./tools/telemetry serial Boron-soak-1 --since 1h --json
 ```
 
-`serial` reconstructs cloud-forwarded serial output for one device from existing Timeline/EventHistory data. It is not direct USB/UART capture. The command reuses the same device selector resolution as `device`, `timeline`, and `watch`.
+`serial` reconstructs cloud-forwarded serial output for one device from existing Timeline/EventHistory data. It is not direct USB/UART capture. The command reuses the same Product-inventory-backed device selector resolution as `device`, `timeline`, and `watch`.
 
 By default, serial rows include only canonical `eventType=serial.log` firmware output. Collector lifecycle records such as `serial.lifecycle.connected`, `serial.lifecycle.disconnected`, and `serial.lifecycle.missing` are excluded. A compatibility rule also recognizes a path-only `/dev/serial/by-id/...` forwarder record as `COLLECTOR` even when the legacy forwarder labeled it `serial.log`. Text output is oldest-first and intentionally log-like:
 
@@ -312,7 +314,7 @@ Options:
 ./tools/telemetry watch P2-NewCode-Dev --raw
 ```
 
-`watch` resolves a device name or device ID once at startup, then polls the Timeline API and `DeviceCurrentState`. It displays new activity oldest-first, suppresses duplicates, automatically retries transient API failures, and continues until Ctrl-C. Serial output is near-live cloud-forwarded serial data, not a direct USB serial connection. The startup banner identifies the timezone used for every Timeline and synthesized Ledger timestamp.
+`watch` resolves a Product inventory device name or device ID once at startup, then polls the Timeline API and `DeviceCurrentState`. It displays new activity oldest-first, suppresses duplicates, automatically retries transient API failures, and continues until Ctrl-C. Serial output is near-live cloud-forwarded serial data, not a direct USB serial connection. The startup banner identifies the timezone used for every Timeline and synthesized Ledger timestamp.
 
 Options:
 - `--interval <seconds>`: Polling interval. Default is the implemented V1 default. Minimum one second.

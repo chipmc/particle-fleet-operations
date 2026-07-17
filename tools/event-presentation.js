@@ -23,7 +23,7 @@ function presentEvent(event = {}, options = {}) {
   return presentationRecord({
     time: event.eventTime || event.time,
     deviceId: event.deviceId ?? options.deviceId,
-    deviceName: event.deviceName ?? options.deviceName,
+    deviceName: options.deviceName ?? event.deviceName,
     kind,
     summary,
     severity,

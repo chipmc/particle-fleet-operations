@@ -61,8 +61,8 @@ async function main() {
 
     if (command === 'devices') {
       ensureNoSelector(options.positionals, 'devices');
-      const devices = await loadDeviceInventory(context);
-      if (devices.length === 0) fail('No devices found in DeviceCurrentState.');
+      const devices = await loadDeviceInventory(context, { productId: options.productId });
+      if (devices.length === 0) fail('No devices found in Particle product inventory.');
       outputDevices(devices, options.json);
       return;
     }
@@ -81,7 +81,7 @@ async function main() {
 
     if (command === 'device') {
       const selector = requireSelector(options.positionals, 'device');
-      const devices = await loadDeviceInventory(context);
+      const devices = await loadDeviceInventory(context, { productId: options.productId });
       const device = resolveDeviceSelector(devices, selector, context);
       outputDevice(device, options.json);
       return;
@@ -89,7 +89,7 @@ async function main() {
 
     if (command === 'timeline') {
       const selector = requireSelector(options.positionals, 'timeline');
-      const devices = await loadDeviceInventory(context);
+      const devices = await loadDeviceInventory(context, { productId: options.productId });
       const device = resolveDeviceSelector(devices, selector, context);
       const timeline = await fetchTimeline(context, device.deviceId, options);
       outputTimeline(device, timeline, options.json);
@@ -98,7 +98,7 @@ async function main() {
 
     if (command === 'watch') {
       const selector = requireSelector(options.positionals, 'watch');
-      const devices = await loadDeviceInventory(context);
+      const devices = await loadDeviceInventory(context, { productId: options.productId });
       const device = resolveDeviceSelector(devices, selector, context);
       await startWatch(context, device, options);
       return;
@@ -107,7 +107,7 @@ async function main() {
     if (command === 'serial') {
       const selector = requireSelector(options.positionals, 'serial');
       validateSerialOptions(options);
-      const devices = await loadDeviceInventory(context);
+      const devices = await loadDeviceInventory(context, { productId: options.productId });
       const device = resolveDeviceSelector(devices, selector, context);
       await startSerial(context, device, options);
       return;
@@ -579,7 +579,7 @@ async function loadDeviceInventory(context, inventoryOptions = {}) {
 
 async function loadParticleProductInventory(context, productId) {
   if (!context.particleAccessToken) {
-    fail(`Fleet summary requires a local PARTICLE_ACCESS_TOKEN to read Particle product inventory. Set PARTICLE_ACCESS_TOKEN in your shell or source ~/${LOCAL_SECRETS_RELATIVE_PATH}.`);
+    fail(`Fleet Operations commands require a local PARTICLE_ACCESS_TOKEN to read Particle product inventory for canonical device identity. Set PARTICLE_ACCESS_TOKEN in your shell or source ~/${LOCAL_SECRETS_RELATIVE_PATH}.`);
   }
 
   const productDevices = [];
@@ -648,10 +648,16 @@ function mergeProductInventory(currentStateDevices, productDevices, productId) {
 
   for (const productDevice of productDevices) {
     const currentState = currentStateById.get(productDevice.deviceId);
+    const canonicalDeviceName = resolveCanonicalDeviceName({
+      deviceId: productDevice.deviceId,
+      productDevice,
+    });
     merged.push({
       ...(currentState || {}),
       deviceId: productDevice.deviceId,
-      deviceName: currentState?.deviceName || productDevice.deviceName,
+      deviceName: canonicalDeviceName,
+      canonicalDeviceName,
+      canonicalDeviceNameSource: canonicalDeviceName === productDevice.deviceName ? 'particle-product-inventory' : 'device-id',
       productId: productDevice.productId || productId,
       particle: productDevice.particle,
       hasProductInventory: true,
@@ -709,11 +715,11 @@ function resolveDeviceSelector(devices, selector, context = undefined) {
   }
 
   const normalizedSelector = selector.toLowerCase();
-  const exact = devices.filter(device => stringValue(device.deviceName).toLowerCase() === normalizedSelector);
+  const exact = devices.filter(device => displayName(device).toLowerCase() === normalizedSelector);
   if (exact.length === 1) return exact[0];
   if (exact.length > 1) failAmbiguous(selector, exact);
 
-  const partial = devices.filter(device => stringValue(device.deviceName).toLowerCase().includes(normalizedSelector));
+  const partial = devices.filter(device => displayName(device).toLowerCase().includes(normalizedSelector));
   if (partial.length === 1) return partial[0];
   if (partial.length > 1) failAmbiguous(selector, partial);
 
@@ -2283,7 +2289,18 @@ class OperatorError extends Error {
 class TransientWatchError extends Error {}
 
 function displayName(device) {
-  return stringValue(device.deviceName) || '<unknown>';
+  return resolveCanonicalDeviceName({ device });
+}
+
+function resolveCanonicalDeviceName({ device = {}, productDevice = null } = {}) {
+  return stringValue(productDevice?.deviceName) ||
+    stringValue(getNested(device, ['particle', 'name'])) ||
+    stringValue(device.canonicalDeviceName) ||
+    stringValue(device.fleetOverrideDeviceName) ||
+    stringValue(device.deviceName) ||
+    stringValue(productDevice?.deviceId) ||
+    stringValue(device.deviceId) ||
+    '<unknown>';
 }
 
 function stringValue(value) {
@@ -2337,6 +2354,7 @@ module.exports = {
   parseOptions,
   queryTimelineFromDynamo,
   renderFleetSummary,
+  resolveCanonicalDeviceName,
   resolveDeviceSelector,
   runSerialLoop,
   runWatchLoop,

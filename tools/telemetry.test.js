@@ -39,6 +39,7 @@ const {
   parseOptions,
   queryTimelineFromDynamo,
   renderFleetSummary,
+  resolveCanonicalDeviceName,
   resolveDeviceSelector,
   runSerialLoop,
   runWatchLoop,
@@ -549,7 +550,7 @@ PARTICLE_API_BASE_URL=https://particle.example.test
   });
 });
 
-test('fleet inventory missing token reports local credential guidance', async () => {
+test('canonical inventory missing token reports local credential guidance', async () => {
   await assert.rejects(
     () => loadDeviceInventory({
       options: { projectId: 'generalized-core-counter' },
@@ -561,6 +562,7 @@ test('fleet inventory missing token reports local credential guidance', async ()
     }, { productId: '42131' }),
     (err) => {
       assert.match(err.message, /local PARTICLE_ACCESS_TOKEN/);
+      assert.match(err.message, /canonical device identity/);
       assert.match(err.message, /secrets\.env/);
       assert.doesNotMatch(err.message, /deployed Lambda|token-/i);
       return true;
@@ -681,6 +683,40 @@ test('fleet summary overlays device settings and derives upcoming and overdue ap
   assert.match(plain, /Upcoming Counter[\s\S]*in 6 min/);
   assert.match(plain, /Overdue Counter[\s\S]*4 min overdue/);
   assert.doesNotMatch(summary.attention.flatMap(entry => entry.observations).join(' '), /health|score|warning|critical/i);
+});
+
+test('fleet summary displays Expected for a device using product defaults without device settings', () => {
+  const now = new Date('2026-07-14T08:30:00.000Z');
+  const summary = buildFleetSummary([{
+    projectId: 'generalized-core-counter',
+    deviceId: 'defaults-only',
+    deviceName: 'Defaults Only',
+    hasProductInventory: true,
+    hasCurrentState: true,
+    lastApplicationReportAt: '2026-07-14T08:00:00.000Z',
+    lastEventTime: '2026-07-14T08:00:00.000Z',
+    lastPlane: 'telemetry',
+    productDefaultsLedgerData: {
+      timing: {
+        reportingIntervalSec: 3600,
+        connectAttemptBudgetSec: 300,
+      },
+    },
+    particle: { connected: true },
+  }], {
+    productId: '42131',
+    now,
+    transportAllowanceSeconds: 60,
+  });
+
+  assert.equal(summary.devices[0].reportingIntervalSeconds, 3600);
+  assert.equal(summary.devices[0].connectionBudgetSeconds, 300);
+  assert.equal(summary.devices[0].expectedNextReport, '2026-07-14T09:06:00.000Z');
+  assert.equal(summary.devices[0].expectationStatus, 'upcoming');
+  assert.match(
+    renderFleetSummary(summary, { color: false, now, terminalWidth: 180 }).join('\n'),
+    /Defaults Only[\s\S]*in 36 min/
+  );
 });
 
 test('fleet summary colorizes upcoming expectations green and overdue expectations red', () => {
@@ -1265,6 +1301,85 @@ test('fleet inventory uses product inventory names without duplicate device look
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('canonical inventory prefers Product name over CurrentState and falls back to device id', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    assert.match(String(url), /\/v1\/products\/42131\/devices/);
+    return {
+      ok: true,
+      json: async () => ({
+        devices: [
+          { id: 'e00fce688e592afaf23ac4fb', name: 'Boron-Dev-14' },
+          { id: 'e00fce68399ee6244a963935' },
+        ],
+      }),
+    };
+  };
+
+  try {
+    const devices = await loadDeviceInventory({
+      options: { projectId: 'generalized-core-counter' },
+      deviceCurrentStateTableName: 'current-state-table',
+      particleAccessToken: 'test-token',
+      particleApiBaseUrl: 'https://particle.example.test',
+      nameCache: new Map(),
+      awsJson: () => ({
+        Items: [
+          {
+            projectId: { S: 'generalized-core-counter' },
+            deviceId: { S: 'e00fce688e592afaf23ac4fb' },
+            deviceName: { S: 'boron-soak-1' },
+            lastEventTime: { S: '2026-07-14T08:00:00.000Z' },
+          },
+          {
+            projectId: { S: 'generalized-core-counter' },
+            deviceId: { S: 'e00fce68399ee6244a963935' },
+            deviceName: { S: 'stale-current-state-name' },
+            lastEventTime: { S: '2026-07-14T07:00:00.000Z' },
+          },
+        ],
+      }),
+    }, { productId: '42131' });
+
+    assert.equal(resolveDeviceSelector(devices, 'Boron-Dev-14').deviceId, 'e00fce688e592afaf23ac4fb');
+    assert.throws(() => resolveDeviceSelector(devices, 'boron-soak-1'), /Device selector not found/);
+    assert.deepEqual(devices.map(device => [device.deviceId, device.deviceName, device.canonicalDeviceNameSource]), [
+      ['e00fce688e592afaf23ac4fb', 'Boron-Dev-14', 'particle-product-inventory'],
+      ['e00fce68399ee6244a963935', 'e00fce68399ee6244a963935', 'device-id'],
+    ]);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('canonical identity is applied to fleet, recent activity, timeline, watch, device, and serial surfaces', () => {
+  const device = {
+    projectId: 'generalized-core-counter',
+    deviceId: 'e00fce688e592afaf23ac4fb',
+    deviceName: 'boron-soak-1',
+    canonicalDeviceName: 'Boron-Dev-14',
+    hasProductInventory: true,
+    hasCurrentState: true,
+    lastEventTime: '2026-07-14T08:00:00.000Z',
+    lastEventType: 'telemetry.occupancy',
+    lastPlane: 'telemetry',
+    particle: { name: 'Boron-Dev-14', connected: true },
+  };
+
+  const summary = buildFleetSummary([device], { productId: '42131', activityLimit: 1 });
+  const timeline = timelinePresentationRows(device, {
+    events: [event({ deviceName: 'serial-forwarder-alias', sourceType: 'serial-forwarder' })],
+  });
+  const watchBanner = getWatchBannerLines(device, watchOptions({ sinceMs: 300000 }));
+
+  assert.equal(resolveCanonicalDeviceName({ device }), 'Boron-Dev-14');
+  assert.equal(resolveDeviceSelector([device], 'Boron-Dev-14').deviceId, 'e00fce688e592afaf23ac4fb');
+  assert.equal(summary.devices[0].deviceName, 'Boron-Dev-14');
+  assert.equal(summary.recentActivity[0].deviceName, 'Boron-Dev-14');
+  assert.equal(timeline.presentations[0].deviceName, 'Boron-Dev-14');
+  assert.match(watchBanner[0], /^Watching Boron-Dev-14 /);
 });
 
 test('watch establishes an initial cursor without printing existing events', () => {
