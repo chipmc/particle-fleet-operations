@@ -20,6 +20,7 @@ import { ParticleDeviceNameResolution } from '../integrations/particle-api';
 
 const DEFAULT_PROJECT_ID = 'generalized-core-counter';
 const DEFAULT_OFFLINE_THRESHOLD_HOURS = 3;
+const DEVICE_STATUS_SCHEMA_VERSION_V2 = 2;
 
 const client = new DynamoDBClient({});
 const ddb = DynamoDBDocumentClient.from(client);
@@ -165,7 +166,9 @@ async function updateProjectedLedgerSnapshot(
     }
   }
 
-  const updateExpression = `SET ${assignments.join(', ')}${removals.length > 0 ? ` REMOVE ${removals.join(', ')}` : ''}`;
+  const setExpression = `SET ${assignments.join(', ')}`;
+  const removeExpression = removals.length > 0 ? ` REMOVE ${removals.join(', ')}` : '';
+  const updateExpression = `${setExpression}${removeExpression}`;
 
   try {
     await ddb.send(new UpdateCommand({
@@ -334,7 +337,8 @@ function determineStateHealthStatus(
     return previous?.healthStatus || 'unknown';
   }
 
-  return determineHealthStatus(state, false);
+  const resetCountIncreaseIgnored = false;
+  return determineHealthStatus(state, resetCountIncreaseIgnored);
 }
 
 function determineHealthStatus(
@@ -452,7 +456,7 @@ function extractDeviceStatusResetCountProjection(
   firmware?: { resetCount: number };
   startup?: { resetCount: number };
 } {
-  if (parseSchemaVersion(data.schemaVersion) !== 2) {
+  if (parseSchemaVersion(data.schemaVersion) !== DEVICE_STATUS_SCHEMA_VERSION_V2) {
     return {};
   }
 
