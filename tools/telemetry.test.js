@@ -50,6 +50,12 @@ const {
 
 const telemetryPath = path.join(__dirname, 'telemetry');
 
+test('copilot bridge smoke test', () => {
+  const result = runTelemetry(['help']);
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /Usage:/);
+});
+
 function runTelemetry(args) {
   return spawnSync(process.execPath, [telemetryPath, ...args], {
     encoding: 'utf8',
