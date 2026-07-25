@@ -126,6 +126,7 @@ async function updateProjectedLedgerSnapshot(
     '#ledgerFetchedAt = :fetchedAt',
     '#ledgerData = :ledgerData',
   ];
+  const removals: string[] = [];
   const names: Record<string, string> = {
     '#ledgerUpdatedAt': `${prefix}LedgerUpdatedAt`,
     '#ledgerFetchedAt': `${prefix}LedgerFetchedAt`,
@@ -143,11 +144,35 @@ async function updateProjectedLedgerSnapshot(
     assignments.push('#ledgerSizeBytes = :sizeBytes');
   }
 
+  if (ledger === 'deviceStatus') {
+    names['#firmwareProjection'] = 'firmware';
+    names['#startupProjection'] = 'startup';
+
+    const resetCountProjection = extractDeviceStatusResetCountProjection(snapshot.data);
+
+    if (resetCountProjection.firmware !== undefined) {
+      values[':firmwareProjection'] = resetCountProjection.firmware;
+      assignments.push('#firmwareProjection = :firmwareProjection');
+    } else {
+      removals.push('#firmwareProjection');
+    }
+
+    if (resetCountProjection.startup !== undefined) {
+      values[':startupProjection'] = resetCountProjection.startup;
+      assignments.push('#startupProjection = :startupProjection');
+    } else {
+      removals.push('#startupProjection');
+    }
+  }
+
   try {
     await ddb.send(new UpdateCommand({
       TableName: tableName,
       Key: { projectId, deviceId },
-      UpdateExpression: `SET ${assignments.join(', ')}`,
+      UpdateExpression: [
+        `SET ${assignments.join(', ')}`,
+        removals.length > 0 ? `REMOVE ${removals.join(', ')}` : undefined,
+      ].filter(Boolean).join(' '),
       ConditionExpression: 'attribute_not_exists(#ledgerUpdatedAt) OR #ledgerUpdatedAt < :incomingUpdatedAt',
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
@@ -222,12 +247,8 @@ interface BuildStateInput {
 
 function buildCurrentState(input: BuildStateInput): DeviceCurrentState {
   const effective = mergePreviousMetrics(input.previous, input.normalized);
-  const resetIncreased =
-    input.previous?.resetCount !== undefined &&
-    effective.resetCount !== undefined &&
-    effective.resetCount > input.previous.resetCount;
-  const healthStatus = determineStateHealthStatus(effective, resetIncreased, input.previous, input.normalized);
-  const anomalies = buildAnomalies(effective, resetIncreased);
+  const healthStatus = determineStateHealthStatus(effective, false, input.previous, input.normalized);
+  const anomalies = buildAnomalies(effective, false);
   const recentSerialErrorCount = input.normalized?.severity === 'ERROR'
     ? (input.previous?.recentSerialErrorCount || 0) + 1
     : input.previous?.recentSerialErrorCount || 0;
@@ -343,7 +364,6 @@ function determineHealthStatus(
   const hasHealthSignal =
     state.battery !== undefined ||
     state.connectTime !== undefined ||
-    state.resetCount !== undefined ||
     state.alertCount !== undefined ||
     state.severity !== undefined;
 
@@ -431,6 +451,61 @@ function omitUndefined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(
     Object.entries(value).filter(([, entryValue]) => entryValue !== undefined)
   ) as T;
+}
+
+function extractDeviceStatusResetCountProjection(
+  data: Record<string, unknown>
+): {
+  firmware?: { resetCount: number };
+  startup?: { resetCount: number };
+} {
+  if (parseSchemaVersion(data.schemaVersion) !== 2) {
+    return {};
+  }
+
+  const firmwareResetCount = getNestedNumber(data, 'firmware', 'resetCount');
+  const startupResetCount = getNestedNumber(data, 'startup', 'resetCount');
+
+  return omitUndefined({
+    firmware: firmwareResetCount !== undefined ? { resetCount: firmwareResetCount } : undefined,
+    startup: startupResetCount !== undefined ? { resetCount: startupResetCount } : undefined,
+  });
+}
+
+function parseSchemaVersion(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+
+  return undefined;
+}
+
+function getNestedNumber(
+  data: Record<string, unknown>,
+  key: string,
+  nestedKey: string
+): number | undefined {
+  const parent = data[key];
+  if (!parent || typeof parent !== 'object') {
+    return undefined;
+  }
+
+  const value = (parent as Record<string, unknown>)[nestedKey];
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+
+  return undefined;
 }
 
 export { ddb, buildCurrentState, determineHealthStatus };

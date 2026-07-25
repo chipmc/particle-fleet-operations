@@ -23,7 +23,6 @@ export interface Anomaly {
  * Applies heuristic rules to identify device health issues:
  * - Low battery conditions
  * - High cellular connection times
- * - Increasing reset counts
  * - Active alerts
  * - Firmware version changes
  * - Rapid battery drain
@@ -40,7 +39,6 @@ export function detectAnomalies(events: DynamoIndexRecord[]): Anomaly[] {
 
   // Track metrics across events
   const batteryReadings: Array<{ time: string; value: number }> = [];
-  const resetCounts: Array<{ time: string; value: number }> = [];
   const firmwareVersions: Array<{ time: string; value: string }> = [];
 
   // Scan events for anomalies
@@ -89,11 +87,6 @@ export function detectAnomalies(events: DynamoIndexRecord[]): Anomaly[] {
       }
     }
 
-    // Reset count anomalies
-    if (event.resetCount !== undefined && event.resetCount !== null) {
-      resetCounts.push({ time: event.eventTime, value: event.resetCount });
-    }
-
     // Alert anomalies
     if (event.alertCount !== undefined && event.alertCount !== null && event.alertCount > 0) {
       anomalies.push({
@@ -108,25 +101,6 @@ export function detectAnomalies(events: DynamoIndexRecord[]): Anomaly[] {
     // Firmware version tracking
     if (event.fwVersion && typeof event.fwVersion === 'string') {
       firmwareVersions.push({ time: event.eventTime, value: event.fwVersion });
-    }
-  }
-
-  // Detect reset count increases
-  if (resetCounts.length > 1) {
-    for (let i = 1; i < resetCounts.length; i++) {
-      const prev = resetCounts[i - 1];
-      const curr = resetCounts[i];
-      const increase = curr.value - prev.value;
-
-      if (increase > 0) {
-        anomalies.push({
-          severity: increase > 3 ? 'high' : 'medium',
-          type: 'reset_count_increase',
-          eventTime: curr.time,
-          message: `Reset count increased by ${increase} (from ${prev.value} to ${curr.value})`,
-          value: increase,
-        });
-      }
     }
   }
 
