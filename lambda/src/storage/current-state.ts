@@ -165,11 +165,13 @@ async function updateProjectedLedgerSnapshot(
     }
   }
 
+  const updateExpression = `SET ${assignments.join(', ')}${removals.length > 0 ? ` REMOVE ${removals.join(', ')}` : ''}`;
+
   try {
     await ddb.send(new UpdateCommand({
       TableName: tableName,
       Key: { projectId, deviceId },
-      UpdateExpression: `SET ${assignments.join(', ')}${removals.length > 0 ? ` REMOVE ${removals.join(', ')}` : ''}`,
+      UpdateExpression: updateExpression,
       ConditionExpression: 'attribute_not_exists(#ledgerUpdatedAt) OR #ledgerUpdatedAt < :incomingUpdatedAt',
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
@@ -244,8 +246,8 @@ interface BuildStateInput {
 
 function buildCurrentState(input: BuildStateInput): DeviceCurrentState {
   const effective = mergePreviousMetrics(input.previous, input.normalized);
-  const healthStatus = determineStateHealthStatus(effective, false, input.previous, input.normalized);
-  const anomalies = buildAnomalies(effective, false);
+  const healthStatus = determineStateHealthStatus(effective, input.previous, input.normalized);
+  const anomalies = buildAnomalies(effective);
   const recentSerialErrorCount = input.normalized?.severity === 'ERROR'
     ? (input.previous?.recentSerialErrorCount || 0) + 1
     : input.previous?.recentSerialErrorCount || 0;
@@ -323,7 +325,6 @@ function hasNormalizedField(
 
 function determineStateHealthStatus(
   state: Partial<DeviceCurrentState>,
-  resetIncreased: boolean,
   previous: DeviceCurrentState | null,
   normalized?: NormalizedEventFields
 ): DeviceHealthStatus {
@@ -333,7 +334,7 @@ function determineStateHealthStatus(
     return previous?.healthStatus || 'unknown';
   }
 
-  return determineHealthStatus(state, resetIncreased);
+  return determineHealthStatus(state, false);
 }
 
 function determineHealthStatus(
@@ -368,8 +369,7 @@ function determineHealthStatus(
 }
 
 function buildAnomalies(
-  state: Partial<DeviceCurrentState>,
-  resetIncreased: boolean
+  state: Partial<DeviceCurrentState>
 ): CurrentStateAnomaly[] {
   const anomalies: CurrentStateAnomaly[] = [];
 
@@ -405,10 +405,6 @@ function buildAnomalies(
 
   if (state.resetDetected) {
     anomalies.push({ severity: 'medium', type: 'serial_reset', message: 'Serial log indicates reset, reboot, or panic activity' });
-  }
-
-  if (resetIncreased) {
-    anomalies.push({ severity: 'medium', type: 'reset_count_increase', message: 'Reset count increased since previous state' });
   }
 
   return anomalies.slice(0, 10);
@@ -462,11 +458,20 @@ function extractDeviceStatusResetCountProjection(
 
   const firmwareResetCount = extractResetCountValue(data, 'firmware', 'resetCount');
   const startupResetCount = extractResetCountValue(data, 'startup', 'resetCount');
+  const projection: {
+    firmware?: { resetCount: number };
+    startup?: { resetCount: number };
+  } = {};
 
-  return omitUndefined({
-    firmware: firmwareResetCount !== undefined ? { resetCount: firmwareResetCount } : undefined,
-    startup: startupResetCount !== undefined ? { resetCount: startupResetCount } : undefined,
-  });
+  if (firmwareResetCount !== undefined) {
+    projection.firmware = { resetCount: firmwareResetCount };
+  }
+
+  if (startupResetCount !== undefined) {
+    projection.startup = { resetCount: startupResetCount };
+  }
+
+  return projection;
 }
 
 function parseSchemaVersion(value: unknown): number | undefined {
