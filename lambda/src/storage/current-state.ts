@@ -169,10 +169,7 @@ async function updateProjectedLedgerSnapshot(
     await ddb.send(new UpdateCommand({
       TableName: tableName,
       Key: { projectId, deviceId },
-      UpdateExpression: [
-        `SET ${assignments.join(', ')}`,
-        removals.length > 0 ? `REMOVE ${removals.join(', ')}` : undefined,
-      ].filter(Boolean).join(' '),
+      UpdateExpression: `SET ${assignments.join(', ')}${removals.length > 0 ? ` REMOVE ${removals.join(', ')}` : ''}`,
       ConditionExpression: 'attribute_not_exists(#ledgerUpdatedAt) OR #ledgerUpdatedAt < :incomingUpdatedAt',
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
@@ -463,8 +460,8 @@ function extractDeviceStatusResetCountProjection(
     return {};
   }
 
-  const firmwareResetCount = getNestedNumber(data, 'firmware', 'resetCount');
-  const startupResetCount = getNestedNumber(data, 'startup', 'resetCount');
+  const firmwareResetCount = extractResetCountValue(data, 'firmware', 'resetCount');
+  const startupResetCount = extractResetCountValue(data, 'startup', 'resetCount');
 
   return omitUndefined({
     firmware: firmwareResetCount !== undefined ? { resetCount: firmwareResetCount } : undefined,
@@ -485,7 +482,7 @@ function parseSchemaVersion(value: unknown): number | undefined {
   return undefined;
 }
 
-function getNestedNumber(
+function extractResetCountValue(
   data: Record<string, unknown>,
   key: string,
   nestedKey: string
