@@ -311,10 +311,6 @@ export interface CurrentStateAnomaly {
   message: string;
 }
 
-export interface DeviceResetCountObservation {
-  resetCount: number;
-}
-
 export interface DeviceCurrentState {
   projectId: string;
   deviceId: string;
@@ -328,8 +324,8 @@ export interface DeviceCurrentState {
   lastPlane?: EventPlane;
   lastSourceType?: string;
   fwVersion?: string;
-  firmware?: DeviceResetCountObservation;
-  startup?: DeviceResetCountObservation;
+  firmware?: { resetCount: number };
+  startup?: { resetCount: number };
   battery?: number;
   connectTime?: number;
   resetCount?: number;
