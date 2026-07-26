@@ -943,6 +943,9 @@ function buildFleetSummaryDevice(device, options = {}) {
     firmwareVersion,
     deviceOsVersion,
     runtimeConnectionState,
+    schemaVersion: (device.deviceStatusLedgerData != null && device.deviceStatusLedgerData.schemaVersion != null)
+      ? device.deviceStatusLedgerData.schemaVersion
+      : null,
     socPercent: socObservation.socPercent,
     socObservedAt: socObservation.socObservedAt,
     socSource: socObservation.socSource,
@@ -1079,6 +1082,7 @@ function extractDeviceOsVersion(device) {
     stringValue(particle.firmwareVersion) ||
     stringValue(getNested(device.deviceStatusLedgerData, ['system', 'firmwareVersion'])) ||
     stringValue(getNested(device.deviceStatusLedgerData, ['deviceOS', 'version'])) ||
+    stringValue(getNested(device.deviceStatusLedgerData, ['startup', 'deviceOS'])) ||
     null;
 }
 
@@ -1191,7 +1195,7 @@ function renderFleetSummary(summary, options = {}) {
 
   const rows = summary.devices.map(device => fleetSummaryTextRow(device, options, color));
   const columns = options.verbose
-    ? ['NAME', 'DEVICE ID', 'CS', 'RT', 'DD', 'CLOUD', 'FIRMWARE', 'DEVICE OS', 'SOC', 'EXPECTED', 'LAST HEARD', 'RUNTIME', 'SOC OBSERVED', 'SOC SOURCE', 'PARTICLE HEARD', 'LEDGER UPDATED', 'LAST EVENT']
+    ? ['NAME', 'DEVICE ID', 'CS', 'RT', 'DD', 'CLOUD', 'FIRMWARE', 'DEVICE OS', 'SOC', 'EXPECTED', 'LAST HEARD', 'RUNTIME', 'SOC OBSERVED', 'SOC SOURCE', 'PARTICLE HEARD', 'LEDGER UPDATED', 'LAST EVENT', 'SCHEMA VER']
     : ['NAME', 'DEVICE ID', 'CS', 'RT', 'DD', 'CLOUD', 'FIRMWARE', 'DEVICE OS', 'SOC', 'EXPECTED', 'LAST HEARD', 'RUNTIME'];
   lines.push(...formatTable(rows, columns));
   lines.push('');
@@ -1223,6 +1227,7 @@ function fleetSummaryTextRow(device, options, color) {
     row['PARTICLE HEARD'] = safeIso(device.lastHeard);
     row['LEDGER UPDATED'] = safeIso(device.metadata.deviceStatusLedgerUpdatedAt);
     row['LAST EVENT'] = safe(device.metadata.lastEventType);
+    row['SCHEMA VER'] = safe(device.schemaVersion);
   }
   return row;
 }
