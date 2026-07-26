@@ -237,6 +237,8 @@ describe('DeviceCurrentState storage', () => {
         '#ledgerFetchedAt': 'deviceStatusLedgerFetchedAt',
         '#ledgerSizeBytes': 'deviceStatusLedgerSizeBytes',
         '#ledgerData': 'deviceStatusLedgerData',
+        '#firmwareProjection': 'firmware',
+        '#startupProjection': 'startup',
       },
       ExpressionAttributeValues: {
         ':incomingUpdatedAt': '2026-07-13T10:05:00.000Z',
@@ -322,6 +324,11 @@ describe('DeviceCurrentState storage', () => {
     expect(updateCommand.input.UpdateExpression).toBe(
       'SET #ledgerUpdatedAt = :incomingUpdatedAt, #ledgerFetchedAt = :fetchedAt, #ledgerData = :ledgerData'
     );
+    expect(updateCommand.input.ExpressionAttributeNames).toEqual({
+      '#ledgerUpdatedAt': 'deviceStatusLedgerUpdatedAt',
+      '#ledgerFetchedAt': 'deviceStatusLedgerFetchedAt',
+      '#ledgerData': 'deviceStatusLedgerData',
+    });
   });
 
   it('should project an optional missing device-settings Ledger by clearing old overrides', async () => {

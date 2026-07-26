@@ -145,17 +145,16 @@ async function updateProjectedLedgerSnapshot(
   }
 
   if (ledger === 'deviceStatus') {
-    names['#firmwareProjection'] = 'firmware';
-    names['#startupProjection'] = 'startup';
-
     const resetCountProjection = extractDeviceStatusResetCountProjection(snapshot.data);
 
     if (resetCountProjection.firmware !== undefined) {
+      names['#firmwareProjection'] = 'firmware';
       values[':firmwareProjection'] = resetCountProjection.firmware;
       assignments.push('#firmwareProjection = :firmwareProjection');
     }
 
     if (resetCountProjection.startup !== undefined) {
+      names['#startupProjection'] = 'startup';
       values[':startupProjection'] = resetCountProjection.startup;
       assignments.push('#startupProjection = :startupProjection');
     }
