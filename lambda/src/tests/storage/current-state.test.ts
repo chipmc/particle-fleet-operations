@@ -7,6 +7,7 @@ import {
   buildCurrentState,
   determineHealthStatus,
   ddb,
+  getDeviceCurrentState,
   projectMissingDeviceSettingsLedger,
   queryDeviceCurrentStates,
   updateDeviceSettingsLedgerSnapshot,
@@ -214,7 +215,12 @@ describe('DeviceCurrentState storage', () => {
         updatedAt: '2026-07-13T10:05:00.000Z',
         fetchedAt: '2026-07-13T10:10:00.000Z',
         sizeBytes: 256,
-        data: { connection: { state: 'connected' } },
+        data: {
+          schemaVersion: 2,
+          connection: { state: 'connected' },
+          firmware: { resetCount: 0 },
+          startup: { resetCount: 5 },
+        },
       }
     )).resolves.toBe('updated');
 
@@ -236,9 +242,18 @@ describe('DeviceCurrentState storage', () => {
         ':incomingUpdatedAt': '2026-07-13T10:05:00.000Z',
         ':fetchedAt': '2026-07-13T10:10:00.000Z',
         ':sizeBytes': 256,
-        ':ledgerData': { connection: { state: 'connected' } },
+        ':ledgerData': {
+          schemaVersion: 2,
+          connection: { state: 'connected' },
+          firmware: { resetCount: 0 },
+          startup: { resetCount: 5 },
+        },
+        ':firmwareProjection': { resetCount: 0 },
+        ':startupProjection': { resetCount: 5 },
       },
     });
+    expect(updateCommand.input.UpdateExpression).toContain('#firmwareProjection = :firmwareProjection');
+    expect(updateCommand.input.UpdateExpression).toContain('#startupProjection = :startupProjection');
   });
 
   it('should treat a failed conditional device-status Ledger write as stale', async () => {
@@ -284,6 +299,29 @@ describe('DeviceCurrentState storage', () => {
       '#ledgerFetchedAt': 'deviceSettingsLedgerFetchedAt',
       '#ledgerData': 'deviceSettingsLedgerData',
     });
+  });
+
+  it('should retain prior v2 reset-count projections when a newer snapshot omits them', async () => {
+    mockDdbSend.mockResolvedValueOnce({});
+
+    await expect(updateDeviceStatusLedgerSnapshot(
+      'current-state-table',
+      'generalized-core-counter',
+      'device123',
+      {
+        updatedAt: '2026-07-13T10:15:00.000Z',
+        fetchedAt: '2026-07-13T10:20:00.000Z',
+        data: {
+          schemaVersion: 2,
+          connection: { state: 'connected' },
+        },
+      }
+    )).resolves.toBe('updated');
+
+    const updateCommand = mockDdbSend.mock.calls[0][0] as UpdateCommand;
+    expect(updateCommand.input.UpdateExpression).toBe(
+      'SET #ledgerUpdatedAt = :incomingUpdatedAt, #ledgerFetchedAt = :fetchedAt, #ledgerData = :ledgerData'
+    );
   });
 
   it('should project an optional missing device-settings Ledger by clearing old overrides', async () => {
@@ -470,6 +508,75 @@ describe('DeviceCurrentState storage', () => {
 
   it('should detect warning when reset count increases', () => {
     expect(determineHealthStatus({ resetCount: 6 }, true)).toBe('warning');
+  });
+
+  it('should not raise an anomaly when schema v2 startup.resetCount exceeds firmware.resetCount', () => {
+    const state = buildCurrentState({
+      projectId: 'generalized-core-counter',
+      deviceId: 'device123',
+      eventTime: '2026-07-13T10:05:00.000Z',
+      eventName: 'Ubidots-Sensor-Hook-v1',
+      body: {
+        event: 'Ubidots-Sensor-Hook-v1',
+        coreid: 'device123',
+        published_at: '2026-07-13T10:05:00.000Z',
+      },
+      parsed,
+      normalized: {
+        ...normalized,
+        battery: 88,
+        connectTime: 18,
+        alertCount: 0,
+        resetCount: undefined,
+      },
+      previous: {
+        projectId: 'generalized-core-counter',
+        deviceId: 'device123',
+        lastEventTime: '2026-07-13T09:05:00.000Z',
+        lastApplicationReportAt: '2026-07-13T09:05:00.000Z',
+        lastIngestTime: '2026-07-13T09:05:05.000Z',
+        lastEventType: 'telemetry.health',
+        fwVersion: '14',
+        firmware: { resetCount: 0 },
+        startup: { resetCount: 5 },
+        healthStatus: 'healthy',
+        anomalyCount: 0,
+        anomalies: [],
+        offlineCandidate: false,
+        updatedAt: '2026-07-13T09:05:05.000Z',
+      },
+      updatedAt: '2026-07-13T10:05:05.000Z',
+    });
+
+    expect(state.anomalyCount).toBe(0);
+    expect(state.anomalies).toEqual([]);
+  });
+
+  it('should expose distinct firmware and startup reset-count fields in current-state output', async () => {
+    mockDdbSend.mockResolvedValueOnce({
+      Item: {
+        projectId: 'generalized-core-counter',
+        deviceId: 'device123',
+        lastEventTime: '2026-07-13T10:05:00.000Z',
+        lastIngestTime: '2026-07-13T10:05:05.000Z',
+        lastEventType: 'telemetry.health',
+        healthStatus: 'healthy',
+        anomalyCount: 0,
+        offlineCandidate: false,
+        firmware: { resetCount: 0 },
+        startup: { resetCount: 5 },
+        updatedAt: '2026-07-13T10:05:05.000Z',
+      },
+    });
+
+    await expect(getDeviceCurrentState(
+      'current-state-table',
+      'generalized-core-counter',
+      'device123'
+    )).resolves.toMatchObject({
+      firmware: { resetCount: 0 },
+      startup: { resetCount: 5 },
+    });
   });
 
   it('should query current-state table by projectId without scanning event history', async () => {

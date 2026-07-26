@@ -127,7 +127,6 @@ async function updateProjectedLedgerSnapshot(
     '#ledgerFetchedAt = :fetchedAt',
     '#ledgerData = :ledgerData',
   ];
-  const removals: string[] = [];
   const names: Record<string, string> = {
     '#ledgerUpdatedAt': `${prefix}LedgerUpdatedAt`,
     '#ledgerFetchedAt': `${prefix}LedgerFetchedAt`,
@@ -154,27 +153,21 @@ async function updateProjectedLedgerSnapshot(
     if (resetCountProjection.firmware !== undefined) {
       values[':firmwareProjection'] = resetCountProjection.firmware;
       assignments.push('#firmwareProjection = :firmwareProjection');
-    } else {
-      removals.push('#firmwareProjection');
     }
 
     if (resetCountProjection.startup !== undefined) {
       values[':startupProjection'] = resetCountProjection.startup;
       assignments.push('#startupProjection = :startupProjection');
-    } else {
-      removals.push('#startupProjection');
     }
   }
 
   const setExpression = `SET ${assignments.join(', ')}`;
-  const removeExpression = removals.length > 0 ? ` REMOVE ${removals.join(', ')}` : '';
-  const updateExpression = `${setExpression}${removeExpression}`;
 
   try {
     await ddb.send(new UpdateCommand({
       TableName: tableName,
       Key: { projectId, deviceId },
-      UpdateExpression: updateExpression,
+      UpdateExpression: setExpression,
       ConditionExpression: 'attribute_not_exists(#ledgerUpdatedAt) OR #ledgerUpdatedAt < :incomingUpdatedAt',
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
@@ -273,6 +266,8 @@ function buildCurrentState(input: BuildStateInput): DeviceCurrentState {
     lastPlane: input.normalized?.plane || input.previous?.lastPlane,
     lastSourceType: input.normalized?.sourceType || input.body.sourceType || input.previous?.lastSourceType,
     fwVersion: input.normalized?.fwVersion || input.body.fw_version || input.previous?.fwVersion,
+    firmware: input.previous?.firmware,
+    startup: input.previous?.startup,
     battery: effective.battery,
     connectTime: effective.connectTime,
     resetCount: effective.resetCount,
