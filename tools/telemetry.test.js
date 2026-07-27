@@ -11,6 +11,9 @@ const {
   presentEvent,
   presentObservation,
 } = require('./event-presentation');
+const {
+  computeNextScheduledApplicationReport,
+} = require('./reporting-schedule');
 
 const {
   TransientWatchError,
@@ -746,6 +749,154 @@ test('fleet summary colorizes upcoming expectations green and overdue expectatio
   const output = renderFleetSummary(summary, { color: true, now, terminalWidth: 180 }).join('\n');
   assert.match(output, /\x1b\[32min 36 min\x1b\[39m/);
   assert.match(output, /\x1b\[31m4 min overdue\x1b\[39m/);
+});
+
+test('hourly reporting keeps inside-window candidates and the exact closing slot', () => {
+  const schedule = {
+    reportingIntervalSeconds: 3600,
+    openHour: 6,
+    closeHour: 22,
+    timeZone: 'America/New_York',
+  };
+
+  assert.equal(computeNextScheduledApplicationReport({
+    ...schedule,
+    lastApplicationReportAt: '2026-07-14T10:00:00.000Z',
+  }), '2026-07-14T11:00:00.000Z');
+  assert.equal(computeNextScheduledApplicationReport({
+    ...schedule,
+    lastApplicationReportAt: '2026-07-14T14:00:00.000Z',
+  }), '2026-07-14T15:00:00.000Z');
+  assert.equal(computeNextScheduledApplicationReport({
+    ...schedule,
+    lastApplicationReportAt: '2026-07-15T01:00:00.000Z',
+  }), '2026-07-15T02:00:00.000Z');
+});
+
+test('hourly reporting rolls the closing report to the first opening slot', () => {
+  assert.equal(computeNextScheduledApplicationReport({
+    lastApplicationReportAt: '2026-07-15T02:00:00.000Z',
+    reportingIntervalSeconds: 3600,
+    openHour: 6,
+    closeHour: 22,
+    timeZone: 'America/New_York',
+  }), '2026-07-15T10:00:00.000Z');
+});
+
+test('two-hour battery-conservation reporting preserves active slots and removes overnight minute drift', () => {
+  const schedule = {
+    reportingIntervalSeconds: 2 * 60 * 60,
+    openHour: 6,
+    closeHour: 22,
+    timeZone: 'America/New_York',
+  };
+
+  assert.equal(computeNextScheduledApplicationReport({
+    ...schedule,
+    lastApplicationReportAt: '2026-07-14T22:00:00.000Z',
+  }), '2026-07-15T00:00:00.000Z');
+  assert.equal(computeNextScheduledApplicationReport({
+    ...schedule,
+    lastApplicationReportAt: '2026-07-15T02:00:00.000Z',
+  }), '2026-07-15T10:00:00.000Z');
+  assert.equal(computeNextScheduledApplicationReport({
+    ...schedule,
+    lastApplicationReportAt: '2026-07-15T00:13:00.000Z',
+  }), '2026-07-15T10:00:00.000Z');
+});
+
+test('America/New_York opening slots naturally follow spring-forward and fall-back transitions', () => {
+  const schedule = {
+    reportingIntervalSeconds: 3600,
+    openHour: 6,
+    closeHour: 22,
+    timeZone: 'America/New_York',
+  };
+
+  assert.equal(computeNextScheduledApplicationReport({
+    ...schedule,
+    lastApplicationReportAt: '2026-03-08T03:00:00.000Z',
+  }), '2026-03-08T10:00:00.000Z');
+  assert.equal(computeNextScheduledApplicationReport({
+    ...schedule,
+    lastApplicationReportAt: '2026-11-01T02:00:00.000Z',
+  }), '2026-11-01T11:00:00.000Z');
+});
+
+test('configured device timezone is independent of the operator timezone', () => {
+  const originalTimeZone = process.env.TZ;
+  process.env.TZ = 'Asia/Singapore';
+  try {
+    assert.equal(computeNextScheduledApplicationReport({
+      lastApplicationReportAt: '2026-07-15T02:00:00.000Z',
+      reportingIntervalSeconds: 3600,
+      openHour: 6,
+      closeHour: 22,
+      timeZone: 'America/New_York',
+    }), '2026-07-15T10:00:00.000Z');
+  } finally {
+    if (originalTimeZone === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTimeZone;
+  }
+});
+
+test('existing POSIX Ledger timezone rules remain schedule-aware', () => {
+  assert.equal(computeNextScheduledApplicationReport({
+    lastApplicationReportAt: '2026-07-15T02:00:00.000Z',
+    reportingIntervalSeconds: 3600,
+    openHour: 6,
+    closeHour: 22,
+    timeZone: 'EST5EDT,M3.2.0/2:00:00,M11.1.0/2:00:00',
+  }), '2026-07-15T10:00:00.000Z');
+});
+
+test('sleeping devices avoid attention until the first opening report is actually missed', () => {
+  const device = {
+    deviceId: 'sleeping-device',
+    deviceName: 'Raleigh Counter',
+    hasProductInventory: true,
+    hasCurrentState: true,
+    lastApplicationReportAt: '2026-07-15T02:00:00.000Z',
+    lastEventTime: '2026-07-15T02:00:00.000Z',
+    lastPlane: 'telemetry',
+    deviceStatusLedgerUpdatedAt: '2026-07-15T02:00:30.000Z',
+    deviceStatusLedgerData: { connection: { state: 'disconnected' } },
+    productDefaultsLedgerData: {
+      timing: {
+        reportingIntervalSec: 3600,
+        connectAttemptBudgetSec: 0,
+        openHour: 6,
+        closeHour: 22,
+        timezone: 'America/New_York',
+      },
+    },
+    particle: { connected: false, last_heard: '2026-07-15T02:00:00.000Z' },
+  };
+  const sleepingNow = new Date('2026-07-15T04:00:00.000Z');
+  const sleeping = buildFleetSummary([device], {
+    now: sleepingNow,
+    transportAllowanceSeconds: 0,
+  });
+
+  assert.equal(sleeping.devices[0].nextScheduledReport, '2026-07-15T10:00:00.000Z');
+  assert.equal(sleeping.devices[0].expectedNextReport, '2026-07-15T10:00:00.000Z');
+  assert.equal(sleeping.devices[0].expectationStatus, 'upcoming');
+  assert.deepEqual(sleeping.attention, []);
+  assert.match(
+    renderFleetSummary(sleeping, { color: false, now: sleepingNow, terminalWidth: 180 }).join('\n'),
+    /Raleigh Counter[\s\S]*in 6 hr/
+  );
+
+  const missed = buildFleetSummary([device], {
+    now: new Date('2026-07-15T10:02:00.000Z'),
+    transportAllowanceSeconds: 0,
+  });
+  assert.equal(missed.devices[0].expectationStatus, 'overdue');
+  assert.deepEqual(missed.attention, [{
+    deviceId: 'sleeping-device',
+    deviceName: 'Raleigh Counter',
+    observations: ['Expected application report 2 minutes ago'],
+  }]);
 });
 
 test('fleet summary JSON omits verbose metadata by default', () => {

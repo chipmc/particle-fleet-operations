@@ -9,6 +9,9 @@ const {
   presentEvent,
   presentObservation,
 } = require('./event-presentation');
+const {
+  computeNextScheduledApplicationReport,
+} = require('./reporting-schedule');
 
 const DEFAULT_STACK_NAME = 'InfraStack';
 const DEFAULT_PROJECT_ID = 'generalized-core-counter';
@@ -933,7 +936,7 @@ function buildFleetSummaryDevice(device, options = {}) {
   const firmwareVersion = extractFirmwareVersion(device);
   const deviceOsVersion = extractDeviceOsVersion(device);
   const socObservation = extractSocObservation(device);
-  const reportingExpectation = buildReportingExpectation(device, options);
+  const reportingExpectation = buildScheduleAwareReportingExpectation(device, options);
 
   return {
     deviceId: device.deviceId,
@@ -976,7 +979,7 @@ function buildFleetSummaryDevice(device, options = {}) {
   };
 }
 
-function buildReportingExpectation(device, options = {}) {
+function buildScheduleAwareReportingExpectation(device, options = {}) {
   const effectiveConfiguration = overlayConfiguration(
     device.productDefaultsLedgerData,
     device.deviceSettingsLedgerData
@@ -992,6 +995,9 @@ function buildReportingExpectation(device, options = {}) {
     ['connection', 'budgetSeconds'],
     ['reporting', 'connectionBudgetSeconds'],
   ]);
+  const reportingWindowOpenHour = configurationHour(effectiveConfiguration, [['timing', 'openHour']]);
+  const reportingWindowCloseHour = configurationHour(effectiveConfiguration, [['timing', 'closeHour']]);
+  const reportingTimeZone = configurationString(effectiveConfiguration, [['timing', 'timezone']]);
   const transportAllowanceSeconds = Number.isFinite(options.transportAllowanceSeconds) && options.transportAllowanceSeconds >= 0
     ? options.transportAllowanceSeconds
     : DEFAULT_TRANSPORT_ALLOWANCE_SECONDS;
@@ -1011,13 +1017,40 @@ function buildReportingExpectation(device, options = {}) {
       reportingIntervalSeconds,
       connectionBudgetSeconds,
       transportAllowanceSeconds,
+      reportingWindowOpenHour,
+      reportingWindowCloseHour,
+      reportingTimeZone,
+      nextScheduledReport: null,
       expectedNextReport: null,
       expectationStatus: 'unknown',
     };
   }
 
-  const expectedNextReport = new Date(lastApplicationReportMs + (
-    reportingIntervalSeconds + connectionBudgetSeconds + transportAllowanceSeconds
+  const nextScheduledReport = computeNextScheduledApplicationReport({
+    lastApplicationReportAt,
+    reportingIntervalSeconds,
+    openHour: reportingWindowOpenHour,
+    closeHour: reportingWindowCloseHour,
+    timeZone: reportingTimeZone,
+  });
+  const nextScheduledReportMs = new Date(nextScheduledReport || 0).getTime();
+  if (!nextScheduledReport || Number.isNaN(nextScheduledReportMs)) {
+    return {
+      lastApplicationReportAt,
+      reportingIntervalSeconds,
+      connectionBudgetSeconds,
+      transportAllowanceSeconds,
+      reportingWindowOpenHour,
+      reportingWindowCloseHour,
+      reportingTimeZone,
+      nextScheduledReport: null,
+      expectedNextReport: null,
+      expectationStatus: 'unknown',
+    };
+  }
+
+  const expectedNextReport = new Date(nextScheduledReportMs + (
+    connectionBudgetSeconds + transportAllowanceSeconds
   ) * 1000).toISOString();
   const nowMs = new Date(options.now || new Date()).getTime();
 
@@ -1026,6 +1059,10 @@ function buildReportingExpectation(device, options = {}) {
     reportingIntervalSeconds,
     connectionBudgetSeconds,
     transportAllowanceSeconds,
+    reportingWindowOpenHour,
+    reportingWindowCloseHour,
+    reportingTimeZone,
+    nextScheduledReport,
     expectedNextReport,
     expectationStatus: !Number.isNaN(nowMs) && nowMs > new Date(expectedNextReport).getTime()
       ? 'overdue'
@@ -1055,6 +1092,19 @@ function configurationSeconds(configuration, paths) {
   for (const path of paths) {
     const value = getNested(configuration, path);
     if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+  }
+  return null;
+}
+
+function configurationHour(configuration, paths) {
+  const hour = configurationSeconds(configuration, paths);
+  return hour !== null && Number.isInteger(hour) && hour <= 23 ? hour : null;
+}
+
+function configurationString(configuration, paths) {
+  for (const path of paths) {
+    const value = stringValue(getNested(configuration, path));
+    if (value) return value;
   }
   return null;
 }
@@ -2333,7 +2383,7 @@ module.exports = {
   buildWatchEntries,
   buildSerialEntries,
   buildFleetSummary,
-  buildReportingExpectation,
+  buildScheduleAwareReportingExpectation,
   classifyTimelineEvent,
   collectNewTimelineEvents,
   createSerialState,

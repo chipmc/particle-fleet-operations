@@ -135,6 +135,18 @@ Production Traffic Pattern
 **Reporting window:** 6:00am–10:00pm Eastern Time
 **Normal frequency:** Once per hour per device
 
+Expected application-report timing is schedule-aware. The canonical scheduler
+uses the effective Ledger reporting interval, `openHour`/`closeHour` operating
+window, and configured device timezone. If `last report + interval` is outside
+the active window, the next report is the first valid slot in the next active
+window. Device-local daylight-saving transitions are resolved from timezone
+rules; operator workstation time and fixed UTC offsets are not scheduling
+inputs.
+
+Fleet presentation and attention consume this canonical timing. Connection and
+transport allowances are applied after the scheduled slot to form the delivery
+expectation. Health classification remains future work.
+
 **Deployment timing:**
 - Preferred: bottom of the hour (e.g., 7:30, 8:30, 9:30 ET)
 - Reason: minimize risk during top-of-hour reporting bursts
