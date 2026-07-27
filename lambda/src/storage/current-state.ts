@@ -20,6 +20,7 @@ import { ParticleDeviceNameResolution } from '../integrations/particle-api';
 
 const DEFAULT_PROJECT_ID = 'generalized-core-counter';
 const DEFAULT_OFFLINE_THRESHOLD_HOURS = 3;
+const DEVICE_STATUS_SCHEMA_VERSION_V2 = 2;
 
 const client = new DynamoDBClient({});
 const ddb = DynamoDBDocumentClient.from(client);
@@ -143,11 +144,29 @@ async function updateProjectedLedgerSnapshot(
     assignments.push('#ledgerSizeBytes = :sizeBytes');
   }
 
+  if (ledger === 'deviceStatus') {
+    const resetCountProjection = extractDeviceStatusResetCountProjection(snapshot.data);
+
+    if (resetCountProjection.firmware !== undefined) {
+      names['#firmwareProjection'] = 'firmware';
+      values[':firmwareProjection'] = resetCountProjection.firmware;
+      assignments.push('#firmwareProjection = :firmwareProjection');
+    }
+
+    if (resetCountProjection.startup !== undefined) {
+      names['#startupProjection'] = 'startup';
+      values[':startupProjection'] = resetCountProjection.startup;
+      assignments.push('#startupProjection = :startupProjection');
+    }
+  }
+
+  const setExpression = `SET ${assignments.join(', ')}`;
+
   try {
     await ddb.send(new UpdateCommand({
       TableName: tableName,
       Key: { projectId, deviceId },
-      UpdateExpression: `SET ${assignments.join(', ')}`,
+      UpdateExpression: setExpression,
       ConditionExpression: 'attribute_not_exists(#ledgerUpdatedAt) OR #ledgerUpdatedAt < :incomingUpdatedAt',
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
@@ -222,12 +241,8 @@ interface BuildStateInput {
 
 function buildCurrentState(input: BuildStateInput): DeviceCurrentState {
   const effective = mergePreviousMetrics(input.previous, input.normalized);
-  const resetIncreased =
-    input.previous?.resetCount !== undefined &&
-    effective.resetCount !== undefined &&
-    effective.resetCount > input.previous.resetCount;
-  const healthStatus = determineStateHealthStatus(effective, resetIncreased, input.previous, input.normalized);
-  const anomalies = buildAnomalies(effective, resetIncreased);
+  const healthStatus = determineStateHealthStatus(effective, input.previous, input.normalized);
+  const anomalies = buildAnomalies(effective);
   const recentSerialErrorCount = input.normalized?.severity === 'ERROR'
     ? (input.previous?.recentSerialErrorCount || 0) + 1
     : input.previous?.recentSerialErrorCount || 0;
@@ -250,6 +265,8 @@ function buildCurrentState(input: BuildStateInput): DeviceCurrentState {
     lastPlane: input.normalized?.plane || input.previous?.lastPlane,
     lastSourceType: input.normalized?.sourceType || input.body.sourceType || input.previous?.lastSourceType,
     fwVersion: input.normalized?.fwVersion || input.body.fw_version || input.previous?.fwVersion,
+    firmware: input.previous?.firmware,
+    startup: input.previous?.startup,
     battery: effective.battery,
     connectTime: effective.connectTime,
     resetCount: effective.resetCount,
@@ -305,7 +322,6 @@ function hasNormalizedField(
 
 function determineStateHealthStatus(
   state: Partial<DeviceCurrentState>,
-  resetIncreased: boolean,
   previous: DeviceCurrentState | null,
   normalized?: NormalizedEventFields
 ): DeviceHealthStatus {
@@ -315,7 +331,8 @@ function determineStateHealthStatus(
     return previous?.healthStatus || 'unknown';
   }
 
-  return determineHealthStatus(state, resetIncreased);
+  const resetCountIncreaseIgnored = false;
+  return determineHealthStatus(state, resetCountIncreaseIgnored);
 }
 
 function determineHealthStatus(
@@ -343,7 +360,6 @@ function determineHealthStatus(
   const hasHealthSignal =
     state.battery !== undefined ||
     state.connectTime !== undefined ||
-    state.resetCount !== undefined ||
     state.alertCount !== undefined ||
     state.severity !== undefined;
 
@@ -351,8 +367,7 @@ function determineHealthStatus(
 }
 
 function buildAnomalies(
-  state: Partial<DeviceCurrentState>,
-  resetIncreased: boolean
+  state: Partial<DeviceCurrentState>
 ): CurrentStateAnomaly[] {
   const anomalies: CurrentStateAnomaly[] = [];
 
@@ -388,10 +403,6 @@ function buildAnomalies(
 
   if (state.resetDetected) {
     anomalies.push({ severity: 'medium', type: 'serial_reset', message: 'Serial log indicates reset, reboot, or panic activity' });
-  }
-
-  if (resetIncreased) {
-    anomalies.push({ severity: 'medium', type: 'reset_count_increase', message: 'Reset count increased since previous state' });
   }
 
   return anomalies.slice(0, 10);
@@ -431,6 +442,70 @@ function omitUndefined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(
     Object.entries(value).filter(([, entryValue]) => entryValue !== undefined)
   ) as T;
+}
+
+function extractDeviceStatusResetCountProjection(
+  data: Record<string, unknown>
+): {
+  firmware?: { resetCount: number };
+  startup?: { resetCount: number };
+} {
+  if (parseSchemaVersion(data.schemaVersion) !== DEVICE_STATUS_SCHEMA_VERSION_V2) {
+    return {};
+  }
+
+  const firmwareResetCount = extractResetCountValue(data, 'firmware', 'resetCount');
+  const startupResetCount = extractResetCountValue(data, 'startup', 'resetCount');
+  const projection: {
+    firmware?: { resetCount: number };
+    startup?: { resetCount: number };
+  } = {};
+
+  if (firmwareResetCount !== undefined) {
+    projection.firmware = { resetCount: firmwareResetCount };
+  }
+
+  if (startupResetCount !== undefined) {
+    projection.startup = { resetCount: startupResetCount };
+  }
+
+  return projection;
+}
+
+function parseSchemaVersion(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+
+  return undefined;
+}
+
+function extractResetCountValue(
+  data: Record<string, unknown>,
+  key: string,
+  nestedKey: string
+): number | undefined {
+  const parent = data[key];
+  if (!parent || typeof parent !== 'object') {
+    return undefined;
+  }
+
+  const value = (parent as Record<string, unknown>)[nestedKey];
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+
+  return undefined;
 }
 
 export { ddb, buildCurrentState, determineHealthStatus };

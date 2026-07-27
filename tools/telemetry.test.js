@@ -53,6 +53,12 @@ const {
 
 const telemetryPath = path.join(__dirname, 'telemetry');
 
+test('copilot bridge smoke test', () => {
+  const result = runTelemetry(['help']);
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /Usage:/);
+});
+
 function runTelemetry(args) {
   return spawnSync(process.execPath, [telemetryPath, ...args], {
     encoding: 'utf8',
@@ -2174,4 +2180,103 @@ test('Dynamo fallback treats empty quiet polls as valid when allowed', () => {
 
   assert.equal(timeline.count, 0);
   assert.deepEqual(timeline.events, []);
+});
+
+test('extractDeviceOsVersion resolves startup.deviceOS for schemaVersion 2 devices', () => {
+  const summary = buildFleetSummary([
+    {
+      deviceId: 'device-v2',
+      deviceName: 'Boron V2',
+      hasProductInventory: true,
+      hasCurrentState: true,
+      lastEventTime: '2026-07-14T08:00:00.000Z',
+      deviceStatusLedgerData: {
+        schemaVersion: 2,
+        startup: { deviceOS: '6.2.0' },
+        connection: { state: 'connected' },
+      },
+    },
+  ], { productId: '42131', generatedAt: '2026-07-14T08:03:00.000Z' });
+
+  assert.equal(summary.devices[0].deviceOsVersion, '6.2.0');
+});
+
+test('extractDeviceOsVersion prefers legacy deviceOS.version over startup.deviceOS', () => {
+  const summary = buildFleetSummary([
+    {
+      deviceId: 'device-both',
+      deviceName: 'Device Both',
+      hasProductInventory: true,
+      hasCurrentState: true,
+      lastEventTime: '2026-07-14T08:00:00.000Z',
+      deviceStatusLedgerData: {
+        schemaVersion: 2,
+        deviceOS: { version: '5.9.0' },
+        startup: { deviceOS: '6.2.0' },
+      },
+    },
+  ], { productId: '42131', generatedAt: '2026-07-14T08:03:00.000Z' });
+
+  assert.equal(summary.devices[0].deviceOsVersion, '5.9.0');
+});
+
+test('fleet summary device row exposes schemaVersion from deviceStatusLedgerData', () => {
+  const summary = buildFleetSummary([
+    {
+      deviceId: 'device-v2',
+      deviceName: 'Boron V2',
+      hasProductInventory: true,
+      hasCurrentState: true,
+      lastEventTime: '2026-07-14T08:00:00.000Z',
+      deviceStatusLedgerData: {
+        schemaVersion: 2,
+        startup: { deviceOS: '6.2.0' },
+      },
+    },
+  ], { productId: '42131', generatedAt: '2026-07-14T08:03:00.000Z' });
+
+  assert.equal(summary.devices[0].schemaVersion, 2);
+  assert.equal(fleetSummaryJson(summary, { verbose: false }).devices[0].schemaVersion, 2);
+  assert.equal(fleetSummaryJson(summary, { verbose: true }).devices[0].schemaVersion, 2);
+});
+
+test('fleet summary schemaVersion regression: v1 device unaffected, report schema field unchanged', () => {
+  const summary = buildFleetSummary([
+    {
+      deviceId: 'device-v1',
+      deviceName: 'Legacy Device',
+      hasProductInventory: true,
+      hasCurrentState: true,
+      lastEventTime: '2026-07-14T08:00:00.000Z',
+      deviceStatusLedgerData: {
+        deviceOS: { version: '5.8.0' },
+        connection: { state: 'connected' },
+      },
+      particle: { connected: true, system_firmware_version: '5.8.0' },
+    },
+  ], { productId: '42131', generatedAt: '2026-07-14T08:03:00.000Z' });
+
+  assert.equal(summary.schema, 'fleet-summary.v1');
+  assert.equal(summary.devices[0].schemaVersion, null);
+  assert.equal(summary.devices[0].deviceOsVersion, '5.8.0');
+});
+
+test('fleet summary verbose text row includes SCHEMA VER for schemaVersion 2 device', () => {
+  const summary = buildFleetSummary([
+    {
+      deviceId: 'device-v2',
+      deviceName: 'Boron V2',
+      hasProductInventory: true,
+      hasCurrentState: true,
+      lastEventTime: '2026-07-14T08:00:00.000Z',
+      deviceStatusLedgerData: {
+        schemaVersion: 2,
+        startup: { deviceOS: '6.2.0' },
+      },
+    },
+  ], { productId: '42131', generatedAt: '2026-07-14T08:03:00.000Z' });
+
+  const text = renderFleetSummary(summary, { verbose: true, color: false }).join('\n');
+  assert.match(text, /SCHEMA VER/);
+  assert.match(text, /2/);
 });
