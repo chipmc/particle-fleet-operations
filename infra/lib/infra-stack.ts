@@ -115,7 +115,11 @@ export class InfraStack extends cdk.Stack {
     }));
 
     // Phase 4: EventHistory write permission (PutItem only, append-only log)
-    eventHistoryTable.grantWriteData(ingestionFunction);
+    ingestionFunction.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['dynamodb:PutItem'],
+      resources: [eventHistoryTable.tableArn],
+    }));
 
     // Phase 2B: Query API requires DynamoDB Query only (no S3, no Scan)
     // Grant minimal DynamoDB read permissions for per-device queries

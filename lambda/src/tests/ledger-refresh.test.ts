@@ -579,4 +579,39 @@ describe('device-status Ledger refresh', () => {
       httpStatus: 429,
     });
   });
+
+  it('should invoke onSyncFailed with httpStatus and errorKind when the ledger HTTP call fails', async () => {
+    const client = createClient(failureResult('retryable_failure', 503));
+    const syncFailedDetail: { errorKind?: string; httpStatus?: number } = {};
+    const onSyncFailed = jest.fn((detail: { errorKind?: string; httpStatus?: number }) => {
+      Object.assign(syncFailedDetail, detail);
+    });
+
+    await expect(refresh({ ledgerClient: client, onSyncFailed })).resolves.toBe('not_found_or_failed');
+
+    expect(onSyncFailed).toHaveBeenCalledTimes(1);
+    expect(syncFailedDetail.errorKind).toBe('retryable_failure');
+    expect(syncFailedDetail.httpStatus).toBe(503);
+  });
+
+  it('should invoke onSyncFailed with errorKind "exception" when the ledger client throws', async () => {
+    const throwingClient = createClientWithImplementation(
+      jest.fn().mockRejectedValue(new Error('network error'))
+    );
+    const onSyncFailed = jest.fn();
+
+    await expect(refresh({ ledgerClient: throwingClient, onSyncFailed })).resolves.toBe('not_found_or_failed');
+
+    expect(onSyncFailed).toHaveBeenCalledTimes(1);
+    expect(onSyncFailed).toHaveBeenCalledWith({ errorKind: 'exception' });
+  });
+
+  it('should not invoke onSyncFailed when the ledger call succeeds', async () => {
+    const client = createClient(successResult('2026-07-13T10:05:00.000Z'));
+    const onSyncFailed = jest.fn();
+
+    await expect(refresh({ ledgerClient: client, onSyncFailed })).resolves.toBe('updated');
+
+    expect(onSyncFailed).not.toHaveBeenCalled();
+  });
 });

@@ -6,11 +6,13 @@
  *
  * Table key schema:
  *   Partition key: deviceId  (STRING)
- *   Sort key:      eventTime (STRING) — stores "{isoTimestamp}#{eventType}"
- *                  to guarantee uniqueness when multiple event types fire
- *                  from the same device report.
+ *   Sort key:      eventTime (STRING) — stores "{isoTimestamp}#{eventType}#{uniqueId}"
+ *                  where uniqueId is the normalized eventId (stable per report) or a
+ *                  random UUID fallback, guaranteeing uniqueness even when multiple
+ *                  reports share the same timestamp and event type.
  */
 
+import { randomUUID } from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { CurrentStateAnomaly, DeviceCurrentState, NormalizedEventFields } from '../types';
@@ -27,7 +29,7 @@ export type EventHistoryEventType =
 
 export interface EventHistoryItem {
   deviceId: string;
-  /** Sort key value: "{isoTimestamp}#{eventType}" */
+  /** Sort key value: "{isoTimestamp}#{eventType}#{uniqueId}" */
   eventTime: string;
   eventType: EventHistoryEventType;
   /** Pure ISO timestamp of the originating device report. */
@@ -80,8 +82,8 @@ export interface IngestionEventHistoryContext {
  * Writes up to five event types when their conditions are met:
  *   ANOMALY           — any anomaly detected in the current effective state
  *   FIRMWARE_UPDATE   — firmware version changed from previous report
- *   BATTERY_CRITICAL  — effective battery below 20%
- *   DEVICE_RECOVERED  — previous state was an offline candidate
+ *   BATTERY_CRITICAL  — effective battery transitions into below-20% (not already critical)
+ *   DEVICE_RECOVERED  — previous state was an offline candidate and current report is newer
  *   LEDGER_SYNC_FAILED — ledger refresh returned a failure
  *
  * All writes are issued concurrently via Promise.all.
@@ -90,6 +92,10 @@ export async function writeIngestionEventHistory(
   ctx: IngestionEventHistoryContext
 ): Promise<void> {
   const writes: Promise<void>[] = [];
+
+  // Stable per-report unique ID, used as the collision-resistant sort-key suffix.
+  // Falls back to a random UUID when normalized fields are unavailable.
+  const uniqueId = ctx.normalized?.eventId ?? randomUUID();
 
   // Compute effective state: take normalized value, fall back to previous.
   // Mirrors mergePreviousMetrics() in current-state.ts.
@@ -116,7 +122,7 @@ export async function writeIngestionEventHistory(
   if (anomalies.length > 0) {
     writes.push(writeEventHistory(ctx.tableName, {
       deviceId: ctx.deviceId,
-      eventTime: `${ctx.publishedAt}#ANOMALY`,
+      eventTime: `${ctx.publishedAt}#ANOMALY#${uniqueId}`,
       eventType: 'ANOMALY',
       reportTime: ctx.publishedAt,
       anomalies,
@@ -130,7 +136,7 @@ export async function writeIngestionEventHistory(
   if (newFwVersion && prevFwVersion && newFwVersion !== prevFwVersion) {
     writes.push(writeEventHistory(ctx.tableName, {
       deviceId: ctx.deviceId,
-      eventTime: `${ctx.publishedAt}#FIRMWARE_UPDATE`,
+      eventTime: `${ctx.publishedAt}#FIRMWARE_UPDATE#${uniqueId}`,
       eventType: 'FIRMWARE_UPDATE',
       reportTime: ctx.publishedAt,
       fromFwVersion: prevFwVersion,
@@ -138,22 +144,31 @@ export async function writeIngestionEventHistory(
     }));
   }
 
-  // BATTERY_CRITICAL — fires when effective battery is below the critical threshold.
-  if (effectiveBattery !== undefined && effectiveBattery < 20) {
+  // BATTERY_CRITICAL — fires only on the transition into critical (< 20%).
+  // Skips if the previous state was already below 20% to avoid firing on every
+  // report from a device that has been sitting at a low charge for days.
+  const prevBattery = ctx.previousState?.battery;
+  const wasAlreadyCritical = prevBattery !== undefined && prevBattery < 20;
+  if (effectiveBattery !== undefined && effectiveBattery < 20 && !wasAlreadyCritical) {
     writes.push(writeEventHistory(ctx.tableName, {
       deviceId: ctx.deviceId,
-      eventTime: `${ctx.publishedAt}#BATTERY_CRITICAL`,
+      eventTime: `${ctx.publishedAt}#BATTERY_CRITICAL#${uniqueId}`,
       eventType: 'BATTERY_CRITICAL',
       reportTime: ctx.publishedAt,
       batteryLevel: effectiveBattery,
     }));
   }
 
-  // DEVICE_RECOVERED — fires when the previous state was an offline candidate.
-  if (ctx.previousState?.offlineCandidate === true) {
+  // DEVICE_RECOVERED — fires when the previous state was an offline candidate
+  // and the current report carries a newer timestamp, confirming the device
+  // has actually come back online.
+  if (
+    ctx.previousState?.offlineCandidate === true &&
+    ctx.publishedAt > ctx.previousState.lastEventTime
+  ) {
     writes.push(writeEventHistory(ctx.tableName, {
       deviceId: ctx.deviceId,
-      eventTime: `${ctx.publishedAt}#DEVICE_RECOVERED`,
+      eventTime: `${ctx.publishedAt}#DEVICE_RECOVERED#${uniqueId}`,
       eventType: 'DEVICE_RECOVERED',
       reportTime: ctx.publishedAt,
     }));
@@ -163,7 +178,7 @@ export async function writeIngestionEventHistory(
   if (ctx.ledgerSyncFailure) {
     const item: EventHistoryItem = {
       deviceId: ctx.deviceId,
-      eventTime: `${ctx.publishedAt}#LEDGER_SYNC_FAILED`,
+      eventTime: `${ctx.publishedAt}#LEDGER_SYNC_FAILED#${uniqueId}`,
       eventType: 'LEDGER_SYNC_FAILED',
       reportTime: ctx.publishedAt,
     };

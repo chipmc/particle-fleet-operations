@@ -76,7 +76,7 @@ describe('writeEventHistory', () => {
     mockDdbSend.mockResolvedValueOnce({});
     const item: EventHistoryItem = {
       deviceId: DEVICE_ID,
-      eventTime: `${REPORT_TIME}#ANOMALY`,
+      eventTime: `${REPORT_TIME}#ANOMALY#evt-1`,
       eventType: 'ANOMALY',
       reportTime: REPORT_TIME,
       anomalyCount: 1,
@@ -108,7 +108,7 @@ describe('writeIngestionEventHistory — event type: ANOMALY', () => {
     expect(anomalyCall).toBeDefined();
     expect(anomalyCall.input.Item.deviceId).toBe(DEVICE_ID);
     expect(anomalyCall.input.Item.reportTime).toBe(REPORT_TIME);
-    expect(anomalyCall.input.Item.eventTime).toBe(`${REPORT_TIME}#ANOMALY`);
+    expect(anomalyCall.input.Item.eventTime).toBe(`${REPORT_TIME}#ANOMALY#evt-1`);
     expect(anomalyCall.input.Item.anomalyCount).toBeGreaterThan(0);
     expect(anomalyCall.input.Item.anomalies).toContainEqual(
       expect.objectContaining({ type: 'critical_battery' })
@@ -168,7 +168,7 @@ describe('writeIngestionEventHistory — event type: FIRMWARE_UPDATE', () => {
     expect(fwCall).toBeDefined();
     expect(fwCall.input.Item.deviceId).toBe(DEVICE_ID);
     expect(fwCall.input.Item.reportTime).toBe(REPORT_TIME);
-    expect(fwCall.input.Item.eventTime).toBe(`${REPORT_TIME}#FIRMWARE_UPDATE`);
+    expect(fwCall.input.Item.eventTime).toBe(`${REPORT_TIME}#FIRMWARE_UPDATE#evt-1`);
     expect(fwCall.input.Item.fromFwVersion).toBe('14');
     expect(fwCall.input.Item.toFwVersion).toBe('15');
   });
@@ -209,10 +209,11 @@ describe('writeIngestionEventHistory — event type: FIRMWARE_UPDATE', () => {
 describe('writeIngestionEventHistory — event type: BATTERY_CRITICAL', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('writes BATTERY_CRITICAL when battery is below 20%', async () => {
+  it('writes BATTERY_CRITICAL when battery transitions into critical for the first time (no previous reading)', async () => {
     mockDdbSend.mockResolvedValue({});
     const ctx = baseContext({
       normalized: baseNormalized({ battery: 12 }),
+      previousState: baseState(), // no previous battery — first time we see it below 20%
     });
 
     await writeIngestionEventHistory(ctx);
@@ -224,8 +225,41 @@ describe('writeIngestionEventHistory — event type: BATTERY_CRITICAL', () => {
     expect(battCall).toBeDefined();
     expect(battCall.input.Item.deviceId).toBe(DEVICE_ID);
     expect(battCall.input.Item.reportTime).toBe(REPORT_TIME);
-    expect(battCall.input.Item.eventTime).toBe(`${REPORT_TIME}#BATTERY_CRITICAL`);
+    expect(battCall.input.Item.eventTime).toBe(`${REPORT_TIME}#BATTERY_CRITICAL#evt-1`);
     expect(battCall.input.Item.batteryLevel).toBe(12);
+  });
+
+  it('writes BATTERY_CRITICAL when battery drops from above 20% to below 20%', async () => {
+    mockDdbSend.mockResolvedValue({});
+    const ctx = baseContext({
+      normalized: baseNormalized({ battery: 15 }),
+      previousState: baseState({ battery: 25 }), // was above threshold
+    });
+
+    await writeIngestionEventHistory(ctx);
+
+    const putCalls = mockDdbSend.mock.calls.map((c) => c[0]);
+    const battCall = putCalls.find(
+      (cmd) => cmd.input?.Item?.eventType === 'BATTERY_CRITICAL'
+    );
+    expect(battCall).toBeDefined();
+    expect(battCall.input.Item.batteryLevel).toBe(15);
+  });
+
+  it('does not write BATTERY_CRITICAL when battery was already below 20% in previous state', async () => {
+    mockDdbSend.mockResolvedValue({});
+    const ctx = baseContext({
+      normalized: baseNormalized({ battery: 12 }),
+      previousState: baseState({ battery: 10 }), // already critical — not a new transition
+    });
+
+    await writeIngestionEventHistory(ctx);
+
+    const putCalls = mockDdbSend.mock.calls.map((c) => c[0]);
+    const battCall = putCalls.find(
+      (cmd) => cmd.input?.Item?.eventType === 'BATTERY_CRITICAL'
+    );
+    expect(battCall).toBeUndefined();
   });
 
   it('does not write BATTERY_CRITICAL when battery is at or above 20%', async () => {
@@ -243,11 +277,11 @@ describe('writeIngestionEventHistory — event type: BATTERY_CRITICAL', () => {
     expect(battCall).toBeUndefined();
   });
 
-  it('falls back to previous state battery for BATTERY_CRITICAL check', async () => {
+  it('does not write BATTERY_CRITICAL when inherited battery was already critical (no transition)', async () => {
     mockDdbSend.mockResolvedValue({});
     const ctx = baseContext({
-      normalized: baseNormalized(), // no battery in current normalized
-      previousState: baseState({ battery: 10 }),
+      normalized: baseNormalized(), // no battery in current report — inherits from previous
+      previousState: baseState({ battery: 10 }), // previous was already critical
     });
 
     await writeIngestionEventHistory(ctx);
@@ -256,18 +290,21 @@ describe('writeIngestionEventHistory — event type: BATTERY_CRITICAL', () => {
     const battCall = putCalls.find(
       (cmd) => cmd.input?.Item?.eventType === 'BATTERY_CRITICAL'
     );
-    expect(battCall).toBeDefined();
-    expect(battCall.input.Item.batteryLevel).toBe(10);
+    expect(battCall).toBeUndefined();
   });
 });
 
 describe('writeIngestionEventHistory — event type: DEVICE_RECOVERED', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('writes DEVICE_RECOVERED when previous state was an offline candidate', async () => {
+  it('writes DEVICE_RECOVERED when previous state was an offline candidate and current report is newer', async () => {
     mockDdbSend.mockResolvedValue({});
     const ctx = baseContext({
-      previousState: baseState({ offlineCandidate: true }),
+      publishedAt: '2026-07-28T11:00:00.000Z',
+      previousState: baseState({
+        offlineCandidate: true,
+        lastEventTime: '2026-07-28T09:00:00.000Z', // older than publishedAt
+      }),
     });
 
     await writeIngestionEventHistory(ctx);
@@ -278,8 +315,8 @@ describe('writeIngestionEventHistory — event type: DEVICE_RECOVERED', () => {
     );
     expect(recCall).toBeDefined();
     expect(recCall.input.Item.deviceId).toBe(DEVICE_ID);
-    expect(recCall.input.Item.reportTime).toBe(REPORT_TIME);
-    expect(recCall.input.Item.eventTime).toBe(`${REPORT_TIME}#DEVICE_RECOVERED`);
+    expect(recCall.input.Item.reportTime).toBe('2026-07-28T11:00:00.000Z');
+    expect(recCall.input.Item.eventTime).toBe(`2026-07-28T11:00:00.000Z#DEVICE_RECOVERED#evt-1`);
   });
 
   it('does not write DEVICE_RECOVERED when previous state was not an offline candidate', async () => {
@@ -309,6 +346,25 @@ describe('writeIngestionEventHistory — event type: DEVICE_RECOVERED', () => {
     );
     expect(recCall).toBeUndefined();
   });
+
+  it('does not write DEVICE_RECOVERED when publishedAt is not newer than previous lastEventTime', async () => {
+    mockDdbSend.mockResolvedValue({});
+    const ctx = baseContext({
+      publishedAt: REPORT_TIME,
+      previousState: baseState({
+        offlineCandidate: true,
+        lastEventTime: REPORT_TIME, // same timestamp — not a new event
+      }),
+    });
+
+    await writeIngestionEventHistory(ctx);
+
+    const putCalls = mockDdbSend.mock.calls.map((c) => c[0]);
+    const recCall = putCalls.find(
+      (cmd) => cmd.input?.Item?.eventType === 'DEVICE_RECOVERED'
+    );
+    expect(recCall).toBeUndefined();
+  });
 });
 
 describe('writeIngestionEventHistory — event type: LEDGER_SYNC_FAILED', () => {
@@ -329,7 +385,7 @@ describe('writeIngestionEventHistory — event type: LEDGER_SYNC_FAILED', () => 
     expect(failCall).toBeDefined();
     expect(failCall.input.Item.deviceId).toBe(DEVICE_ID);
     expect(failCall.input.Item.reportTime).toBe(REPORT_TIME);
-    expect(failCall.input.Item.eventTime).toBe(`${REPORT_TIME}#LEDGER_SYNC_FAILED`);
+    expect(failCall.input.Item.eventTime).toBe(`${REPORT_TIME}#LEDGER_SYNC_FAILED#evt-1`);
     expect(failCall.input.Item.errorKind).toBe('http_error');
     expect(failCall.input.Item.httpStatus).toBe(404);
   });
