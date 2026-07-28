@@ -11,6 +11,7 @@ import { InboundEvent, LambdaResponse, ParticleWebhook } from './types';
 import { storeRawEvent } from './storage/s3';
 import { indexEvent } from './storage/dynamo';
 import { getDeviceCurrentState, updateDeviceCurrentState } from './storage/current-state';
+import { writeIngestionEventHistory, LedgerSyncFailureDetail } from './storage/event-history';
 import { resolveParticleDeviceName } from './integrations/particle-api';
 import { refreshDeviceStatusLedger } from './ledger-refresh';
 import {
@@ -23,7 +24,7 @@ import {
   safeParseData,
   normalizeEvent,
 } from './utils/parse';
-import { NormalizedEventFields } from './types';
+import { DeviceCurrentState, NormalizedEventFields } from './types';
 
 /**
  * Handle ingestion of Particle webhook events
@@ -134,10 +135,13 @@ export async function handleIngestion(event: InboundEvent): Promise<LambdaRespon
   );
 
   const currentStateTableName = process.env.DEVICE_CURRENT_STATE_TABLE_NAME;
+  const projectId = normalized?.projectId || body.projectId || 'generalized-core-counter';
+  let previousCurrentState: DeviceCurrentState | null = null;
+  let ledgerSyncFailure: LedgerSyncFailureDetail | undefined;
+
   if (currentStateTableName) {
     try {
-      const projectId = normalized?.projectId || body.projectId || 'generalized-core-counter';
-      const previousCurrentState = await getDeviceCurrentState(currentStateTableName, projectId, deviceId);
+      previousCurrentState = await getDeviceCurrentState(currentStateTableName, projectId, deviceId);
       const deviceNameResolution = previousCurrentState?.deviceName
         ? null
         : await resolveParticleDeviceName(deviceId);
@@ -161,6 +165,7 @@ export async function handleIngestion(event: InboundEvent): Promise<LambdaRespon
         deviceId,
         body,
         previous: previousCurrentState,
+        onSyncFailed: (detail) => { ledgerSyncFailure = detail; },
       });
       console.log(
         'Phase3A DeviceCurrentState update succeeded',
@@ -177,7 +182,7 @@ export async function handleIngestion(event: InboundEvent): Promise<LambdaRespon
         'Phase3A DeviceCurrentState update failed; preserving ingestion',
         JSON.stringify({
           tableName: currentStateTableName,
-          projectId: normalized?.projectId || body.projectId || 'generalized-core-counter',
+          projectId,
           deviceId,
           eventName,
           eventTime: publishedAt,
@@ -194,6 +199,31 @@ export async function handleIngestion(event: InboundEvent): Promise<LambdaRespon
         eventTime: publishedAt,
       })
     );
+  }
+
+  const eventHistoryTableName = process.env.EVENT_HISTORY_TABLE_NAME;
+  if (eventHistoryTableName) {
+    try {
+      await writeIngestionEventHistory({
+        tableName: eventHistoryTableName,
+        deviceId,
+        publishedAt,
+        normalized,
+        previousState: previousCurrentState,
+        ledgerSyncFailure,
+      });
+    } catch (err) {
+      console.warn(
+        'Phase4 EventHistory write failed; preserving ingestion',
+        JSON.stringify({
+          tableName: eventHistoryTableName,
+          deviceId,
+          eventName,
+          eventTime: publishedAt,
+        }),
+        err
+      );
+    }
   }
 
   // ============================================================================

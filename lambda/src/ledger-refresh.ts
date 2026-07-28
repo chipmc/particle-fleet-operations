@@ -10,6 +10,7 @@ import {
   updateDeviceStatusLedgerSnapshot,
   updateProductDefaultsLedgerSnapshot,
 } from './storage/current-state';
+import { LedgerSyncFailureDetail } from './storage/event-history';
 import { DeviceCurrentState, ParticleWebhook } from './types';
 
 export type DeviceStatusLedgerRefreshResult =
@@ -32,6 +33,8 @@ interface RefreshDeviceStatusLedgerInput {
   previous: DeviceCurrentState | null;
   fetchedAt?: Date;
   ledgerClient?: ParticleLedgerClient;
+  /** Optional callback invoked when a ledger sync failure occurs. */
+  onSyncFailed?: (detail: LedgerSyncFailureDetail) => void | Promise<void>;
 }
 
 const productIdByDeviceId = new Map<string, string>();
@@ -125,6 +128,10 @@ async function executeDeviceStatusLedgerRefresh(
         httpStatus: ledgerResult.error.httpStatus,
         errorKind: ledgerResult.error.kind,
       });
+      input.onSyncFailed?.({
+        errorKind: ledgerResult.error.kind,
+        httpStatus: ledgerResult.error.httpStatus,
+      });
       return 'not_found_or_failed';
     }
 
@@ -155,6 +162,7 @@ async function executeDeviceStatusLedgerRefresh(
     return updateResult;
   } catch (err) {
     logLedgerRefresh({ deviceId: input.deviceId, result: 'failed', elapsedMs: elapsedMs(), errorKind: 'exception' });
+    input.onSyncFailed?.({ errorKind: 'exception' });
     return 'not_found_or_failed';
   }
 }
