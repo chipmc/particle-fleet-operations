@@ -47,6 +47,16 @@ export class InfraStack extends cdk.Stack {
       removalPolicy: RemovalPolicy.RETAIN,
     });
 
+    const eventHistoryTable = new dynamodb.Table(this, 'DeviceEventHistoryTable', {
+      partitionKey: { name: 'deviceId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'eventTime', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
     // =========================================================================
     // Lambda Function (handles both ingestion and query)
     // =========================================================================
@@ -71,6 +81,7 @@ export class InfraStack extends cdk.Stack {
         RAW_LOGS_BUCKET_NAME: rawLogsBucket.bucketName,
         LOG_EVENTS_TABLE_NAME: logEventsTable.tableName,
         DEVICE_CURRENT_STATE_TABLE_NAME: deviceCurrentStateTable.tableName,
+        EVENT_HISTORY_TABLE_NAME: eventHistoryTable.tableName,
         PARTICLE_ACCESS_TOKEN: process.env.PARTICLE_ACCESS_TOKEN || '',
         PARTICLE_API_BASE_URL: process.env.PARTICLE_API_BASE_URL || 'https://api.particle.io',
         PARTICLE_WEBHOOK_SECRET: process.env.PARTICLE_WEBHOOK_SECRET || '',
@@ -101,6 +112,13 @@ export class InfraStack extends cdk.Stack {
       resources: [
         deviceCurrentStateTable.tableArn,
       ],
+    }));
+
+    // Phase 4: EventHistory write permission (PutItem only, append-only log)
+    ingestionFunction.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['dynamodb:PutItem'],
+      resources: [eventHistoryTable.tableArn],
     }));
 
     // Phase 2B: Query API requires DynamoDB Query only (no S3, no Scan)
@@ -233,6 +251,10 @@ export class InfraStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'DeviceCurrentStateTableName', {
       value: deviceCurrentStateTable.tableName,
+    });
+
+    new cdk.CfnOutput(this, 'EventHistoryTableName', {
+      value: eventHistoryTable.tableName,
     });
   }
 }
