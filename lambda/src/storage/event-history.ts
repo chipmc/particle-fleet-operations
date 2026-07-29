@@ -224,20 +224,24 @@ function buildEventTime(
   return `${ctx.publishedAt}#${eventType}#${eventIdComponent}#${payloadHash}`;
 }
 
-function stableSerialize(value: unknown): string {
+function stableSerialize(value: unknown, depth: number = 0): string {
+  if (depth > 50) {
+    throw new Error('EventHistory payload exceeded maximum serialization depth');
+  }
+
   if (value === null || typeof value !== 'object') {
     return JSON.stringify(value);
   }
 
   if (Array.isArray(value)) {
-    return `[${value.map((entry) => stableSerialize(entry ?? null)).join(',')}]`;
+    return `[${value.map((entry) => entry === undefined ? 'null' : stableSerialize(entry, depth + 1)).join(',')}]`;
   }
 
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, entryValue]) => entryValue !== undefined)
     .sort(([left], [right]) => left.localeCompare(right));
 
-  return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableSerialize(entryValue)}`).join(',')}}`;
+  return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableSerialize(entryValue, depth + 1)}`).join(',')}}`;
 }
 
 function isOfflineCandidate(eventTime: string, thresholdHours: number, now: string): boolean {

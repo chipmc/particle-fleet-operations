@@ -84,7 +84,7 @@ function expectEventTime(
   ]);
 }
 
-function legacyComputeAnomalies(state: {
+function referenceComputeAnomalies(state: {
   battery?: number;
   connectTime?: number;
   alertCount?: number;
@@ -227,7 +227,7 @@ describe('writeIngestionEventHistory — event type: ANOMALY', () => {
     };
 
     expect(anomalyCall).toBeDefined();
-    expect(anomalyCall.input.Item.anomalies).toEqual(legacyComputeAnomalies(effectiveState));
+    expect(anomalyCall.input.Item.anomalies).toEqual(referenceComputeAnomalies(effectiveState));
     expect(anomalyCall.input.Item.anomalies).toEqual(buildAnomalies(effectiveState));
   });
 
