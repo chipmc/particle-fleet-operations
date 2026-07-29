@@ -80,11 +80,14 @@ function expectEventTime(
     reportTime,
     eventType,
     eventId,
-    expect.stringMatching(/^[0-9a-f]{16}$/),
+    expect.stringMatching(/^[0-9a-f]{32}$/),
   ]);
 }
 
-/** Reference copy of the pre-export EventHistory anomaly logic for parity checks. */
+/**
+ * Reference copy of the old EventHistory anomaly logic for parity regression checks.
+ * Remove if this regression is ever replaced with a stronger end-to-end assertion.
+ */
 function referenceComputeAnomalies(state: {
   battery?: number;
   connectTime?: number;

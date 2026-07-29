@@ -24,7 +24,6 @@ const ddb = DynamoDBDocumentClient.from(client);
 const DEFAULT_OFFLINE_THRESHOLD_HOURS = 3;
 const MISSING_EVENT_ID_COMPONENT = 'no-event-id';
 const MAX_SERIALIZATION_DEPTH = 50;
-const UNDEFINED_ARRAY_ENTRY_TOKEN = '__EVENT_HISTORY_UNDEFINED__';
 
 export type EventHistoryEventType =
   | 'ANOMALY'
@@ -222,7 +221,7 @@ function buildEventTime(
       item,
     }))
     .digest('hex')
-    .slice(0, 16);
+    .slice(0, 32);
   return `${ctx.publishedAt}#${eventType}#${eventIdComponent}#${payloadHash}`;
 }
 
@@ -236,7 +235,7 @@ function stableSerialize(value: unknown, depth: number = 0): string {
   }
 
   if (Array.isArray(value)) {
-    return `[${value.map((entry) => entry === undefined ? UNDEFINED_ARRAY_ENTRY_TOKEN : stableSerialize(entry, depth + 1)).join(',')}]`;
+    return `[${value.map((entry) => entry === undefined ? 'u' : `v:${stableSerialize(entry, depth + 1)}`).join(',')}]`;
   }
 
   const entries = Object.entries(value as Record<string, unknown>)
