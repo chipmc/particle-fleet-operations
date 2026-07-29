@@ -84,6 +84,7 @@ function expectEventTime(
   ]);
 }
 
+/** Reference copy of the pre-export EventHistory anomaly logic for parity checks. */
 function referenceComputeAnomalies(state: {
   battery?: number;
   connectTime?: number;
