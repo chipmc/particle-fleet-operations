@@ -27,6 +27,7 @@ const productId = '12345';
 const startTime = new Date('2026-07-13T10:10:00.000Z');
 const insideCooldown = new Date('2026-07-13T10:10:30.000Z');
 const afterCooldown = new Date('2026-07-13T10:11:01.000Z');
+const flushMacrotask = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 const eligibleBody: ParticleWebhook = {
   event: eligibleEventName,
@@ -594,6 +595,38 @@ describe('device-status Ledger refresh', () => {
     expect(syncFailedDetail.httpStatus).toBe(503);
   });
 
+  it('should await an async onSyncFailed callback before resolving an HTTP failure', async () => {
+    const client = createClient(failureResult('retryable_failure', 503));
+    let releaseCallback!: () => void;
+    let callbackFinished = false;
+    let callbackStarted!: Promise<void>;
+    let markCallbackStarted!: () => void;
+    callbackStarted = new Promise<void>((resolve) => {
+      markCallbackStarted = resolve;
+    });
+    const onSyncFailed = jest.fn(async () => {
+      markCallbackStarted();
+      await new Promise<void>((resolve) => {
+        releaseCallback = resolve;
+      });
+      callbackFinished = true;
+    });
+
+    const refreshPromise = refresh({ ledgerClient: client, onSyncFailed });
+    await callbackStarted;
+
+    let refreshSettled = false;
+    refreshPromise.then(() => {
+      refreshSettled = true;
+    });
+    await flushMacrotask();
+    expect(refreshSettled).toBe(false);
+
+    releaseCallback();
+    await expect(refreshPromise).resolves.toBe('not_found_or_failed');
+    expect(callbackFinished).toBe(true);
+  });
+
   it('should invoke onSyncFailed with errorKind "exception" when the ledger client throws', async () => {
     const throwingClient = createClientWithImplementation(
       jest.fn().mockRejectedValue(new Error('network error'))
@@ -604,6 +637,54 @@ describe('device-status Ledger refresh', () => {
 
     expect(onSyncFailed).toHaveBeenCalledTimes(1);
     expect(onSyncFailed).toHaveBeenCalledWith({ errorKind: 'exception' });
+  });
+
+  it('should await an async onSyncFailed callback before resolving an exception failure', async () => {
+    const throwingClient = createClientWithImplementation(
+      jest.fn().mockRejectedValue(new Error('network error'))
+    );
+    let releaseCallback!: () => void;
+    let callbackFinished = false;
+    let callbackStarted!: Promise<void>;
+    let markCallbackStarted!: () => void;
+    callbackStarted = new Promise<void>((resolve) => {
+      markCallbackStarted = resolve;
+    });
+    const onSyncFailed = jest.fn(async () => {
+      markCallbackStarted();
+      await new Promise<void>((resolve) => {
+        releaseCallback = resolve;
+      });
+      callbackFinished = true;
+    });
+
+    const refreshPromise = refresh({ ledgerClient: throwingClient, onSyncFailed });
+    await callbackStarted;
+
+    let refreshSettled = false;
+    refreshPromise.then(() => {
+      refreshSettled = true;
+    });
+    await flushMacrotask();
+    expect(refreshSettled).toBe(false);
+
+    releaseCallback();
+    await expect(refreshPromise).resolves.toBe('not_found_or_failed');
+    expect(callbackFinished).toBe(true);
+  });
+
+  it('should surface onSyncFailed rejections without reinvoking the callback', async () => {
+    const client = createClient(failureResult('retryable_failure', 503));
+    const callbackError = new Error('callback failed');
+    const onSyncFailed = jest.fn().mockRejectedValue(callbackError);
+
+    await expect(refresh({ ledgerClient: client, onSyncFailed })).rejects.toThrow('callback failed');
+
+    expect(onSyncFailed).toHaveBeenCalledTimes(1);
+    expect(onSyncFailed).toHaveBeenCalledWith({
+      errorKind: 'retryable_failure',
+      httpStatus: 503,
+    });
   });
 
   it('should not invoke onSyncFailed when the ledger call succeeds', async () => {

@@ -17,7 +17,8 @@ import {
   EventHistoryItem,
   IngestionEventHistoryContext,
 } from '../../storage/event-history';
-import { DeviceCurrentState, NormalizedEventFields } from '../../types';
+import { buildAnomalies } from '../../storage/current-state';
+import { CurrentStateAnomaly, DeviceCurrentState, NormalizedEventFields } from '../../types';
 
 const mockDdbSend = jest.fn();
 jest.spyOn(ddb, 'send').mockImplementation(mockDdbSend);
@@ -63,10 +64,87 @@ function baseContext(overrides: Partial<IngestionEventHistoryContext> = {}): Ing
     tableName: TABLE,
     deviceId: DEVICE_ID,
     publishedAt: REPORT_TIME,
+    rawPayload: baseRawPayload(),
     normalized: baseNormalized(),
     previousState: baseState(),
     ...overrides,
   };
+}
+
+function baseRawPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    event: 'Ubidots-Sensor-Hook-v1',
+    coreid: DEVICE_ID,
+    product_id: 12345,
+    published_at: REPORT_TIME,
+    ...overrides,
+  };
+}
+
+function expectEventTime(
+  eventTime: string,
+  reportTime: string,
+  eventType: string,
+  eventId: string = 'evt-1'
+): void {
+  expect(eventTime.split('#')).toEqual([
+    reportTime,
+    eventType,
+    eventId,
+    expect.stringMatching(/^[0-9a-f]{32}$/),
+  ]);
+}
+
+/**
+ * Reference copy of the old EventHistory anomaly logic for parity regression checks.
+ * Remove if this regression is ever replaced with a stronger end-to-end assertion.
+ */
+function referenceComputeAnomalies(state: {
+  battery?: number;
+  connectTime?: number;
+  alertCount?: number;
+  severity?: string | null;
+  watchdogDetected?: boolean;
+  reconnectDetected?: boolean;
+  resetDetected?: boolean;
+}): CurrentStateAnomaly[] {
+  const anomalies: CurrentStateAnomaly[] = [];
+
+  if (state.battery !== undefined && state.battery < 20) {
+    anomalies.push({ severity: 'high', type: 'critical_battery', message: 'Battery below 20%' });
+  } else if (state.battery !== undefined && state.battery < 30) {
+    anomalies.push({ severity: 'medium', type: 'low_battery', message: 'Battery below 30%' });
+  }
+
+  if (state.connectTime !== undefined && state.connectTime > 300) {
+    anomalies.push({ severity: 'high', type: 'very_high_connect_time', message: 'Connect time exceeded 300 seconds' });
+  } else if (state.connectTime !== undefined && state.connectTime > 180) {
+    anomalies.push({ severity: 'medium', type: 'high_connect_time', message: 'Connect time exceeded 180 seconds' });
+  }
+
+  if (state.alertCount !== undefined && state.alertCount > 0) {
+    anomalies.push({ severity: 'high', type: 'active_alerts', message: 'Active alert count is non-zero' });
+  }
+
+  if (state.severity === 'ERROR') {
+    anomalies.push({ severity: 'high', type: 'serial_error', message: 'Latest serial event is ERROR severity' });
+  } else if (state.severity === 'WARN') {
+    anomalies.push({ severity: 'medium', type: 'serial_warning', message: 'Latest serial event is WARN severity' });
+  }
+
+  if (state.watchdogDetected) {
+    anomalies.push({ severity: 'high', type: 'serial_watchdog', message: 'Serial log indicates watchdog activity' });
+  }
+
+  if (state.reconnectDetected) {
+    anomalies.push({ severity: 'medium', type: 'serial_reconnect', message: 'Serial log indicates reconnect or retry activity' });
+  }
+
+  if (state.resetDetected) {
+    anomalies.push({ severity: 'medium', type: 'serial_reset', message: 'Serial log indicates reset, reboot, or panic activity' });
+  }
+
+  return anomalies.slice(0, 10);
 }
 
 describe('writeEventHistory', () => {
@@ -108,7 +186,7 @@ describe('writeIngestionEventHistory — event type: ANOMALY', () => {
     expect(anomalyCall).toBeDefined();
     expect(anomalyCall.input.Item.deviceId).toBe(DEVICE_ID);
     expect(anomalyCall.input.Item.reportTime).toBe(REPORT_TIME);
-    expect(anomalyCall.input.Item.eventTime).toBe(`${REPORT_TIME}#ANOMALY#evt-1`);
+    expectEventTime(anomalyCall.input.Item.eventTime, REPORT_TIME, 'ANOMALY');
     expect(anomalyCall.input.Item.anomalyCount).toBeGreaterThan(0);
     expect(anomalyCall.input.Item.anomalies).toContainEqual(
       expect.objectContaining({ type: 'critical_battery' })
@@ -131,6 +209,41 @@ describe('writeIngestionEventHistory — event type: ANOMALY', () => {
     expect(anomalyCall.input.Item.anomalies).toContainEqual(
       expect.objectContaining({ type: 'very_high_connect_time' })
     );
+  });
+
+  it('matches the legacy anomaly output when routed through buildAnomalies', async () => {
+    mockDdbSend.mockResolvedValue({});
+    const ctx = baseContext({
+      normalized: baseNormalized({
+        battery: 15,
+        connectTime: 350,
+        alertCount: 1,
+        severity: 'WARN',
+        watchdogDetected: true,
+        reconnectDetected: true,
+        resetDetected: true,
+      }),
+    });
+
+    await writeIngestionEventHistory(ctx);
+
+    const putCalls = mockDdbSend.mock.calls.map((c) => c[0]);
+    const anomalyCall = putCalls.find(
+      (cmd) => cmd.input?.Item?.eventType === 'ANOMALY'
+    );
+    const effectiveState: Partial<DeviceCurrentState> = {
+      battery: 15,
+      connectTime: 350,
+      alertCount: 1,
+      severity: 'WARN',
+      watchdogDetected: true,
+      reconnectDetected: true,
+      resetDetected: true,
+    };
+
+    expect(anomalyCall).toBeDefined();
+    expect(anomalyCall.input.Item.anomalies).toEqual(referenceComputeAnomalies(effectiveState));
+    expect(anomalyCall.input.Item.anomalies).toEqual(buildAnomalies(effectiveState));
   });
 
   it('does not write ANOMALY when no anomalies are present', async () => {
@@ -168,7 +281,7 @@ describe('writeIngestionEventHistory — event type: FIRMWARE_UPDATE', () => {
     expect(fwCall).toBeDefined();
     expect(fwCall.input.Item.deviceId).toBe(DEVICE_ID);
     expect(fwCall.input.Item.reportTime).toBe(REPORT_TIME);
-    expect(fwCall.input.Item.eventTime).toBe(`${REPORT_TIME}#FIRMWARE_UPDATE#evt-1`);
+    expectEventTime(fwCall.input.Item.eventTime, REPORT_TIME, 'FIRMWARE_UPDATE');
     expect(fwCall.input.Item.fromFwVersion).toBe('14');
     expect(fwCall.input.Item.toFwVersion).toBe('15');
   });
@@ -225,7 +338,7 @@ describe('writeIngestionEventHistory — event type: BATTERY_CRITICAL', () => {
     expect(battCall).toBeDefined();
     expect(battCall.input.Item.deviceId).toBe(DEVICE_ID);
     expect(battCall.input.Item.reportTime).toBe(REPORT_TIME);
-    expect(battCall.input.Item.eventTime).toBe(`${REPORT_TIME}#BATTERY_CRITICAL#evt-1`);
+    expectEventTime(battCall.input.Item.eventTime, REPORT_TIME, 'BATTERY_CRITICAL');
     expect(battCall.input.Item.batteryLevel).toBe(12);
   });
 
@@ -297,12 +410,13 @@ describe('writeIngestionEventHistory — event type: BATTERY_CRITICAL', () => {
 describe('writeIngestionEventHistory — event type: DEVICE_RECOVERED', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('writes DEVICE_RECOVERED when previous state was an offline candidate and current report is newer', async () => {
+  it('writes DEVICE_RECOVERED when a fresh report follows an offline gap', async () => {
     mockDdbSend.mockResolvedValue({});
     const ctx = baseContext({
-      publishedAt: '2026-07-28T11:00:00.000Z',
+      publishedAt: '2026-07-28T13:30:00.000Z',
+      evaluatedAt: '2026-07-28T14:00:00.000Z',
       previousState: baseState({
-        offlineCandidate: true,
+        offlineCandidate: false,
         lastEventTime: '2026-07-28T09:00:00.000Z', // older than publishedAt
       }),
     });
@@ -315,14 +429,43 @@ describe('writeIngestionEventHistory — event type: DEVICE_RECOVERED', () => {
     );
     expect(recCall).toBeDefined();
     expect(recCall.input.Item.deviceId).toBe(DEVICE_ID);
-    expect(recCall.input.Item.reportTime).toBe('2026-07-28T11:00:00.000Z');
-    expect(recCall.input.Item.eventTime).toBe(`2026-07-28T11:00:00.000Z#DEVICE_RECOVERED#evt-1`);
+    expect(recCall.input.Item.reportTime).toBe('2026-07-28T13:30:00.000Z');
+    expectEventTime(
+      recCall.input.Item.eventTime,
+      '2026-07-28T13:30:00.000Z',
+      'DEVICE_RECOVERED'
+    );
   });
 
-  it('does not write DEVICE_RECOVERED when previous state was not an offline candidate', async () => {
+  it('does not write DEVICE_RECOVERED for a newer-but-still-stale report', async () => {
     mockDdbSend.mockResolvedValue({});
     const ctx = baseContext({
-      previousState: baseState({ offlineCandidate: false }),
+      publishedAt: '2026-07-28T13:30:00.000Z',
+      evaluatedAt: '2026-07-28T20:00:00.000Z',
+      previousState: baseState({
+        offlineCandidate: true,
+        lastEventTime: '2026-07-28T09:00:00.000Z',
+      }),
+    });
+
+    await writeIngestionEventHistory(ctx);
+
+    const putCalls = mockDdbSend.mock.calls.map((c) => c[0]);
+    const recCall = putCalls.find(
+      (cmd) => cmd.input?.Item?.eventType === 'DEVICE_RECOVERED'
+    );
+    expect(recCall).toBeUndefined();
+  });
+
+  it('does not write DEVICE_RECOVERED when the prior report never crossed the offline threshold', async () => {
+    mockDdbSend.mockResolvedValue({});
+    const ctx = baseContext({
+      publishedAt: '2026-07-28T12:30:00.000Z',
+      evaluatedAt: '2026-07-28T13:00:00.000Z',
+      previousState: baseState({
+        offlineCandidate: true,
+        lastEventTime: '2026-07-28T11:00:00.000Z',
+      }),
     });
 
     await writeIngestionEventHistory(ctx);
@@ -385,7 +528,7 @@ describe('writeIngestionEventHistory — event type: LEDGER_SYNC_FAILED', () => 
     expect(failCall).toBeDefined();
     expect(failCall.input.Item.deviceId).toBe(DEVICE_ID);
     expect(failCall.input.Item.reportTime).toBe(REPORT_TIME);
-    expect(failCall.input.Item.eventTime).toBe(`${REPORT_TIME}#LEDGER_SYNC_FAILED#evt-1`);
+    expectEventTime(failCall.input.Item.eventTime, REPORT_TIME, 'LEDGER_SYNC_FAILED');
     expect(failCall.input.Item.errorKind).toBe('http_error');
     expect(failCall.input.Item.httpStatus).toBe(404);
   });
@@ -429,6 +572,39 @@ describe('writeIngestionEventHistory — non-blocking behaviour', () => {
     });
 
     await expect(writeIngestionEventHistory(ctx)).rejects.toThrow('DynamoDB unavailable');
+  });
+});
+
+describe('writeIngestionEventHistory — sort key collisions', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('writes separate rows when only a normalization-discarded raw field changes', async () => {
+    mockDdbSend.mockResolvedValue({});
+
+    await writeIngestionEventHistory(baseContext({
+      rawPayload: baseRawPayload({ vendorSequence: 1 }),
+      normalized: baseNormalized({
+        eventId: 'evt-collision',
+        battery: 15,
+      }),
+    }));
+
+    await writeIngestionEventHistory(baseContext({
+      rawPayload: baseRawPayload({ vendorSequence: 2 }),
+      normalized: baseNormalized({
+        eventId: 'evt-collision',
+        battery: 15,
+      }),
+    }));
+
+    const anomalyItems = mockDdbSend.mock.calls
+      .map((c) => c[0].input?.Item)
+      .filter((item) => item?.eventType === 'ANOMALY');
+
+    expect(anomalyItems).toHaveLength(2);
+    expect(anomalyItems[0].eventTime).not.toBe(anomalyItems[1].eventTime);
+    expectEventTime(anomalyItems[0].eventTime, REPORT_TIME, 'ANOMALY', 'evt-collision');
+    expectEventTime(anomalyItems[1].eventTime, REPORT_TIME, 'ANOMALY', 'evt-collision');
   });
 });
 

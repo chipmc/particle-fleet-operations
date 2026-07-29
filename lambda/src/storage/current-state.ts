@@ -19,7 +19,7 @@ import {
 import { ParticleDeviceNameResolution } from '../integrations/particle-api';
 
 const DEFAULT_PROJECT_ID = 'generalized-core-counter';
-const DEFAULT_OFFLINE_THRESHOLD_HOURS = 3;
+export const OFFLINE_THRESHOLD_HOURS = 3;
 const DEVICE_STATUS_SCHEMA_VERSION_V2 = 2;
 
 const client = new DynamoDBClient({});
@@ -289,7 +289,7 @@ function buildCurrentState(input: BuildStateInput): DeviceCurrentState {
     healthStatus,
     anomalyCount: anomalies.length,
     anomalies,
-    offlineCandidate: isOfflineCandidate(input.eventTime, DEFAULT_OFFLINE_THRESHOLD_HOURS, input.updatedAt),
+    offlineCandidate: isOfflineCandidate(input.eventTime, OFFLINE_THRESHOLD_HOURS, input.updatedAt),
     updatedAt: input.updatedAt,
   });
 }
@@ -408,7 +408,7 @@ function buildAnomalies(
   return anomalies.slice(0, 10);
 }
 
-function isOfflineCandidate(eventTime: string, thresholdHours: number, now: string): boolean {
+export function isOfflineCandidate(eventTime: string, thresholdHours: number, now: string): boolean {
   return new Date(eventTime).getTime() < new Date(now).getTime() - thresholdHours * 60 * 60 * 1000;
 }
 
@@ -508,4 +508,4 @@ function extractResetCountValue(
   return undefined;
 }
 
-export { ddb, buildCurrentState, determineHealthStatus };
+export { ddb, buildAnomalies, buildCurrentState, determineHealthStatus };
