@@ -16,7 +16,7 @@
 import { createHash } from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
-import { CurrentStateAnomaly, DeviceCurrentState, NormalizedEventFields, ParticleWebhook } from '../types';
+import { CurrentStateAnomaly, DeviceCurrentState, NormalizedEventFields } from '../types';
 import { buildAnomalies, isOfflineCandidate, OFFLINE_THRESHOLD_HOURS } from './current-state';
 
 const client = new DynamoDBClient({});
@@ -76,7 +76,7 @@ export interface IngestionEventHistoryContext {
   deviceId: string;
   publishedAt: string;
   evaluatedAt?: string;
-  rawPayload?: ParticleWebhook;
+  rawPayload?: unknown;
   normalized?: NormalizedEventFields;
   previousState: DeviceCurrentState | null;
   ledgerSyncFailure?: LedgerSyncFailureDetail;

@@ -18,7 +18,7 @@ import {
   IngestionEventHistoryContext,
 } from '../../storage/event-history';
 import { buildAnomalies } from '../../storage/current-state';
-import { CurrentStateAnomaly, DeviceCurrentState, NormalizedEventFields, ParticleWebhook } from '../../types';
+import { CurrentStateAnomaly, DeviceCurrentState, NormalizedEventFields } from '../../types';
 
 const mockDdbSend = jest.fn();
 jest.spyOn(ddb, 'send').mockImplementation(mockDdbSend);
@@ -71,7 +71,7 @@ function baseContext(overrides: Partial<IngestionEventHistoryContext> = {}): Ing
   };
 }
 
-function baseRawPayload(overrides: Partial<ParticleWebhook> = {}): ParticleWebhook {
+function baseRawPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     event: 'Ubidots-Sensor-Hook-v1',
     coreid: DEVICE_ID,
@@ -582,7 +582,7 @@ describe('writeIngestionEventHistory — sort key collisions', () => {
     mockDdbSend.mockResolvedValue({});
 
     await writeIngestionEventHistory(baseContext({
-      rawPayload: baseRawPayload({ vendorSequence: 1 } as Partial<ParticleWebhook>),
+      rawPayload: baseRawPayload({ vendorSequence: 1 }),
       normalized: baseNormalized({
         eventId: 'evt-collision',
         battery: 15,
@@ -590,7 +590,7 @@ describe('writeIngestionEventHistory — sort key collisions', () => {
     }));
 
     await writeIngestionEventHistory(baseContext({
-      rawPayload: baseRawPayload({ vendorSequence: 2 } as Partial<ParticleWebhook>),
+      rawPayload: baseRawPayload({ vendorSequence: 2 }),
       normalized: baseNormalized({
         eventId: 'evt-collision',
         battery: 15,

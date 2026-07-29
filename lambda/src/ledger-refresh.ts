@@ -97,7 +97,6 @@ async function executeDeviceStatusLedgerRefresh(
 ): Promise<DeviceStatusLedgerRefreshResult> {
   const startedAtMs = Date.now();
   const elapsedMs = (): number => Math.max(0, Date.now() - startedAtMs);
-  let result: DeviceStatusLedgerRefreshResult;
   let syncFailureDetail: LedgerSyncFailureDetail | undefined;
 
   try {
@@ -134,7 +133,6 @@ async function executeDeviceStatusLedgerRefresh(
         errorKind: ledgerResult.error.kind,
         httpStatus: ledgerResult.error.httpStatus,
       };
-      result = 'not_found_or_failed';
     } else {
       const ledgerUpdatedAt = ledgerResult.instance.updated_at;
       if (!ledgerUpdatedAt) {
@@ -165,11 +163,12 @@ async function executeDeviceStatusLedgerRefresh(
   } catch (err) {
     logLedgerRefresh({ deviceId: input.deviceId, result: 'failed', elapsedMs: elapsedMs(), errorKind: 'exception' });
     syncFailureDetail = { errorKind: 'exception' };
-    result = 'not_found_or_failed';
   }
 
-  await input.onSyncFailed?.(syncFailureDetail);
-  return result;
+  if (syncFailureDetail) {
+    await input.onSyncFailed?.(syncFailureDetail);
+  }
+  return 'not_found_or_failed';
 }
 
 async function projectConfigurationLedgers(
