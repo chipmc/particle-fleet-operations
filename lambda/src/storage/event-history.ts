@@ -6,19 +6,23 @@
  *
  * Table key schema:
  *   Partition key: deviceId  (STRING)
- *   Sort key:      eventTime (STRING) — stores "{isoTimestamp}#{eventType}#{uniqueId}"
- *                  where uniqueId is the normalized eventId (stable per report) or a
- *                  random UUID fallback, guaranteeing uniqueness even when multiple
- *                  reports share the same timestamp and event type.
+ *   Sort key:      eventTime (STRING) — stores
+ *                  "{isoTimestamp}#{eventType}#{eventIdOrPlaceholder}#{payloadHash}"
+ *                  where payloadHash is deterministically derived from the event
+ *                  payload so retries stay idempotent while distinct payloads
+ *                  sharing the same timestamp/eventId remain append-only.
  */
 
-import { randomUUID } from 'crypto';
+import { createHash } from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { CurrentStateAnomaly, DeviceCurrentState, NormalizedEventFields } from '../types';
+import { buildAnomalies } from './current-state';
 
 const client = new DynamoDBClient({});
 const ddb = DynamoDBDocumentClient.from(client);
+const DEFAULT_OFFLINE_THRESHOLD_HOURS = 3;
+const MISSING_EVENT_ID_COMPONENT = 'no-event-id';
 
 export type EventHistoryEventType =
   | 'ANOMALY'
@@ -29,7 +33,7 @@ export type EventHistoryEventType =
 
 export interface EventHistoryItem {
   deviceId: string;
-  /** Sort key value: "{isoTimestamp}#{eventType}#{uniqueId}" */
+  /** Sort key value: "{isoTimestamp}#{eventType}#{eventIdOrPlaceholder}#{payloadHash}" */
   eventTime: string;
   eventType: EventHistoryEventType;
   /** Pure ISO timestamp of the originating device report. */
@@ -71,6 +75,7 @@ export interface IngestionEventHistoryContext {
   tableName: string;
   deviceId: string;
   publishedAt: string;
+  evaluatedAt?: string;
   normalized?: NormalizedEventFields;
   previousState: DeviceCurrentState | null;
   ledgerSyncFailure?: LedgerSyncFailureDetail;
@@ -83,7 +88,7 @@ export interface IngestionEventHistoryContext {
  *   ANOMALY           — any anomaly detected in the current effective state
  *   FIRMWARE_UPDATE   — firmware version changed from previous report
  *   BATTERY_CRITICAL  — effective battery transitions into below-20% (not already critical)
- *   DEVICE_RECOVERED  — previous state was an offline candidate and current report is newer
+ *   DEVICE_RECOVERED  — prior telemetry had crossed the offline threshold and this report is fresh again
  *   LEDGER_SYNC_FAILED — ledger refresh returned a failure
  *
  * All writes are issued concurrently via Promise.all.
@@ -92,10 +97,6 @@ export async function writeIngestionEventHistory(
   ctx: IngestionEventHistoryContext
 ): Promise<void> {
   const writes: Promise<void>[] = [];
-
-  // Stable per-report unique ID, used as the collision-resistant sort-key suffix.
-  // Falls back to a random UUID when normalized fields are unavailable.
-  const uniqueId = ctx.normalized?.eventId ?? randomUUID();
 
   // Compute effective state: take normalized value, fall back to previous.
   // Mirrors mergePreviousMetrics() in current-state.ts.
@@ -107,8 +108,7 @@ export async function writeIngestionEventHistory(
   const effectiveReconnect = ctx.normalized?.reconnectDetected ?? ctx.previousState?.reconnectDetected;
   const effectiveReset = ctx.normalized?.resetDetected ?? ctx.previousState?.resetDetected;
 
-  // Compute anomalies — mirrors buildAnomalies() in current-state.ts.
-  const anomalies = computeAnomalies({
+  const anomalies = buildAnomalies({
     battery: effectiveBattery,
     connectTime: effectiveConnectTime,
     alertCount: effectiveAlertCount,
@@ -120,28 +120,24 @@ export async function writeIngestionEventHistory(
 
   // ANOMALY — fires when any anomaly is detected in the current effective state.
   if (anomalies.length > 0) {
-    writes.push(writeEventHistory(ctx.tableName, {
+    writes.push(writeEventHistory(ctx.tableName, createEventHistoryItem(ctx, 'ANOMALY', {
       deviceId: ctx.deviceId,
-      eventTime: `${ctx.publishedAt}#ANOMALY#${uniqueId}`,
-      eventType: 'ANOMALY',
       reportTime: ctx.publishedAt,
       anomalies,
       anomalyCount: anomalies.length,
-    }));
+    })));
   }
 
   // FIRMWARE_UPDATE — fires when firmware version differs from previous state.
   const newFwVersion = ctx.normalized?.fwVersion;
   const prevFwVersion = ctx.previousState?.fwVersion;
   if (newFwVersion && prevFwVersion && newFwVersion !== prevFwVersion) {
-    writes.push(writeEventHistory(ctx.tableName, {
+    writes.push(writeEventHistory(ctx.tableName, createEventHistoryItem(ctx, 'FIRMWARE_UPDATE', {
       deviceId: ctx.deviceId,
-      eventTime: `${ctx.publishedAt}#FIRMWARE_UPDATE#${uniqueId}`,
-      eventType: 'FIRMWARE_UPDATE',
       reportTime: ctx.publishedAt,
       fromFwVersion: prevFwVersion,
       toFwVersion: newFwVersion,
-    }));
+    })));
   }
 
   // BATTERY_CRITICAL — fires only on the transition into critical (< 20%).
@@ -150,44 +146,46 @@ export async function writeIngestionEventHistory(
   const prevBattery = ctx.previousState?.battery;
   const wasAlreadyCritical = prevBattery !== undefined && prevBattery < 20;
   if (effectiveBattery !== undefined && effectiveBattery < 20 && !wasAlreadyCritical) {
-    writes.push(writeEventHistory(ctx.tableName, {
+    writes.push(writeEventHistory(ctx.tableName, createEventHistoryItem(ctx, 'BATTERY_CRITICAL', {
       deviceId: ctx.deviceId,
-      eventTime: `${ctx.publishedAt}#BATTERY_CRITICAL#${uniqueId}`,
-      eventType: 'BATTERY_CRITICAL',
       reportTime: ctx.publishedAt,
       batteryLevel: effectiveBattery,
-    }));
+    })));
   }
 
-  // DEVICE_RECOVERED — fires when the previous state was an offline candidate
-  // and the current report carries a newer timestamp, confirming the device
-  // has actually come back online.
+  // DEVICE_RECOVERED — fires only when the previous report had crossed the
+  // offline threshold before this one arrived and this new report is itself
+  // fresh enough to be considered back online.
+  const previousLastEventTime = ctx.previousState?.lastEventTime;
+  const currentReportIsFresh = !isOfflineCandidate(
+    ctx.publishedAt,
+    DEFAULT_OFFLINE_THRESHOLD_HOURS,
+    ctx.evaluatedAt ?? new Date().toISOString()
+  );
   if (
-    ctx.previousState?.offlineCandidate === true &&
-    ctx.publishedAt > ctx.previousState.lastEventTime
+    previousLastEventTime &&
+    ctx.publishedAt > previousLastEventTime &&
+    isOfflineCandidate(previousLastEventTime, DEFAULT_OFFLINE_THRESHOLD_HOURS, ctx.publishedAt) &&
+    currentReportIsFresh
   ) {
-    writes.push(writeEventHistory(ctx.tableName, {
+    writes.push(writeEventHistory(ctx.tableName, createEventHistoryItem(ctx, 'DEVICE_RECOVERED', {
       deviceId: ctx.deviceId,
-      eventTime: `${ctx.publishedAt}#DEVICE_RECOVERED#${uniqueId}`,
-      eventType: 'DEVICE_RECOVERED',
       reportTime: ctx.publishedAt,
-    }));
+    })));
   }
 
   // LEDGER_SYNC_FAILED — fires when a ledger refresh failure was signalled.
   if (ctx.ledgerSyncFailure) {
-    const item: EventHistoryItem = {
+    const item = createEventHistoryItem(ctx, 'LEDGER_SYNC_FAILED', {
       deviceId: ctx.deviceId,
-      eventTime: `${ctx.publishedAt}#LEDGER_SYNC_FAILED#${uniqueId}`,
-      eventType: 'LEDGER_SYNC_FAILED',
       reportTime: ctx.publishedAt,
-    };
-    if (ctx.ledgerSyncFailure.errorKind !== undefined) {
-      item.errorKind = ctx.ledgerSyncFailure.errorKind;
-    }
-    if (ctx.ledgerSyncFailure.httpStatus !== undefined) {
-      item.httpStatus = ctx.ledgerSyncFailure.httpStatus;
-    }
+      ...(ctx.ledgerSyncFailure.errorKind !== undefined && {
+        errorKind: ctx.ledgerSyncFailure.errorKind,
+      }),
+      ...(ctx.ledgerSyncFailure.httpStatus !== undefined && {
+        httpStatus: ctx.ledgerSyncFailure.httpStatus,
+      }),
+    });
     writes.push(writeEventHistory(ctx.tableName, item));
   }
 
@@ -198,58 +196,52 @@ export async function writeIngestionEventHistory(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-interface AnomalyState {
-  battery?: number;
-  connectTime?: number;
-  alertCount?: number;
-  severity?: string | null;
-  watchdogDetected?: boolean;
-  reconnectDetected?: boolean;
-  resetDetected?: boolean;
+function createEventHistoryItem(
+  ctx: IngestionEventHistoryContext,
+  eventType: EventHistoryEventType,
+  item: Omit<EventHistoryItem, 'eventTime' | 'eventType'>
+): EventHistoryItem {
+  return {
+    ...item,
+    eventType,
+    eventTime: buildEventTime(ctx, eventType, item),
+  };
 }
 
-/**
- * Derive anomalies from the effective device state.
- * Mirrors buildAnomalies() in storage/current-state.ts (no import needed).
- */
-function computeAnomalies(state: AnomalyState): CurrentStateAnomaly[] {
-  const anomalies: CurrentStateAnomaly[] = [];
+function buildEventTime(
+  ctx: IngestionEventHistoryContext,
+  eventType: EventHistoryEventType,
+  item: Omit<EventHistoryItem, 'eventTime' | 'eventType'>
+): string {
+  const eventIdComponent = ctx.normalized?.eventId ?? MISSING_EVENT_ID_COMPONENT;
+  const payloadHash = createHash('sha256')
+    .update(stableSerialize({
+      normalized: ctx.normalized ?? null,
+      item,
+    }))
+    .digest('hex')
+    .slice(0, 16);
+  return `${ctx.publishedAt}#${eventType}#${eventIdComponent}#${payloadHash}`;
+}
 
-  if (state.battery !== undefined && state.battery < 20) {
-    anomalies.push({ severity: 'high', type: 'critical_battery', message: 'Battery below 20%' });
-  } else if (state.battery !== undefined && state.battery < 30) {
-    anomalies.push({ severity: 'medium', type: 'low_battery', message: 'Battery below 30%' });
+function stableSerialize(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
   }
 
-  if (state.connectTime !== undefined && state.connectTime > 300) {
-    anomalies.push({ severity: 'high', type: 'very_high_connect_time', message: 'Connect time exceeded 300 seconds' });
-  } else if (state.connectTime !== undefined && state.connectTime > 180) {
-    anomalies.push({ severity: 'medium', type: 'high_connect_time', message: 'Connect time exceeded 180 seconds' });
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableSerialize(entry ?? null)).join(',')}]`;
   }
 
-  if (state.alertCount !== undefined && state.alertCount > 0) {
-    anomalies.push({ severity: 'high', type: 'active_alerts', message: 'Active alert count is non-zero' });
-  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, entryValue]) => entryValue !== undefined)
+    .sort(([left], [right]) => left.localeCompare(right));
 
-  if (state.severity === 'ERROR') {
-    anomalies.push({ severity: 'high', type: 'serial_error', message: 'Latest serial event is ERROR severity' });
-  } else if (state.severity === 'WARN') {
-    anomalies.push({ severity: 'medium', type: 'serial_warning', message: 'Latest serial event is WARN severity' });
-  }
+  return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableSerialize(entryValue)}`).join(',')}}`;
+}
 
-  if (state.watchdogDetected) {
-    anomalies.push({ severity: 'high', type: 'serial_watchdog', message: 'Serial log indicates watchdog activity' });
-  }
-
-  if (state.reconnectDetected) {
-    anomalies.push({ severity: 'medium', type: 'serial_reconnect', message: 'Serial log indicates reconnect or retry activity' });
-  }
-
-  if (state.resetDetected) {
-    anomalies.push({ severity: 'medium', type: 'serial_reset', message: 'Serial log indicates reset, reboot, or panic activity' });
-  }
-
-  return anomalies.slice(0, 10);
+function isOfflineCandidate(eventTime: string, thresholdHours: number, now: string): boolean {
+  return new Date(eventTime).getTime() < new Date(now).getTime() - thresholdHours * 60 * 60 * 1000;
 }
 
 export { ddb };

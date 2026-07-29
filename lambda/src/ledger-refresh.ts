@@ -128,7 +128,7 @@ async function executeDeviceStatusLedgerRefresh(
         httpStatus: ledgerResult.error.httpStatus,
         errorKind: ledgerResult.error.kind,
       });
-      input.onSyncFailed?.({
+      await input.onSyncFailed?.({
         errorKind: ledgerResult.error.kind,
         httpStatus: ledgerResult.error.httpStatus,
       });
@@ -162,7 +162,7 @@ async function executeDeviceStatusLedgerRefresh(
     return updateResult;
   } catch (err) {
     logLedgerRefresh({ deviceId: input.deviceId, result: 'failed', elapsedMs: elapsedMs(), errorKind: 'exception' });
-    input.onSyncFailed?.({ errorKind: 'exception' });
+    await input.onSyncFailed?.({ errorKind: 'exception' });
     return 'not_found_or_failed';
   }
 }

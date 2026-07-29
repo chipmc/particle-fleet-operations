@@ -508,4 +508,4 @@ function extractResetCountValue(
   return undefined;
 }
 
-export { ddb, buildCurrentState, determineHealthStatus };
+export { ddb, buildAnomalies, buildCurrentState, determineHealthStatus };

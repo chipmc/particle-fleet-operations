@@ -594,6 +594,38 @@ describe('device-status Ledger refresh', () => {
     expect(syncFailedDetail.httpStatus).toBe(503);
   });
 
+  it('should await an async onSyncFailed callback before resolving', async () => {
+    const client = createClient(failureResult('retryable_failure', 503));
+    let releaseCallback!: () => void;
+    let callbackFinished = false;
+    let callbackStarted!: Promise<void>;
+    let markCallbackStarted!: () => void;
+    callbackStarted = new Promise<void>((resolve) => {
+      markCallbackStarted = resolve;
+    });
+    const onSyncFailed = jest.fn(async () => {
+      markCallbackStarted();
+      await new Promise<void>((resolve) => {
+        releaseCallback = resolve;
+      });
+      callbackFinished = true;
+    });
+
+    const refreshPromise = refresh({ ledgerClient: client, onSyncFailed });
+    await callbackStarted;
+
+    let refreshSettled = false;
+    refreshPromise.then(() => {
+      refreshSettled = true;
+    });
+    await Promise.resolve();
+    expect(refreshSettled).toBe(false);
+
+    releaseCallback();
+    await expect(refreshPromise).resolves.toBe('not_found_or_failed');
+    expect(callbackFinished).toBe(true);
+  });
+
   it('should invoke onSyncFailed with errorKind "exception" when the ledger client throws', async () => {
     const throwingClient = createClientWithImplementation(
       jest.fn().mockRejectedValue(new Error('network error'))
