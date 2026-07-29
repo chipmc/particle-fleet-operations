@@ -16,12 +16,11 @@
 import { createHash } from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
-import { CurrentStateAnomaly, DeviceCurrentState, NormalizedEventFields } from '../types';
-import { buildAnomalies } from './current-state';
+import { CurrentStateAnomaly, DeviceCurrentState, NormalizedEventFields, ParticleWebhook } from '../types';
+import { buildAnomalies, isOfflineCandidate, OFFLINE_THRESHOLD_HOURS } from './current-state';
 
 const client = new DynamoDBClient({});
 const ddb = DynamoDBDocumentClient.from(client);
-const DEFAULT_OFFLINE_THRESHOLD_HOURS = 3;
 const MISSING_EVENT_ID_COMPONENT = 'no-event-id';
 const MAX_SERIALIZATION_DEPTH = 50;
 
@@ -77,6 +76,7 @@ export interface IngestionEventHistoryContext {
   deviceId: string;
   publishedAt: string;
   evaluatedAt?: string;
+  rawPayload?: ParticleWebhook;
   normalized?: NormalizedEventFields;
   previousState: DeviceCurrentState | null;
   ledgerSyncFailure?: LedgerSyncFailureDetail;
@@ -160,13 +160,13 @@ export async function writeIngestionEventHistory(
   const previousLastEventTime = ctx.previousState?.lastEventTime;
   const currentReportIsFresh = !isOfflineCandidate(
     ctx.publishedAt,
-    DEFAULT_OFFLINE_THRESHOLD_HOURS,
+    OFFLINE_THRESHOLD_HOURS,
     ctx.evaluatedAt ?? new Date().toISOString()
   );
   if (
     previousLastEventTime &&
     ctx.publishedAt > previousLastEventTime &&
-    isOfflineCandidate(previousLastEventTime, DEFAULT_OFFLINE_THRESHOLD_HOURS, ctx.publishedAt) &&
+    isOfflineCandidate(previousLastEventTime, OFFLINE_THRESHOLD_HOURS, ctx.publishedAt) &&
     currentReportIsFresh
   ) {
     writes.push(writeEventHistory(ctx.tableName, createEventHistoryItem(ctx, 'DEVICE_RECOVERED', {
@@ -217,7 +217,7 @@ function buildEventTime(
   const eventIdComponent = ctx.normalized?.eventId ?? MISSING_EVENT_ID_COMPONENT;
   const payloadHash = createHash('sha256')
     .update(stableSerialize({
-      normalized: ctx.normalized ?? null,
+      rawPayload: ctx.rawPayload ?? null,
       item,
     }))
     .digest('hex')
@@ -243,10 +243,6 @@ function stableSerialize(value: unknown, depth: number = 0): string {
     .sort(([left], [right]) => left.localeCompare(right));
 
   return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableSerialize(entryValue, depth + 1)}`).join(',')}}`;
-}
-
-function isOfflineCandidate(eventTime: string, thresholdHours: number, now: string): boolean {
-  return new Date(eventTime).getTime() < new Date(now).getTime() - thresholdHours * 60 * 60 * 1000;
 }
 
 export { ddb };

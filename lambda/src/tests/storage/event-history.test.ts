@@ -18,7 +18,7 @@ import {
   IngestionEventHistoryContext,
 } from '../../storage/event-history';
 import { buildAnomalies } from '../../storage/current-state';
-import { CurrentStateAnomaly, DeviceCurrentState, NormalizedEventFields } from '../../types';
+import { CurrentStateAnomaly, DeviceCurrentState, NormalizedEventFields, ParticleWebhook } from '../../types';
 
 const mockDdbSend = jest.fn();
 jest.spyOn(ddb, 'send').mockImplementation(mockDdbSend);
@@ -64,8 +64,19 @@ function baseContext(overrides: Partial<IngestionEventHistoryContext> = {}): Ing
     tableName: TABLE,
     deviceId: DEVICE_ID,
     publishedAt: REPORT_TIME,
+    rawPayload: baseRawPayload(),
     normalized: baseNormalized(),
     previousState: baseState(),
+    ...overrides,
+  };
+}
+
+function baseRawPayload(overrides: Partial<ParticleWebhook> = {}): ParticleWebhook {
+  return {
+    event: 'Ubidots-Sensor-Hook-v1',
+    coreid: DEVICE_ID,
+    product_id: 12345,
+    published_at: REPORT_TIME,
     ...overrides,
   };
 }
@@ -567,10 +578,11 @@ describe('writeIngestionEventHistory — non-blocking behaviour', () => {
 describe('writeIngestionEventHistory — sort key collisions', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('writes separate rows for distinct payloads that share reportTime and eventId', async () => {
+  it('writes separate rows when only a normalization-discarded raw field changes', async () => {
     mockDdbSend.mockResolvedValue({});
 
     await writeIngestionEventHistory(baseContext({
+      rawPayload: baseRawPayload({ vendorSequence: 1 } as Partial<ParticleWebhook>),
       normalized: baseNormalized({
         eventId: 'evt-collision',
         battery: 15,
@@ -578,9 +590,10 @@ describe('writeIngestionEventHistory — sort key collisions', () => {
     }));
 
     await writeIngestionEventHistory(baseContext({
+      rawPayload: baseRawPayload({ vendorSequence: 2 } as Partial<ParticleWebhook>),
       normalized: baseNormalized({
         eventId: 'evt-collision',
-        connectTime: 350,
+        battery: 15,
       }),
     }));
 

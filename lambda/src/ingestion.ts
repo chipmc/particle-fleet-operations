@@ -86,6 +86,7 @@ export async function handleIngestion(event: InboundEvent): Promise<LambdaRespon
   const eventName = extractEventName(body);
   const deviceId = extractDeviceId(body);
   const publishedAt = extractTimestamp(body);
+  const evaluatedAt = new Date().toISOString();
   const parsedData = safeParseData(body.data);
 
   const parsed = buildParsedEvent(
@@ -208,6 +209,8 @@ export async function handleIngestion(event: InboundEvent): Promise<LambdaRespon
         tableName: eventHistoryTableName,
         deviceId,
         publishedAt,
+        evaluatedAt,
+        rawPayload: body,
         normalized,
         previousState: previousCurrentState,
         ledgerSyncFailure,
