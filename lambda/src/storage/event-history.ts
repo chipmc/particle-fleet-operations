@@ -234,7 +234,7 @@ function stableSerialize(value: unknown, depth: number = 0): string {
   }
 
   if (Array.isArray(value)) {
-    return `[${value.map((entry) => entry === undefined ? 'null' : stableSerialize(entry, depth + 1)).join(',')}]`;
+    return `[${value.map((entry) => entry === undefined ? 'undefined' : stableSerialize(entry, depth + 1)).join(',')}]`;
   }
 
   const entries = Object.entries(value as Record<string, unknown>)
