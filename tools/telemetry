@@ -136,6 +136,7 @@ function printUsage() {
   ./tools/telemetry timeline <name-or-device-id> [--since 1h | --hours 24] [--limit 50] [--json]
   ./tools/telemetry watch <name-or-device-id> [--interval 3] [--since 5m] [--serial-only] [--json]
   ./tools/telemetry serial <name-or-device-id> --since 1h [--follow] [--include-collector] [--grep text] [--json]
+  ./tools/telemetry serial <name-or-device-id> --start <ISO8601> [--until <ISO8601>] [--include-collector] [--grep text] [--json]
 
 Commands:
   devices     List devices from DeviceCurrentState
@@ -160,6 +161,7 @@ Options:
   --limit <count>      Timeline max events
   --interval <seconds> Watch polling interval, minimum 1 (default: ${DEFAULT_WATCH_INTERVAL_SECONDS})
   --since <duration>   Timeline/Watch history window, e.g. 30s, 5m, 1h
+  --start <timestamp>  Absolute start timestamp for serial reconstruction window (ISO 8601)
   --until <timestamp>  End timestamp for serial reconstruction window
   --follow             Continue watching new serial lines after initial history
   --include-collector  Include Serial Forwarder lifecycle events in serial output
@@ -294,6 +296,7 @@ Options:
 `,
     serial: `Usage:
   ./tools/telemetry serial <name-or-device-id> --since 1h [--until <ISO timestamp>] [--follow] [--include-collector] [--grep <text>] [--json]
+  ./tools/telemetry serial <name-or-device-id> --start <ISO timestamp> [--until <ISO timestamp>] [--include-collector] [--grep <text>] [--json]
   ./tools/telemetry serial <name-or-device-id> --follow [--include-collector] [--grep <text>] [--json]
 
 Reconstruct cloud-forwarded serial output for one device from existing
@@ -305,7 +308,8 @@ SERIAL means firmware-generated output; COLLECTOR means forwarder transport or
 USB lifecycle evidence and is not automatically a forwarder defect.
 
 Options:
-  --since <duration>   History window, e.g. 30s, 5m, 1h. Required unless --follow starts from now.
+  --since <duration>   History window, e.g. 30s, 5m, 1h. Required unless --start or --follow starts from now.
+  --start <timestamp>  Absolute start timestamp for the initial window (ISO 8601). Mutually exclusive with --since.
   --until <timestamp>  End timestamp for the initial window. Defaults to now.
   --follow             Continue watching new serial lines after initial history.
   --include-collector  Include COLLECTOR lifecycle events and show KIND in output.
@@ -338,6 +342,7 @@ function parseOptions(args) {
     intervalSeconds: DEFAULT_WATCH_INTERVAL_SECONDS,
     sinceMs: 0,
     until: null,
+    startIso: null,
     follow: false,
     includeCollector: false,
     grep: null,
@@ -378,6 +383,8 @@ function parseOptions(args) {
       options.intervalSeconds = parseWatchInterval(requireOptionValue(args, ++index, '--interval'));
     } else if (arg === '--since') {
       options.sinceMs = parseDurationMs(requireOptionValue(args, ++index, '--since'), '--since');
+    } else if (arg === '--start') {
+      options.startIso = parseIsoTimestamp(requireOptionValue(args, ++index, '--start'), '--start');
     } else if (arg === '--until') {
       options.until = parseIsoTimestamp(requireOptionValue(args, ++index, '--until'), '--until');
     } else if (arg === '--follow') {
@@ -1749,7 +1756,12 @@ async function runSerialLoop(context, device, options, deps = {}) {
       }
       consecutiveFailures = 0;
 
-      if (!options.follow) break;
+      if (!options.follow) {
+        if (state.serialRowsEmitted >= options.limit) {
+          warn(`WARN: results truncated at ${options.limit} rows (--limit), narrow your --start/--until range or raise --limit.`);
+        }
+        break;
+      }
       await sleepFn(options.intervalSeconds * 1000, signal);
     } catch (err) {
       if (signal && signal.aborted) break;
@@ -1765,12 +1777,13 @@ async function runSerialLoop(context, device, options, deps = {}) {
 }
 
 function validateSerialOptions(options) {
-  if (!options.follow && !options.sinceMs) fail('serial requires --since unless --follow starts from now.');
+  if (options.sinceMs && options.startIso) fail('--start and --since are mutually exclusive; use one or the other.');
+  if (!options.follow && !options.sinceMs && !options.startIso) fail('serial requires --since or --start unless --follow starts from now.');
 }
 
 function createSerialState(options, now) {
   const state = createWatchState(options, now);
-  state.includeInitialTimeline = options.sinceMs > 0;
+  state.includeInitialTimeline = options.sinceMs > 0 || Boolean(options.startIso);
   state.serialRowsEmitted = 0;
   return state;
 }
@@ -1905,7 +1918,14 @@ async function runWatchLoop(context, device, options, deps = {}) {
 }
 
 function createWatchState(options, now) {
-  const startMs = options.sinceMs > 0 ? now.getTime() - options.sinceMs : now.getTime() - WATCH_CURSOR_LOOKBACK_MS;
+  let startMs;
+  if (options.startIso) {
+    startMs = new Date(options.startIso).getTime();
+  } else if (options.sinceMs > 0) {
+    startMs = now.getTime() - options.sinceMs;
+  } else {
+    startMs = now.getTime() - WATCH_CURSOR_LOOKBACK_MS;
+  }
   return {
     initialized: false,
     includeInitialTimeline: options.sinceMs > 0,
@@ -2418,5 +2438,6 @@ module.exports = {
   runWatchLoop,
   timelineLookbackHours,
   timelinePresentationRows,
+  validateSerialOptions,
   watchEntryFromEvent,
 };
