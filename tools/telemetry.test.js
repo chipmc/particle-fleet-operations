@@ -48,6 +48,7 @@ const {
   runWatchLoop,
   timelineLookbackHours,
   timelinePresentationRows,
+  validateSerialOptions,
   watchEntryFromEvent,
 } = require('./telemetry');
 
@@ -1903,6 +1904,131 @@ test('serial timeline fetch paginates API history pages', async () => {
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('serial --start (no --until) uses absolute start and defaults end to now', async () => {
+  const calls = [];
+  const options = serialOptions({ sinceMs: 0, startIso: '2026-07-14T06:00:00.000Z', until: null });
+
+  await runSerialLoop({}, { deviceId: 'device123' }, options, {
+    now: () => new Date('2026-07-14T09:00:00.000Z'),
+    fetchTimeline: async (_context, deviceId, state, now) => {
+      calls.push({ start: state.timelineStart, end: now.toISOString() });
+      return { events: [] };
+    },
+  });
+
+  assert.deepEqual(calls, [{
+    start: '2026-07-14T06:00:00.000Z',
+    end: '2026-07-14T09:00:00.000Z',
+  }]);
+});
+
+test('serial --start + --until returns rows within [start, until]', async () => {
+  const calls = [];
+  const options = serialOptions({ sinceMs: 0, startIso: '2026-07-14T06:00:00.000Z', until: '2026-07-14T08:00:00.000Z' });
+
+  await runSerialLoop({}, { deviceId: 'device123' }, options, {
+    now: () => new Date('2026-07-14T09:00:00.000Z'),
+    fetchTimeline: async (_context, deviceId, state, now) => {
+      calls.push({ start: state.timelineStart, end: now.toISOString() });
+      return { events: [] };
+    },
+  });
+
+  assert.deepEqual(calls, [{
+    start: '2026-07-14T06:00:00.000Z',
+    end: '2026-07-14T08:00:00.000Z',
+  }]);
+});
+
+test('serial --start and --since together errors', () => {
+  assert.throws(
+    () => validateSerialOptions(serialOptions({ sinceMs: 3600000, startIso: '2026-07-14T06:00:00.000Z' })),
+    /--start and --since are mutually exclusive/,
+  );
+});
+
+test('serial neither --start nor --since (and not --follow) errors', () => {
+  assert.throws(
+    () => validateSerialOptions(serialOptions({ sinceMs: 0, startIso: null, follow: false })),
+    /serial requires --since or --start/,
+  );
+});
+
+test('serial truncation warning appears when row cap is hit in a bounded run', async () => {
+  const warnings = [];
+  const options = serialOptions({ sinceMs: 3600000, limit: 1 });
+
+  await runSerialLoop({}, { deviceId: 'device123' }, options, {
+    now: () => new Date('2026-07-14T09:00:00.000Z'),
+    fetchTimeline: async () => ({
+      events: [
+        event({ eventTime: '2026-07-14T08:00:01.000Z', eventId: 'a', s3Key: 'a', eventName: 'serialLog', serialLogLine: 'first' }),
+        event({ eventTime: '2026-07-14T08:00:02.000Z', eventId: 'b', s3Key: 'b', eventName: 'serialLog', serialLogLine: 'second' }),
+      ],
+    }),
+    write: () => {},
+    warn: message => warnings.push(message),
+  });
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /truncated at 1 rows \(--limit\)/);
+  assert.match(warnings[0], /--start\/--until/);
+});
+
+test('serial truncation warning does not appear when row cap is not hit', async () => {
+  const warnings = [];
+  const options = serialOptions({ sinceMs: 3600000, limit: 25 });
+
+  await runSerialLoop({}, { deviceId: 'device123' }, options, {
+    now: () => new Date('2026-07-14T09:00:00.000Z'),
+    fetchTimeline: async () => ({
+      events: [
+        event({ eventTime: '2026-07-14T08:00:01.000Z', eventId: 'a', s3Key: 'a', eventName: 'serialLog', serialLogLine: 'only' }),
+      ],
+    }),
+    write: () => {},
+    warn: message => warnings.push(message),
+  });
+
+  assert.deepEqual(warnings, []);
+});
+
+test('serial --since regression: existing --since behavior is unchanged', async () => {
+  const calls = [];
+  const options = serialOptions({ sinceMs: 3600000, until: null });
+
+  await runSerialLoop({}, { deviceId: 'device123' }, options, {
+    now: () => new Date('2026-07-14T09:00:00.000Z'),
+    fetchTimeline: async (_context, deviceId, state, now) => {
+      calls.push({ start: state.timelineStart, end: now.toISOString() });
+      return { events: [] };
+    },
+  });
+
+  assert.deepEqual(calls, [{
+    start: '2026-07-14T08:00:00.000Z',
+    end: '2026-07-14T09:00:00.000Z',
+  }]);
+});
+
+test('serial --since + --until regression: existing combined behavior is unchanged', async () => {
+  const calls = [];
+  const options = serialOptions({ sinceMs: 3600000, until: '2026-07-14T08:30:00.000Z' });
+
+  await runSerialLoop({}, { deviceId: 'device123' }, options, {
+    now: () => new Date('2026-07-14T09:00:00.000Z'),
+    fetchTimeline: async (_context, deviceId, state, now) => {
+      calls.push({ start: state.timelineStart, end: now.toISOString() });
+      return { events: [] };
+    },
+  });
+
+  assert.deepEqual(calls, [{
+    start: '2026-07-14T07:30:00.000Z',
+    end: '2026-07-14T08:30:00.000Z',
+  }]);
 });
 
 test('Particle status events classify as lifecycle', () => {
