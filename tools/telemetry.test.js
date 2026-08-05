@@ -2443,6 +2443,57 @@ test('Dynamo fallback treats empty quiet polls as valid when allowed', () => {
   assert.deepEqual(timeline.events, []);
 });
 
+test('timeline --start/--until Dynamo path sends correct :start/:end expression values', () => {
+  let capturedExprValues;
+  const context = {
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: (_options, args) => {
+      const idx = args.indexOf('--expression-attribute-values');
+      if (idx !== -1) capturedExprValues = JSON.parse(args[idx + 1]);
+      return { Items: [], LastEvaluatedKey: undefined };
+    },
+  };
+
+  const options = {
+    ...parseOptions(['--start', '2026-08-05T10:00:00.000Z', '--until', '2026-08-05T11:00:00.000Z', 'Boron-Dev-09']),
+    limit: 10,
+    allowEmpty: true,
+  };
+
+  queryTimelineFromDynamo(context, 'device123', options);
+
+  assert.ok(capturedExprValues, 'awsJson was called with expression-attribute-values');
+  assert.equal(capturedExprValues[':start'].S, '2026-08-05T10:00:00.000Z');
+  assert.equal(capturedExprValues[':end'].S, '2026-08-05T11:00:00.000Z');
+});
+
+test('serial --start/--until Dynamo path (via fetchTimelinePage) sends correct :start/:end expression values', async () => {
+  let capturedExprValues;
+  const context = {
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: (_options, args) => {
+      const idx = args.indexOf('--expression-attribute-values');
+      if (idx !== -1) capturedExprValues = JSON.parse(args[idx + 1]);
+      return { Items: [], LastEvaluatedKey: undefined };
+    },
+  };
+
+  const options = {
+    ...parseOptions(['--start', '2026-08-05T10:00:00.000Z', '--until', '2026-08-05T11:00:00.000Z', 'Boron-Dev-09']),
+    limit: 10,
+  };
+  const state = createSerialState(options, new Date('2026-08-05T10:00:00.000Z'));
+  state.includeInitialTimeline = true;
+
+  await fetchSerialTimeline(context, 'device123', state, new Date('2026-08-05T11:00:00.000Z'), options);
+
+  assert.ok(capturedExprValues, 'awsJson was called with expression-attribute-values');
+  assert.equal(capturedExprValues[':start'].S, '2026-08-05T10:00:00.000Z');
+  assert.equal(capturedExprValues[':end'].S, '2026-08-05T11:00:00.000Z');
+});
+
 test('extractDeviceOsVersion resolves startup.deviceOS for schemaVersion 2 devices', () => {
   const summary = buildFleetSummary([
     {
