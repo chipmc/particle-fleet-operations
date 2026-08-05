@@ -94,6 +94,11 @@ curl -X GET "https://<api-url>/device/e00fce68e4fa8ab3f8faa207/timeline?hours=24
 - `eventName`: Original event name from webhook
 - `eventType`: Stable semantic classification (Phase 2A)
 - `plane`: Event plane: telemetry, forensic, or serial
+
+  > **Note:** The endpoint returns events across all planes in the queried time window.
+  > There is no server-side filter for `plane`. Filtering by plane (e.g. serial-only output)
+  > is performed client-side by `tools/telemetry serial` via `tools/event-presentation.js`,
+  > not by any query parameter.
 - `battery`: Battery percentage (if present)
 - `connectTime`: Cellular connection time in seconds (if present)
 - `resetCount`: Device reset counter (if present)
@@ -569,6 +574,59 @@ curl -X GET "https://<api-url>/device/$DEVICE_ID/summary?hours=168" \
 - Leverage `limit` parameter
 - Cache responses for dashboards
 - Prefer anomalies endpoint for alert monitoring
+
+---
+
+## CLI Usage — tools/telemetry
+
+`tools/telemetry` is the primary CLI for querying device telemetry. It supports
+`timeline` (single bounded fetch) and `serial` (cloud-forwarded serial reconstruction)
+commands, both of which accept `--start`/`--until`/`--since` flags.
+
+### Time-window flags
+
+| Flag | Commands | Description |
+|---|---|---|
+| `--since <duration>` | `timeline`, `serial`, `watch` | Relative lookback window. Examples: `30s`, `5m`, `1h`. Mutually exclusive with `--start`. |
+| `--start <ISO8601>` | `timeline`, `serial` | Absolute start timestamp. Mutually exclusive with `--since`. |
+| `--until <ISO8601>` | `timeline`, `serial` | Absolute end timestamp. Defaults to now when `--start` is given. |
+| `--hours <n>` | `timeline` | Relative lookback in hours (default: 24). Ignored when `--since` or `--start` is given. |
+
+**Mutual-exclusion rule:** Passing both `--start` and `--since` exits with an error:
+
+```
+ERROR: --start and --since are mutually exclusive; use one or the other.
+```
+
+**Truncation warning:** When the number of returned events equals `--limit`, a warning
+is printed to stderr:
+
+```
+WARN: results truncated at <N> events (--limit), narrow your window or raise --limit.
+```
+
+**`watch --start` is not supported.** The `watch` command tails near-live events and
+uses a cursor-based poll loop; `--start` is rejected with a clear error:
+
+```
+ERROR: --start is not supported for watch; use --since.
+```
+
+### Examples
+
+```bash
+# timeline: last 2 hours (relative)
+./tools/telemetry timeline Boron-Dev-09 --since 2h
+
+# timeline: absolute window
+./tools/telemetry timeline Boron-Dev-09 --start 2026-08-01T08:00:00Z --until 2026-08-01T10:00:00Z
+
+# serial: absolute start, end defaults to now
+./tools/telemetry serial Boron-Dev-09 --start 2026-08-01T08:00:00Z
+
+# serial: relative window with follow
+./tools/telemetry serial Boron-Dev-09 --since 1h --follow
+```
 
 ---
 

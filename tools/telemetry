@@ -60,6 +60,10 @@ async function main() {
     }
 
     const options = parseOptions(args);
+
+    if (command === 'timeline') validateStartSince(options);
+    if (command === 'watch' && options.startIso) fail('--start is not supported for watch; use --since.');
+
     const context = await loadContext(options);
 
     if (command === 'devices') {
@@ -91,10 +95,13 @@ async function main() {
     }
 
     if (command === 'timeline') {
+      validateStartSince(options);
       const selector = requireSelector(options.positionals, 'timeline');
       const devices = await loadDeviceInventory(context, { productId: options.productId });
       const device = resolveDeviceSelector(devices, selector, context);
       const timeline = await fetchTimeline(context, device.deviceId, options);
+      const warning = formatTruncationWarning(timeline.count, options.limit, 'timeline');
+      if (warning) console.error(warning);
       outputTimeline(device, timeline, options.json);
       return;
     }
@@ -133,7 +140,7 @@ function printUsage() {
   ./tools/telemetry devices [--json]
   ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit ${DEFAULT_FLEET_ACTIVITY_LIMIT}] [--transport-allowance 60s] [--json] [--verbose]
   ./tools/telemetry device <name-or-device-id> [--json]
-  ./tools/telemetry timeline <name-or-device-id> [--since 1h | --hours 24] [--limit 50] [--json]
+  ./tools/telemetry timeline <name-or-device-id> [--since 1h | --start <ISO8601> [--until <ISO8601>] | --hours 24] [--limit 50] [--json]
   ./tools/telemetry watch <name-or-device-id> [--interval 3] [--since 5m] [--serial-only] [--json]
   ./tools/telemetry serial <name-or-device-id> --since 1h [--follow] [--include-collector] [--grep text] [--json]
   ./tools/telemetry serial <name-or-device-id> --start <ISO8601> [--until <ISO8601>] [--include-collector] [--grep text] [--json]
@@ -243,7 +250,7 @@ Options:
   --region <region>    AWS region
 `,
     timeline: `Usage:
-  ./tools/telemetry timeline <name-or-device-id> [--since 1h | --hours 24] [--limit 50] [--json]
+  ./tools/telemetry timeline <name-or-device-id> [--since 1h | --start <ISO8601> [--until <ISO8601>] | --hours 24] [--limit 50] [--json]
 
 Show recent timeline events for one device. Selectors accept a full Particle
 device ID, exact device name, or unambiguous partial device name.
@@ -261,8 +268,10 @@ Kinds:
   EVENT               Other canonical events.
 
 Options:
-  --since <duration>   Timeline lookback, e.g. 30m or 1h. Overrides --hours.
-  --hours <hours>      Timeline lookback window (default: ${DEFAULT_TIMELINE_HOURS})
+  --since <duration>   Timeline lookback, e.g. 30m or 1h. Mutually exclusive with --start.
+  --start <timestamp>  Absolute start timestamp (ISO 8601). Mutually exclusive with --since.
+  --until <timestamp>  End timestamp (ISO 8601). Defaults to now. Only meaningful with --start.
+  --hours <hours>      Timeline lookback window (default: ${DEFAULT_TIMELINE_HOURS}). Ignored when --since or --start is given.
   --limit <count>      Timeline max events (default: ${DEFAULT_TIMELINE_LIMIT})
   --json               Emit JSON output
   --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
@@ -740,13 +749,17 @@ function resolveDeviceSelector(devices, selector, context = undefined) {
   fail(`Device selector not found: ${selector}`);
 }
 
-async function fetchTimeline(context, deviceId, options) {
+async function fetchTimeline(context, deviceId, options, nowFn) {
   if (!context.webhookSecret) return queryTimelineFromDynamo(context, deviceId, options);
 
-  const params = new URLSearchParams({
-    hours: String(timelineLookbackHours(options)),
-    limit: String(options.limit),
-  });
+  const { start, end } = resolveTimelineWindow(options, nowFn);
+  const params = new URLSearchParams({ limit: String(options.limit) });
+  if (start) {
+    params.set('start', start);
+    params.set('end', end);
+  } else {
+    params.set('hours', String(timelineLookbackHours(options)));
+  }
   const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${params.toString()}`;
   const response = await fetch(url, {
     headers: {
@@ -787,6 +800,32 @@ function queryTimelineFromDynamo(context, deviceId, options) {
 
 function timelineLookbackHours(options) {
   return options.sinceMs > 0 ? options.sinceMs / (60 * 60 * 1000) : options.hours;
+}
+
+function validateStartSince(options) {
+  if (options.sinceMs > 0 && options.startIso) {
+    fail('--start and --since are mutually exclusive; use one or the other.');
+  }
+}
+
+function resolveTimelineWindow(options, nowFn) {
+  const now = nowFn ? nowFn() : new Date();
+  if (options.startIso) {
+    const end = options.until ? new Date(options.until) : now;
+    return { start: options.startIso, end: end.toISOString() };
+  }
+  if (options.sinceMs > 0) {
+    const start = new Date(now.getTime() - options.sinceMs);
+    return { start: start.toISOString(), end: now.toISOString() };
+  }
+  return { start: null, end: null };
+}
+
+function formatTruncationWarning(eventCount, limit, command) {
+  if (eventCount >= limit) {
+    return `WARN: results truncated at ${limit} events (--limit), narrow your window or raise --limit.`;
+  }
+  return null;
 }
 
 function queryTimelineRecordsFromDynamo(context, deviceId, start, end, options) {
@@ -2418,6 +2457,7 @@ module.exports = {
   formatDuration,
   formatRelativeTime,
   formatSerialEntry,
+  formatTruncationWarning,
   createSerialRenderer,
   formatWatchEntry,
   fetchTimeline,
@@ -2434,10 +2474,12 @@ module.exports = {
   renderFleetSummary,
   resolveCanonicalDeviceName,
   resolveDeviceSelector,
+  resolveTimelineWindow,
   runSerialLoop,
   runWatchLoop,
   timelineLookbackHours,
   timelinePresentationRows,
   validateSerialOptions,
+  validateStartSince,
   watchEntryFromEvent,
 };
