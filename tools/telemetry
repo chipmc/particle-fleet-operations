@@ -782,8 +782,9 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
 }
 
 function queryTimelineFromDynamo(context, deviceId, options) {
-  const end = options.end ? new Date(options.end) : new Date();
-  const start = options.start ? new Date(options.start) : new Date(end.getTime() - timelineLookbackHours(options) * 60 * 60 * 1000);
+  const resolved = resolveTimelineWindow(options);
+  const end = resolved.end ? new Date(resolved.end) : new Date();
+  const start = resolved.start ? new Date(resolved.start) : new Date(end.getTime() - timelineLookbackHours(options) * 60 * 60 * 1000);
   const records = queryTimelineRecordsFromDynamo(context, deviceId, start.toISOString(), end.toISOString(), options);
 
   if (records.length === 0 && !options.allowEmpty) fail(`No data found for device: ${deviceId}`);
@@ -1796,9 +1797,8 @@ async function runSerialLoop(context, device, options, deps = {}) {
       consecutiveFailures = 0;
 
       if (!options.follow) {
-        if (state.serialRowsEmitted >= options.limit) {
-          warn(`WARN: results truncated at ${options.limit} rows (--limit), narrow your --start/--until range or raise --limit.`);
-        }
+        const truncWarn = formatTruncationWarning(state.serialRowsEmitted, options.limit, 'serial');
+        if (truncWarn) warn(truncWarn);
         break;
       }
       await sleepFn(options.intervalSeconds * 1000, signal);
@@ -2007,8 +2007,8 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
 async function fetchTimelinePage(context, deviceId, params) {
   if (!context.webhookSecret) {
     return queryTimelineFromDynamo(context, deviceId, {
-      start: params.start,
-      end: params.end,
+      startIso: params.start,
+      until: params.end,
       limit: params.limit,
       allowEmpty: true,
     });

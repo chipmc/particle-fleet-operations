@@ -2108,8 +2108,8 @@ test('serial truncation warning appears when row cap is hit in a bounded run', a
   });
 
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /truncated at 1 rows \(--limit\)/);
-  assert.match(warnings[0], /--start\/--until/);
+  assert.match(warnings[0], /truncated at 1 events \(--limit\)/);
+  assert.match(warnings[0], /narrow your window/);
 });
 
 test('serial truncation warning does not appear when row cap is not hit', async () => {
@@ -2390,8 +2390,8 @@ test('Dynamo fallback paginates across multiple pages', () => {
   };
 
   const timeline = queryTimelineFromDynamo(context, 'device123', {
-    start: '2026-07-14T08:00:00.000Z',
-    end: '2026-07-14T08:00:03.000Z',
+    startIso: '2026-07-14T08:00:00.000Z',
+    until: '2026-07-14T08:00:03.000Z',
     limit: 2,
     pageLimit: 1,
   });
@@ -2418,8 +2418,8 @@ test('Dynamo fallback uses bounded page sizes for large result sets', () => {
   };
 
   const timeline = queryTimelineFromDynamo(context, 'device123', {
-    start: '2026-07-14T08:00:00.000Z',
-    end: '2026-07-14T08:00:03.000Z',
+    startIso: '2026-07-14T08:00:00.000Z',
+    until: '2026-07-14T08:00:03.000Z',
     limit: 450,
   });
 
@@ -2433,8 +2433,8 @@ test('Dynamo fallback treats empty quiet polls as valid when allowed', () => {
     logEventsTableName: 'events-table',
     awsJson: () => ({ Items: [] }),
   }, 'device123', {
-    start: '2026-07-14T08:00:00.000Z',
-    end: '2026-07-14T08:00:03.000Z',
+    startIso: '2026-07-14T08:00:00.000Z',
+    until: '2026-07-14T08:00:03.000Z',
     limit: 10,
     allowEmpty: true,
   });
