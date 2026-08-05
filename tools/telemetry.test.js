@@ -33,6 +33,7 @@ const {
   formatDuration,
   formatRelativeTime,
   formatSerialEntry,
+  formatTruncationWarning,
   formatWatchEntry,
   getWatchBannerLines,
   isDeviceId,
@@ -44,11 +45,13 @@ const {
   renderFleetSummary,
   resolveCanonicalDeviceName,
   resolveDeviceSelector,
+  resolveTimelineWindow,
   runSerialLoop,
   runWatchLoop,
   timelineLookbackHours,
   timelinePresentationRows,
   validateSerialOptions,
+  validateStartSince,
   watchEntryFromEvent,
 } = require('./telemetry');
 
@@ -493,7 +496,7 @@ test('timeline --since overrides the default 24-hour lookback', () => {
   assert.equal(timelineLookbackHours(parseOptions(['--hours', '6', 'Boron-Dev-09'])), 6);
 });
 
-test('timeline API request sends the --since lookback instead of default hours', async () => {
+test('timeline API request sends start/end bounds for --since instead of hours', async () => {
   const originalFetch = global.fetch;
   let requestedUrl = '';
   global.fetch = async (url) => {
@@ -510,11 +513,143 @@ test('timeline API request sends the --since lookback instead of default hours',
       ...parseOptions(['--since', '1h', 'Boron-Dev-09']),
       limit: 25,
     });
-    assert.match(requestedUrl, /[?&]hours=1(?:&|$)/);
-    assert.doesNotMatch(requestedUrl, /[?&]hours=24(?:&|$)/);
+    assert.match(requestedUrl, /[?&]start=/);
+    assert.match(requestedUrl, /[?&]end=/);
+    assert.doesNotMatch(requestedUrl, /[?&]hours=/);
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('timeline --start sends start/end params instead of hours', async () => {
+  const originalFetch = global.fetch;
+  let requestedUrl = '';
+  global.fetch = async (url) => {
+    requestedUrl = String(url);
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ events: [], count: 0 }),
+    };
+  };
+
+  try {
+    const now = new Date('2026-08-05T12:00:00.000Z');
+    await fetchTimeline({ webhookSecret: 'secret', queryApiBaseUrl: 'https://query.example.test' }, 'device123', {
+      ...parseOptions(['--start', '2026-08-05T10:00:00.000Z', 'Boron-Dev-09']),
+      limit: 25,
+    }, () => now);
+    assert.match(requestedUrl, /[?&]start=2026-08-05T10/);
+    assert.match(requestedUrl, /[?&]end=/);
+    assert.doesNotMatch(requestedUrl, /[?&]hours=/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('timeline --start + --until sends both bounds', async () => {
+  const originalFetch = global.fetch;
+  let requestedUrl = '';
+  global.fetch = async (url) => {
+    requestedUrl = String(url);
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ events: [], count: 0 }),
+    };
+  };
+
+  try {
+    await fetchTimeline({ webhookSecret: 'secret', queryApiBaseUrl: 'https://query.example.test' }, 'device123', {
+      ...parseOptions(['--start', '2026-08-05T10:00:00.000Z', '--until', '2026-08-05T11:00:00.000Z', 'Boron-Dev-09']),
+      limit: 25,
+    });
+    assert.match(requestedUrl, /[?&]start=2026-08-05T10/);
+    assert.match(requestedUrl, /[?&]end=2026-08-05T11/);
+    assert.doesNotMatch(requestedUrl, /[?&]hours=/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('validateStartSince rejects --start and --since together', () => {
+  assert.throws(
+    () => validateStartSince({ sinceMs: 3600000, startIso: '2026-08-05T10:00:00.000Z' }),
+    /--start and --since are mutually exclusive/
+  );
+});
+
+test('validateStartSince allows --start alone', () => {
+  assert.doesNotThrow(() => validateStartSince({ sinceMs: 0, startIso: '2026-08-05T10:00:00.000Z' }));
+});
+
+test('validateStartSince allows --since alone', () => {
+  assert.doesNotThrow(() => validateStartSince({ sinceMs: 3600000, startIso: null }));
+});
+
+test('resolveTimelineWindow returns start/end for --start', () => {
+  const now = new Date('2026-08-05T12:00:00.000Z');
+  const result = resolveTimelineWindow({ startIso: '2026-08-05T10:00:00.000Z', sinceMs: 0 }, () => now);
+  assert.equal(result.start, '2026-08-05T10:00:00.000Z');
+  assert.equal(result.end, '2026-08-05T12:00:00.000Z');
+});
+
+test('resolveTimelineWindow uses --until when provided with --start', () => {
+  const now = new Date('2026-08-05T12:00:00.000Z');
+  const result = resolveTimelineWindow({ startIso: '2026-08-05T10:00:00.000Z', until: '2026-08-05T11:00:00.000Z', sinceMs: 0 }, () => now);
+  assert.equal(result.start, '2026-08-05T10:00:00.000Z');
+  assert.equal(result.end, '2026-08-05T11:00:00.000Z');
+});
+
+test('resolveTimelineWindow returns null start when neither --start nor --since', () => {
+  const result = resolveTimelineWindow({ sinceMs: 0, startIso: null });
+  assert.equal(result.start, null);
+});
+
+test('formatTruncationWarning returns warning when count meets limit', () => {
+  const warning = formatTruncationWarning(25, 25, 'timeline');
+  assert.ok(warning);
+  assert.match(warning, /truncated/);
+  assert.match(warning, /25/);
+});
+
+test('formatTruncationWarning returns null when count is below limit', () => {
+  assert.equal(formatTruncationWarning(10, 25, 'timeline'), null);
+});
+
+test('timeline --start rejection guard in CLI rejects --start + --since together', () => {
+  const result = runTelemetry(['timeline', '--start', '2026-08-05T10:00:00.000Z', '--since', '1h', 'Boron-Dev-09']);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--start and --since are mutually exclusive/);
+});
+
+test('watch --start errors with a clear message', () => {
+  const result = runTelemetry(['watch', '--start', '2026-08-05T10:00:00.000Z', 'Boron-Dev-09']);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--start is not supported for watch/);
+  assert.match(result.stderr, /--since/);
+});
+
+test('watch without --start does not error on --start guard', async () => {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  controller.abort();
+  const options = { sinceMs: 0, startIso: null, intervalSeconds: 3, limit: 25, serialOnly: false, json: false, raw: false };
+  const device = { deviceId: 'abc123', deviceName: 'Test' };
+  const context = {};
+  let fetchCalled = false;
+
+  await runWatchLoop(context, device, options, {
+    signal,
+    fetchTimeline: async () => { fetchCalled = true; return { events: [] }; },
+    loadCurrentState: async () => ({}),
+    now: () => new Date(),
+    sleep: async () => {},
+    write: () => {},
+    warn: () => {},
+  });
+  // If --start guard fires it would throw before reaching here
+  assert.ok(true);
 });
 
 test('fleet option parsing supports product id, transport allowance, and verbose', () => {
@@ -1973,8 +2108,8 @@ test('serial truncation warning appears when row cap is hit in a bounded run', a
   });
 
   assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /truncated at 1 rows \(--limit\)/);
-  assert.match(warnings[0], /--start\/--until/);
+  assert.match(warnings[0], /truncated at 1 events \(--limit\)/);
+  assert.match(warnings[0], /narrow your window/);
 });
 
 test('serial truncation warning does not appear when row cap is not hit', async () => {
@@ -2255,8 +2390,8 @@ test('Dynamo fallback paginates across multiple pages', () => {
   };
 
   const timeline = queryTimelineFromDynamo(context, 'device123', {
-    start: '2026-07-14T08:00:00.000Z',
-    end: '2026-07-14T08:00:03.000Z',
+    startIso: '2026-07-14T08:00:00.000Z',
+    until: '2026-07-14T08:00:03.000Z',
     limit: 2,
     pageLimit: 1,
   });
@@ -2283,8 +2418,8 @@ test('Dynamo fallback uses bounded page sizes for large result sets', () => {
   };
 
   const timeline = queryTimelineFromDynamo(context, 'device123', {
-    start: '2026-07-14T08:00:00.000Z',
-    end: '2026-07-14T08:00:03.000Z',
+    startIso: '2026-07-14T08:00:00.000Z',
+    until: '2026-07-14T08:00:03.000Z',
     limit: 450,
   });
 
@@ -2298,8 +2433,8 @@ test('Dynamo fallback treats empty quiet polls as valid when allowed', () => {
     logEventsTableName: 'events-table',
     awsJson: () => ({ Items: [] }),
   }, 'device123', {
-    start: '2026-07-14T08:00:00.000Z',
-    end: '2026-07-14T08:00:03.000Z',
+    startIso: '2026-07-14T08:00:00.000Z',
+    until: '2026-07-14T08:00:03.000Z',
     limit: 10,
     allowEmpty: true,
   });
