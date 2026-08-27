@@ -860,6 +860,17 @@ function annotateTimelineHttpPayload(payload, requestedLimit, options = {}) {
   };
 }
 
+function annotateTimelineHttpPagePayload(payload, requestedLimit) {
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  const responseCount = Number.isFinite(payload.count) ? payload.count : events.length;
+  return {
+    ...payload,
+    events,
+    limit: requestedLimit,
+    truncated: requestedLimit > TIMELINE_HTTP_MAX_LIMIT && responseCount >= TIMELINE_HTTP_MAX_LIMIT,
+  };
+}
+
 function queryTimelineRecordsFromDynamo(context, deviceId, start, end, options) {
   const records = [];
   const readAwsJson = context.awsJson || awsJson;
@@ -2068,7 +2079,7 @@ async function fetchTimelinePage(context, deviceId, params) {
   const query = new URLSearchParams({
     start: params.start,
     end: params.end,
-    limit: String(Math.min(params.limit + 1, TIMELINE_HTTP_MAX_LIMIT)),
+    limit: String(Math.min(params.limit, TIMELINE_HTTP_MAX_LIMIT)),
   });
   const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${query.toString()}`;
   let response;
@@ -2097,7 +2108,7 @@ async function fetchTimelinePage(context, deviceId, params) {
     fail(message);
   }
 
-  return annotateTimelineHttpPayload(payload, params.limit);
+  return annotateTimelineHttpPagePayload(payload, params.limit);
 }
 
 function loadDeviceCurrentState(context, deviceId) {
