@@ -1889,9 +1889,12 @@ async function fetchSerialTimeline(context, deviceId, state, now, options) {
 function buildSerialEntries(events, state, options) {
   const entries = [];
   const newEvents = collectNewTimelineEvents(events, state);
+  const seenInBatch = new Set();
 
   for (const event of newEvents) {
-    if (state.seenEventIds.has(watchEventId(event))) continue;
+    const rowIdentity = `${event.eventTime}:${watchEventId(event)}`;
+    if (seenInBatch.has(rowIdentity)) continue;
+    seenInBatch.add(rowIdentity);
     markWatchEventSeen(state, event);
     if (!state.includeInitialTimeline && !state.initialized) continue;
     const entry = watchEntryFromEvent(event, options);

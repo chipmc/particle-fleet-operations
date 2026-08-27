@@ -2439,6 +2439,17 @@ test('serial suppresses duplicates and preserves identical timestamp event IDs',
   assert.deepEqual(entries.map(entry => entry.summary), ['second same timestamp']);
 });
 
+test('serial keeps distinct rows that share an eventId when eventTime differs', () => {
+  const options = serialOptions();
+  const state = createSerialState(options, new Date('2026-07-14T08:00:10.000Z'));
+  const entries = buildSerialEntries([
+    event({ eventTime: '2026-07-14T08:00:01.000Z', eventId: 'shared', s3Key: 'first', eventName: 'serialLog', serialLogLine: 'first row' }),
+    event({ eventTime: '2026-07-14T08:00:02.000Z', eventId: 'shared', s3Key: 'second', eventName: 'serialLog', serialLogLine: 'second row' }),
+  ], state, options);
+
+  assert.deepEqual(entries.map(entry => entry.summary), ['first row', 'second row']);
+});
+
 test('serial window calculation and --until use the requested reconstruction range', async () => {
   const options = serialOptions({ until: '2026-07-14T08:00:00.000Z' });
   const calls = [];
@@ -2988,6 +2999,52 @@ test('serial exact-limit complete window at 2 events does not truncate or emit d
   assert.deepEqual(warnings, []);
 });
 
+test('serial exact-limit complete window keeps rows with shared event IDs when eventTime differs', async () => {
+  const warnings = [];
+  const output = [];
+  const options = serialOptions({
+    startIso: '2026-07-14T08:00:01.000Z',
+    until: '2026-07-14T08:00:02.000Z',
+    sinceMs: 0,
+    limit: 2,
+    json: true,
+  });
+  const sharedRows = [
+    serialTimelineEvent(1, { eventId: 'shared', s3Key: 's3/shared-1', serialLogLine: 'first row' }),
+    serialTimelineEvent(2, { eventId: 'shared', s3Key: 's3/shared-2', serialLogLine: 'second row' }),
+  ];
+  const context = {
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(sharedRows),
+  };
+
+  const result = await runSerialLoop(context, { deviceId: 'device123' }, options, {
+    now: () => new Date('2026-07-14T08:00:02.000Z'),
+    write: line => output.push(line),
+    warn: message => warnings.push(message),
+  });
+
+  const records = parseNdjson(output.join('\n'));
+  assert.equal(result.truncated, false);
+  assert.deepEqual(records.slice(0, -1).map(record => ({
+    eventId: record.event.eventId,
+    s3Key: record.event.s3Key,
+    time: record.time,
+    line: record.line,
+  })), [
+    { eventId: 'shared', s3Key: 's3/shared-1', time: '2026-07-14T08:00:01.000Z', line: 'first row' },
+    { eventId: 'shared', s3Key: 's3/shared-2', time: '2026-07-14T08:00:02.000Z', line: 'second row' },
+  ]);
+  assert.deepEqual(records.at(-1), {
+    record: 'summary',
+    truncated: false,
+    count: 2,
+    limit: 2,
+  });
+  assert.deepEqual(warnings, []);
+});
+
 test('serial exact-limit complete window at 3 events does not truncate or emit duplicate event IDs', async () => {
   const warnings = [];
   const output = [];
@@ -3082,6 +3139,45 @@ test('serial --follow does not emit a summary record', async () => {
   assert.equal(records.length, 1);
   assert.equal(records[0].line, 'new line');
   assert.equal(records.some(record => record.record === 'summary'), false);
+});
+
+test('serial --follow advances past shared event IDs without duplicating rows', async () => {
+  const output = [];
+  const controller = new AbortController();
+  let calls = 0;
+  let sleeps = 0;
+
+  await runSerialLoop({}, { deviceId: 'device123' }, serialOptions({ sinceMs: 0, follow: true, json: true }), {
+    signal: controller.signal,
+    now: () => new Date('2026-07-14T08:00:10.000Z'),
+    fetchTimeline: async () => {
+      calls += 1;
+      if (calls === 1) return { events: [] };
+      if (calls === 2) {
+        return {
+          events: [
+            serialTimelineEvent(11, { eventId: 'shared', s3Key: 's3/shared-11', serialLogLine: 'first shared row' }),
+            serialTimelineEvent(12, { eventId: 'shared', s3Key: 's3/shared-12', serialLogLine: 'second shared row' }),
+          ],
+        };
+      }
+      return {
+        events: [
+          serialTimelineEvent(12, { eventId: 'shared', s3Key: 's3/shared-12', serialLogLine: 'second shared row' }),
+          serialTimelineEvent(13, { eventId: 'next', s3Key: 's3/next-13', serialLogLine: 'next row' }),
+        ],
+      };
+    },
+    write: line => output.push(line),
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps >= 3) controller.abort();
+    },
+  });
+
+  const records = parseNdjson(output.join('\n'));
+  assert.deepEqual(records.map(record => record.line), ['first shared row', 'second shared row', 'next row']);
+  assert.deepEqual(records.map(record => record.event.s3Key), ['s3/shared-11', 's3/shared-12', 's3/next-13']);
 });
 
 test('serial --since regression: existing --since behavior is unchanged', async () => {
