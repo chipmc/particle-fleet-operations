@@ -25,6 +25,8 @@ const DEFAULT_WATCH_INTERVAL_SECONDS = 3;
 const WATCH_TIMELINE_LIMIT = 200;
 const WATCH_DYNAMO_PAGE_LIMIT = 200;
 const WATCH_DYNAMO_MAX_ROWS = 2000;
+const TIMELINE_HTTP_MAX_LIMIT = 1000;
+const TRUNCATED_EXIT_CODE = 3;
 const WATCH_CURSOR_LOOKBACK_MS = 5 * 60 * 1000;
 const WATCH_LINE_MAX_LENGTH = 160;
 const DEVICE_ID_PATTERN = /^[a-fA-F0-9]{24}$/;
@@ -100,9 +102,10 @@ async function main() {
       const devices = await loadDeviceInventory(context, { productId: options.productId });
       const device = resolveDeviceSelector(devices, selector, context);
       const timeline = await fetchTimeline(context, device.deviceId, options);
-      const warning = formatTruncationWarning(timeline.count, options.limit, 'timeline');
+      const warning = formatTruncationWarning(timeline.truncated, options.limit, 'timeline');
       if (warning) console.error(warning);
       outputTimeline(device, timeline, options.json);
+      if (timeline.truncated) process.exitCode = TRUNCATED_EXIT_CODE;
       return;
     }
 
@@ -119,7 +122,8 @@ async function main() {
       validateSerialOptions(options);
       const devices = await loadDeviceInventory(context, { productId: options.productId });
       const device = resolveDeviceSelector(devices, selector, context);
-      await startSerial(context, device, options);
+      const result = await startSerial(context, device, options);
+      if (result && result.truncated) process.exitCode = TRUNCATED_EXIT_CODE;
       return;
     }
 
@@ -750,10 +754,14 @@ function resolveDeviceSelector(devices, selector, context = undefined) {
 }
 
 async function fetchTimeline(context, deviceId, options, nowFn) {
-  if (!context.webhookSecret) return queryTimelineFromDynamo(context, deviceId, options);
+  const requestedLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
+  if (!context.webhookSecret) return queryTimelineFromDynamo(context, deviceId, { ...options, probeForTruncation: true });
 
   const { start, end } = resolveTimelineWindow(options, nowFn);
-  const params = new URLSearchParams({ limit: String(options.limit) });
+  const useConservativeHeuristic = requestedLimit >= TIMELINE_HTTP_MAX_LIMIT;
+  const params = new URLSearchParams({
+    limit: String(useConservativeHeuristic ? requestedLimit : requestedLimit + 1),
+  });
   if (start) {
     params.set('start', start);
     params.set('end', end);
@@ -778,23 +786,40 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
   if (!response.ok) {
     fail(`Timeline API request failed with HTTP ${response.status}: ${payload.message || payload.error || 'unknown error'}`);
   }
-  return payload;
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  const trimmedEvents = events.slice(0, requestedLimit);
+  const responseCount = Number.isFinite(payload.count) ? payload.count : events.length;
+  return {
+    ...payload,
+    count: trimmedEvents.length,
+    events: trimmedEvents,
+    limit: requestedLimit,
+    truncated: useConservativeHeuristic ? responseCount >= requestedLimit : events.length > requestedLimit,
+  };
 }
 
 function queryTimelineFromDynamo(context, deviceId, options) {
   const resolved = resolveTimelineWindow(options);
   const end = resolved.end ? new Date(resolved.end) : new Date();
   const start = resolved.start ? new Date(resolved.start) : new Date(end.getTime() - timelineLookbackHours(options) * 60 * 60 * 1000);
-  const records = queryTimelineRecordsFromDynamo(context, deviceId, start.toISOString(), end.toISOString(), options);
+  const requestedLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
+  const queryLimit = options.probeForTruncation ? requestedLimit + 1 : requestedLimit;
+  const records = queryTimelineRecordsFromDynamo(context, deviceId, start.toISOString(), end.toISOString(), {
+    ...options,
+    limit: queryLimit,
+  });
+  const trimmedRecords = records.slice(0, requestedLimit);
 
-  if (records.length === 0 && !options.allowEmpty) fail(`No data found for device: ${deviceId}`);
+  if (trimmedRecords.length === 0 && !options.allowEmpty) fail(`No data found for device: ${deviceId}`);
 
   return {
     deviceId,
     start: start.toISOString(),
     end: end.toISOString(),
-    count: records.length,
-    events: records.map(formatTimelineRecord),
+    count: trimmedRecords.length,
+    events: trimmedRecords.map(formatTimelineRecord),
+    limit: requestedLimit,
+    truncated: records.length > requestedLimit,
     source: 'dynamodb',
   };
 }
@@ -823,7 +848,7 @@ function resolveTimelineWindow(options, nowFn) {
 }
 
 function formatTruncationWarning(eventCount, limit, command) {
-  if (eventCount >= limit) {
+  if (eventCount) {
     return `WARN: results truncated at ${limit} events (--limit), narrow your window or raise --limit.`;
   }
   return null;
@@ -1759,7 +1784,7 @@ async function startSerial(context, device, options) {
   process.once('SIGINT', onSigint);
 
   try {
-    await runSerialLoop(context, device, options, {
+    return await runSerialLoop(context, device, options, {
       signal: controller.signal,
       write,
       warn,
@@ -1797,9 +1822,16 @@ async function runSerialLoop(context, device, options, deps = {}) {
       consecutiveFailures = 0;
 
       if (!options.follow) {
-        const truncWarn = formatTruncationWarning(state.serialRowsEmitted, options.limit, 'serial');
+        const truncated = Boolean(timeline.truncated || state.serialRowsSkipped > 0);
+        if (options.json) write(JSON.stringify({
+          record: 'summary',
+          truncated,
+          count: state.serialRowsEmitted,
+          limit: options.limit,
+        }));
+        const truncWarn = formatTruncationWarning(truncated, options.limit, 'serial');
         if (truncWarn) warn(truncWarn);
-        break;
+        return { truncated };
       }
       await sleepFn(options.intervalSeconds * 1000, signal);
     } catch (err) {
@@ -1813,6 +1845,7 @@ async function runSerialLoop(context, device, options, deps = {}) {
       await sleepFn(getWatchBackoffMs(consecutiveFailures), signal);
     }
   }
+  return { truncated: false };
 }
 
 function validateSerialOptions(options) {
@@ -1824,6 +1857,7 @@ function createSerialState(options, now) {
   const state = createWatchState(options, now);
   state.includeInitialTimeline = options.sinceMs > 0 || Boolean(options.startIso);
   state.serialRowsEmitted = 0;
+  state.serialRowsSkipped = 0;
   return state;
 }
 
@@ -1841,7 +1875,10 @@ function buildSerialEntries(events, state, options) {
     const entry = watchEntryFromEvent(event, options);
     if (!entry || (entry.kind !== 'SERIAL' && !(options.includeCollector && entry.kind === 'COLLECTOR'))) continue;
     if (options.grep && !entry.summary.includes(options.grep)) continue;
-    if (!options.follow && state.serialRowsEmitted >= options.limit) continue;
+    if (!options.follow && state.serialRowsEmitted >= options.limit) {
+      state.serialRowsSkipped += 1;
+      continue;
+    }
     entries.push(entry);
     state.serialRowsEmitted += 1;
   }
@@ -1981,9 +2018,13 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
   const events = [];
   let pageEnd = end;
   const visitedPageEnds = new Set();
+  let truncated = false;
 
   while (true) {
-    if (visitedPageEnds.has(pageEnd)) break;
+    if (visitedPageEnds.has(pageEnd)) {
+      truncated = true;
+      break;
+    }
     visitedPageEnds.add(pageEnd);
 
     const page = await fetchTimelinePage(context, deviceId, {
@@ -2001,7 +2042,7 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
     pageEnd = oldest.eventTime;
   }
 
-  return { events };
+  return { events, truncated };
 }
 
 async function fetchTimelinePage(context, deviceId, params) {

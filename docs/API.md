@@ -598,12 +598,27 @@ commands, both of which accept `--start`/`--until`/`--since` flags.
 ERROR: --start and --since are mutually exclusive; use one or the other.
 ```
 
-**Truncation warning:** When the number of returned events equals `--limit`, a warning
-is printed to stderr:
+**Truncation signaling:** When a bounded `timeline` or non-`--follow` `serial`
+result is partial, the CLI still writes the data to stdout, then exits with code
+`3` and prints this warning to stderr:
 
 ```
 WARN: results truncated at <N> events (--limit), narrow your window or raise --limit.
 ```
+
+- `timeline --json` includes `truncated: true|false` and `limit`, and its
+  `count`/`events` reflect the emitted (trimmed) result set.
+- `serial --json` remains NDJSON. For bounded, non-`--follow` runs it appends
+  one trailing summary record after the data lines:
+
+  ```json
+  {"record":"summary","truncated":true,"count":25,"limit":25}
+  ```
+
+- `serial --follow` emits no summary record and does not use truncation exit
+  code `3`.
+- Complete bounded results, including windows with exactly `--limit` events,
+  keep `truncated: false` and exit `0`.
 
 **`watch --start` is not supported.** The `watch` command tails near-live events and
 uses a cursor-based poll loop; `--start` is rejected with a clear error:
