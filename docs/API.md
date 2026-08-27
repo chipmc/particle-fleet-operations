@@ -620,8 +620,9 @@ WARN: results truncated at <N> events (--limit), narrow your window or raise --l
 
 - `serial --follow` emits no summary record and does not use truncation exit
   code `3`.
-- Complete bounded results, including windows with exactly `--limit` events,
-  keep `truncated: false` and exit `0`.
+- Complete bounded results keep `truncated: false` and exit `0`, including
+  complete windows with exactly `--limit` events on the DynamoDB path and other
+  non-clamped paths.
 
 **`watch --start` is not supported.** The `watch` command tails near-live events and
 uses a cursor-based poll loop; `--start` is rejected with a clear error:

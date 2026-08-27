@@ -786,16 +786,7 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
   if (!response.ok) {
     fail(`Timeline API request failed with HTTP ${response.status}: ${payload.message || payload.error || 'unknown error'}`);
   }
-  const events = Array.isArray(payload.events) ? payload.events : [];
-  const trimmedEvents = events.slice(0, requestedLimit);
-  const responseCount = Number.isFinite(payload.count) ? payload.count : events.length;
-  return {
-    ...payload,
-    count: trimmedEvents.length,
-    events: trimmedEvents,
-    limit: requestedLimit,
-    truncated: events.length > requestedLimit || responseCount >= TIMELINE_HTTP_MAX_LIMIT,
-  };
+  return annotateTimelineHttpPayload(payload, requestedLimit, { trimEvents: true });
 }
 
 function queryTimelineFromDynamo(context, deviceId, options) {
@@ -820,7 +811,7 @@ function queryTimelineFromDynamo(context, deviceId, options) {
     count: trimmedRecords.length,
     events: trimmedRecords.map(formatTimelineRecord),
     limit: requestedLimit,
-    truncated: records.length > requestedLimit || timelineRecords.hitMaxRows,
+    truncated: records.length > requestedLimit || timelineRecords.moreAvailable,
     source: 'dynamodb',
   };
 }
@@ -853,6 +844,19 @@ function formatTruncationWarning(truncated, limit, command) {
     return `WARN: results truncated at ${limit} events (--limit), narrow your window or raise --limit.`;
   }
   return null;
+}
+
+function annotateTimelineHttpPayload(payload, requestedLimit, options = {}) {
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  const responseCount = Number.isFinite(payload.count) ? payload.count : events.length;
+  const returnedEvents = options.trimEvents ? events.slice(0, requestedLimit) : events;
+  return {
+    ...payload,
+    ...(options.trimEvents ? { count: returnedEvents.length } : {}),
+    events: returnedEvents,
+    limit: requestedLimit,
+    truncated: events.length > requestedLimit || responseCount >= TIMELINE_HTTP_MAX_LIMIT,
+  };
 }
 
 function queryTimelineRecordsFromDynamo(context, deviceId, start, end, options) {
@@ -892,7 +896,7 @@ function queryTimelineRecordsFromDynamo(context, deviceId, start, end, options) 
 
   return {
     records,
-    hitMaxRows: maxRows === WATCH_DYNAMO_MAX_ROWS && records.length >= maxRows,
+    moreAvailable: Boolean(exclusiveStartKey),
   };
 }
 
@@ -2037,6 +2041,7 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
       limit,
     });
     const pageEvents = page.events || [];
+    if (page.truncated) truncated = true;
     events.push(...pageEvents);
 
     if (pageEvents.length < limit) break;
@@ -2062,7 +2067,7 @@ async function fetchTimelinePage(context, deviceId, params) {
   const query = new URLSearchParams({
     start: params.start,
     end: params.end,
-    limit: String(params.limit),
+    limit: String(Math.min(params.limit + 1, TIMELINE_HTTP_MAX_LIMIT)),
   });
   const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${query.toString()}`;
   let response;
@@ -2091,7 +2096,7 @@ async function fetchTimelinePage(context, deviceId, params) {
     fail(message);
   }
 
-  return payload;
+  return annotateTimelineHttpPayload(payload, params.limit);
 }
 
 function loadDeviceCurrentState(context, deviceId) {

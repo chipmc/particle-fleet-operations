@@ -906,6 +906,68 @@ test('timeline Dynamo does not report truncation when result count exactly match
   assert.equal(timeline.truncated, false);
 });
 
+test('timeline Dynamo keeps a complete 1999-record window below the internal cap untruncated', async () => {
+  const records = serialTimelineEvents(1999);
+  const timeline = await fetchTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(records),
+  }, 'device123', {
+    ...parseOptions(['--start', fixedIso(1), '--until', fixedIso(1999), 'device123']),
+    limit: 2000,
+  });
+
+  assert.equal(timeline.count, 1999);
+  assert.equal(timeline.truncated, false);
+});
+
+test('timeline Dynamo keeps a complete exactly-2000-record window untruncated at limit 2000', async () => {
+  const records = serialTimelineEvents(2000);
+  const timeline = await fetchTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(records),
+  }, 'device123', {
+    ...parseOptions(['--start', fixedIso(1), '--until', fixedIso(2000), 'device123']),
+    limit: 2000,
+  });
+
+  assert.equal(timeline.count, 2000);
+  assert.equal(timeline.limit, 2000);
+  assert.equal(timeline.truncated, false);
+});
+
+test('timeline Dynamo keeps a complete exactly-2000-record window untruncated at limit 5000', async () => {
+  const records = serialTimelineEvents(2000);
+  const timeline = await fetchTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(records),
+  }, 'device123', {
+    ...parseOptions(['--start', fixedIso(1), '--until', fixedIso(2000), 'device123']),
+    limit: 5000,
+  });
+
+  assert.equal(timeline.count, 2000);
+  assert.equal(timeline.limit, 5000);
+  assert.equal(timeline.truncated, false);
+});
+
+test('timeline Dynamo reports truncation when 2001 records exceed the 2000-record probe boundary', async () => {
+  const records = serialTimelineEvents(2001);
+  const timeline = await fetchTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(records),
+  }, 'device123', {
+    ...parseOptions(['--start', fixedIso(1), '--until', fixedIso(2001), 'device123']),
+    limit: 2000,
+  });
+
+  assert.equal(timeline.count, 2000);
+  assert.equal(timeline.truncated, true);
+});
+
 test('timeline Dynamo reports truncation when the internal 2000-row cap blocks the probe at limit 2000', async () => {
   const records = serialTimelineEvents(2500);
   const timeline = await fetchTimeline({
@@ -2499,6 +2561,63 @@ test('serial timeline fetch paginates API history pages', async () => {
     assert.deepEqual(timeline.events.map(item => item.eventId), ['newer', 'older']);
     assert.match(urls[1], /end=2026-07-14T08%3A00%3A02\.000Z/);
     assert.match(urls[2], /end=2026-07-14T08%3A00%3A01\.000Z/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('serial timeline fetch reports truncation for Dynamo windows above the 2000-row internal cap', async () => {
+  const options = serialOptions({
+    sinceMs: 0,
+    startIso: fixedIso(1),
+    until: fixedIso(2500),
+    limit: 3000,
+  });
+  const state = createSerialState(options, new Date(fixedIso(2500)));
+  state.includeInitialTimeline = true;
+
+  const timeline = await fetchSerialTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(serialTimelineEvents(2500)),
+  }, 'device123', state, new Date(fixedIso(2500)), options);
+
+  assert.equal(timeline.events.length, 2000);
+  assert.equal(timeline.truncated, true);
+});
+
+test('serial timeline fetch reports truncation for HTTP windows clamped at the 1000-event server cap', async () => {
+  const originalFetch = global.fetch;
+  const urls = [];
+  global.fetch = async (url) => {
+    urls.push(String(url));
+    return {
+      ok: true,
+      text: async () => JSON.stringify({
+        count: 1000,
+        events: serialTimelineEvents(1000),
+      }),
+    };
+  };
+
+  try {
+    const options = serialOptions({
+      sinceMs: 0,
+      startIso: fixedIso(1),
+      until: fixedIso(5000),
+      limit: 1500,
+    });
+    const state = createSerialState(options, new Date(fixedIso(5000)));
+    state.includeInitialTimeline = true;
+
+    const timeline = await fetchSerialTimeline({
+      webhookSecret: 'secret',
+      queryApiBaseUrl: 'https://query.example.test',
+    }, 'device123', state, new Date(fixedIso(5000)), options);
+
+    assert.match(urls[0], /[?&]limit=1000(?:&|$)/);
+    assert.equal(timeline.events.length, 1000);
+    assert.equal(timeline.truncated, true);
   } finally {
     global.fetch = originalFetch;
   }
