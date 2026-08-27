@@ -608,6 +608,9 @@ WARN: results truncated at <N> events (--limit), narrow your window or raise --l
 
 - `timeline --json` includes `truncated: true|false` and `limit`, and its
   `count`/`events` reflect the emitted (trimmed) result set.
+- For `timeline`, results at or above the upstream 1000-event HTTP clamp may
+  conservatively report `truncated: true` because the CLI cannot distinguish a
+  complete 1000-event window from a clamped partial response on that path.
 - `serial --json` remains NDJSON. For bounded, non-`--follow` runs it appends
   one trailing summary record after the data lines:
 

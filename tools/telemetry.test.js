@@ -151,6 +151,10 @@ function serialTimelineEvent(index, overrides = {}) {
   });
 }
 
+function serialTimelineEvents(count, overrides = {}) {
+  return Array.from({ length: count }, (_, index) => serialTimelineEvent(index + 1, overrides));
+}
+
 function dynamoTimelineItem(record) {
   return dynamoItem({
     deviceId: record.deviceId,
@@ -642,6 +646,39 @@ test('CLI exit codes distinguish truncated, complete, error, and ambiguous resul
   assert.match(ambiguous.stderr, /ERROR: Ambiguous device selector: Boron/);
 });
 
+test('serial CLI reports truncated grep no-match results with exit 3, summary record, and WARN', async (t) => {
+  const deviceId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+  const env = await createTelemetryCliFixture(t, {
+    devices: [
+      { deviceId, deviceName: 'Boron Alpha', projectId: 'generalized-core-counter' },
+    ],
+    events: [
+      serialTimelineEvent(1, { deviceId, eventId: 'event-1', s3Key: 's3/event-1', serialLogLine: 'alpha' }),
+      serialTimelineEvent(2, { deviceId, eventId: 'event-2', s3Key: 's3/event-2', serialLogLine: 'beta' }),
+      serialTimelineEvent(3, { deviceId, eventId: 'event-3', s3Key: 's3/event-3', serialLogLine: 'gamma' }),
+    ],
+  });
+
+  const result = runTelemetry([
+    'serial',
+    deviceId,
+    '--start', fixedIso(1),
+    '--until', fixedIso(3),
+    '--limit', '1',
+    '--grep', 'NO-MATCH',
+    '--json',
+  ], env);
+
+  assert.equal(result.status, 3);
+  assert.equal(result.stderr.trim(), 'WARN: results truncated at 1 events (--limit), narrow your window or raise --limit.');
+  assert.deepEqual(parseNdjson(result.stdout), [{
+    record: 'summary',
+    truncated: true,
+    count: 0,
+    limit: 1,
+  }]);
+});
+
 test('Particle-resolved name works for device selector resolution', async () => {
   const originalFetch = global.fetch;
   global.fetch = async () => ({
@@ -855,7 +892,7 @@ test('timeline Dynamo marks truncated false when fewer than limit records are fe
 });
 
 test('timeline Dynamo does not report truncation when result count exactly matches the limit', async () => {
-  const records = Array.from({ length: 5 }, (_, index) => serialTimelineEvent(index + 1));
+  const records = serialTimelineEvents(5);
   const timeline = await fetchTimeline({
     options: {},
     logEventsTableName: 'events-table',
@@ -867,6 +904,38 @@ test('timeline Dynamo does not report truncation when result count exactly match
 
   assert.equal(timeline.count, 5);
   assert.equal(timeline.truncated, false);
+});
+
+test('timeline Dynamo reports truncation when the internal 2000-row cap blocks the probe at limit 2000', async () => {
+  const records = serialTimelineEvents(2500);
+  const timeline = await fetchTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(records),
+  }, 'device123', {
+    ...parseOptions(['--start', fixedIso(1), '--until', fixedIso(2500), 'device123']),
+    limit: 2000,
+  });
+
+  assert.equal(timeline.count, 2000);
+  assert.equal(timeline.limit, 2000);
+  assert.equal(timeline.truncated, true);
+});
+
+test('timeline Dynamo reports truncation when the internal 2000-row cap truncates a request above the caller limit', async () => {
+  const records = serialTimelineEvents(2500);
+  const timeline = await fetchTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(records),
+  }, 'device123', {
+    ...parseOptions(['--start', fixedIso(1), '--until', fixedIso(2500), 'device123']),
+    limit: 5000,
+  });
+
+  assert.equal(timeline.count, 2000);
+  assert.equal(timeline.limit, 5000);
+  assert.equal(timeline.truncated, true);
 });
 
 test('timeline HTTP requests limit plus one and injects truncation into the trimmed payload', async () => {
@@ -902,7 +971,7 @@ test('timeline HTTP requests limit plus one and injects truncation into the trim
   }
 });
 
-test('timeline HTTP uses the count>=limit fallback heuristic when the requested limit reaches the API clamp', async () => {
+test('timeline HTTP conservatively reports truncation when the response hits the 1000-event server clamp', async () => {
   const originalFetch = global.fetch;
   let requestedUrl = '';
   global.fetch = async (url) => {
@@ -928,6 +997,38 @@ test('timeline HTTP uses the count>=limit fallback heuristic when the requested 
     assert.match(requestedUrl, /[?&]limit=1000(?:&|$)/);
     assert.doesNotMatch(requestedUrl, /[?&]limit=1001(?:&|$)/);
     assert.equal(timeline.count, 1000);
+    assert.equal(timeline.truncated, true);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('timeline HTTP reports truncation for requested limits above the 1000-event server clamp', async () => {
+  const originalFetch = global.fetch;
+  let requestedUrl = '';
+  global.fetch = async (url) => {
+    requestedUrl = String(url);
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        deviceId: 'device123',
+        start: fixedIso(1),
+        end: fixedIso(5000),
+        count: 1000,
+        events: serialTimelineEvents(1000),
+      }),
+    };
+  };
+
+  try {
+    const timeline = await fetchTimeline({ webhookSecret: 'secret', queryApiBaseUrl: 'https://query.example.test' }, 'device123', {
+      ...parseOptions(['--start', fixedIso(1), '--until', fixedIso(5000), 'device123']),
+      limit: 1001,
+    });
+    assert.match(requestedUrl, /[?&]limit=1000(?:&|$)/);
+    assert.equal(timeline.count, 1000);
+    assert.equal(timeline.limit, 1001);
     assert.equal(timeline.truncated, true);
   } finally {
     global.fetch = originalFetch;

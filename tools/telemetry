@@ -758,9 +758,9 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
   if (!context.webhookSecret) return queryTimelineFromDynamo(context, deviceId, { ...options, probeForTruncation: true });
 
   const { start, end } = resolveTimelineWindow(options, nowFn);
-  const useConservativeHeuristic = requestedLimit >= TIMELINE_HTTP_MAX_LIMIT;
+  const probeLimit = Math.min(requestedLimit + 1, TIMELINE_HTTP_MAX_LIMIT);
   const params = new URLSearchParams({
-    limit: String(useConservativeHeuristic ? requestedLimit : requestedLimit + 1),
+    limit: String(probeLimit),
   });
   if (start) {
     params.set('start', start);
@@ -794,7 +794,7 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
     count: trimmedEvents.length,
     events: trimmedEvents,
     limit: requestedLimit,
-    truncated: useConservativeHeuristic ? responseCount >= requestedLimit : events.length > requestedLimit,
+    truncated: events.length > requestedLimit || responseCount >= TIMELINE_HTTP_MAX_LIMIT,
   };
 }
 
@@ -804,10 +804,11 @@ function queryTimelineFromDynamo(context, deviceId, options) {
   const start = resolved.start ? new Date(resolved.start) : new Date(end.getTime() - timelineLookbackHours(options) * 60 * 60 * 1000);
   const requestedLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
   const queryLimit = options.probeForTruncation ? requestedLimit + 1 : requestedLimit;
-  const records = queryTimelineRecordsFromDynamo(context, deviceId, start.toISOString(), end.toISOString(), {
+  const timelineRecords = queryTimelineRecordsFromDynamo(context, deviceId, start.toISOString(), end.toISOString(), {
     ...options,
     limit: queryLimit,
   });
+  const records = timelineRecords.records;
   const trimmedRecords = records.slice(0, requestedLimit);
 
   if (trimmedRecords.length === 0 && !options.allowEmpty) fail(`No data found for device: ${deviceId}`);
@@ -819,7 +820,7 @@ function queryTimelineFromDynamo(context, deviceId, options) {
     count: trimmedRecords.length,
     events: trimmedRecords.map(formatTimelineRecord),
     limit: requestedLimit,
-    truncated: records.length > requestedLimit,
+    truncated: records.length > requestedLimit || timelineRecords.hitMaxRows,
     source: 'dynamodb',
   };
 }
@@ -847,8 +848,8 @@ function resolveTimelineWindow(options, nowFn) {
   return { start: null, end: null };
 }
 
-function formatTruncationWarning(eventCount, limit, command) {
-  if (eventCount) {
+function formatTruncationWarning(truncated, limit, command) {
+  if (truncated) {
     return `WARN: results truncated at ${limit} events (--limit), narrow your window or raise --limit.`;
   }
   return null;
@@ -889,7 +890,10 @@ function queryTimelineRecordsFromDynamo(context, deviceId, start, end, options) 
     exclusiveStartKey = page.LastEvaluatedKey;
   } while (exclusiveStartKey && records.length < requestedLimit && records.length < maxRows);
 
-  return records;
+  return {
+    records,
+    hitMaxRows: records.length >= maxRows && maxRows >= WATCH_DYNAMO_MAX_ROWS,
+  };
 }
 
 function formatTimelineRecord(record) {
