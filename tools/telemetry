@@ -2054,7 +2054,7 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
       limit,
     });
     const pageEvents = page.events || [];
-    if (page.truncated) truncated = true;
+    if (page.truncated && pageEvents.length < limit) truncated = true;
     events.push(...pageEvents);
 
     if (pageEvents.length < limit) break;

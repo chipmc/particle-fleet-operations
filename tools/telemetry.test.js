@@ -2822,6 +2822,138 @@ test('serial grep with a fully fetched window does not over-report truncation', 
   assert.deepEqual(warnings, []);
 });
 
+test('serial grep with exactly one full page and no matches does not report truncation', async () => {
+  const warnings = [];
+  const output = [];
+  const options = serialOptions({
+    startIso: fixedIso(1),
+    until: fixedIso(25),
+    sinceMs: 0,
+    limit: 25,
+    grep: 'NO-MATCH',
+    json: true,
+  });
+  const context = {
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(serialTimelineEvents(25)),
+  };
+
+  const result = await runSerialLoop(context, { deviceId: 'device123' }, options, {
+    now: () => new Date(fixedIso(25)),
+    write: line => output.push(line),
+    warn: message => warnings.push(message),
+  });
+
+  assert.equal(result.truncated, false);
+  assert.deepEqual(parseNdjson(output.join('\n')), [{
+    record: 'summary',
+    truncated: false,
+    count: 0,
+    limit: 25,
+  }]);
+  assert.deepEqual(warnings, []);
+});
+
+test('serial grep with two fully recovered pages and no matches does not report truncation', async () => {
+  const warnings = [];
+  const output = [];
+  const options = serialOptions({
+    startIso: fixedIso(1),
+    until: fixedIso(26),
+    sinceMs: 0,
+    limit: 25,
+    grep: 'NO-MATCH',
+    json: true,
+  });
+  const context = {
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(serialTimelineEvents(26)),
+  };
+
+  const result = await runSerialLoop(context, { deviceId: 'device123' }, options, {
+    now: () => new Date(fixedIso(26)),
+    write: line => output.push(line),
+    warn: message => warnings.push(message),
+  });
+
+  assert.equal(result.truncated, false);
+  assert.deepEqual(parseNdjson(output.join('\n')), [{
+    record: 'summary',
+    truncated: false,
+    count: 0,
+    limit: 25,
+  }]);
+  assert.deepEqual(warnings, []);
+});
+
+test('serial grep with many fully recovered pages and no matches does not report truncation', async () => {
+  const warnings = [];
+  const output = [];
+  const options = serialOptions({
+    startIso: fixedIso(1),
+    until: fixedIso(200),
+    sinceMs: 0,
+    limit: 25,
+    grep: 'NO-MATCH',
+    json: true,
+  });
+  const context = {
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(serialTimelineEvents(200)),
+  };
+
+  const result = await runSerialLoop(context, { deviceId: 'device123' }, options, {
+    now: () => new Date(fixedIso(200)),
+    write: line => output.push(line),
+    warn: message => warnings.push(message),
+  });
+
+  assert.equal(result.truncated, false);
+  assert.deepEqual(parseNdjson(output.join('\n')), [{
+    record: 'summary',
+    truncated: false,
+    count: 0,
+    limit: 25,
+  }]);
+  assert.deepEqual(warnings, []);
+});
+
+test('serial grep still reports truncation when an elevated-limit Dynamo window is capped before recovery', async () => {
+  const warnings = [];
+  const output = [];
+  const options = serialOptions({
+    startIso: fixedIso(1),
+    until: fixedIso(2500),
+    sinceMs: 0,
+    limit: 3000,
+    grep: 'NO-MATCH',
+    json: true,
+  });
+  const context = {
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(serialTimelineEvents(2500)),
+  };
+
+  const result = await runSerialLoop(context, { deviceId: 'device123' }, options, {
+    now: () => new Date(fixedIso(2500)),
+    write: line => output.push(line),
+    warn: message => warnings.push(message),
+  });
+
+  assert.equal(result.truncated, true);
+  assert.deepEqual(parseNdjson(output.join('\n')), [{
+    record: 'summary',
+    truncated: true,
+    count: 0,
+    limit: 3000,
+  }]);
+  assert.deepEqual(warnings, ['WARN: results truncated at 3000 events (--limit), narrow your window or raise --limit.']);
+});
+
 test('serial --follow does not emit a summary record', async () => {
   const output = [];
   const controller = new AbortController();
