@@ -1891,6 +1891,7 @@ function buildSerialEntries(events, state, options) {
   const newEvents = collectNewTimelineEvents(events, state);
 
   for (const event of newEvents) {
+    if (state.seenEventIds.has(watchEventId(event))) continue;
     markWatchEventSeen(state, event);
     if (!state.includeInitialTimeline && !state.initialized) continue;
     const entry = watchEntryFromEvent(event, options);

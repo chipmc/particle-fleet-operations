@@ -2954,6 +2954,109 @@ test('serial grep still reports truncation when an elevated-limit Dynamo window 
   assert.deepEqual(warnings, ['WARN: results truncated at 3000 events (--limit), narrow your window or raise --limit.']);
 });
 
+test('serial exact-limit complete window at 2 events does not truncate or emit duplicate event IDs', async () => {
+  const warnings = [];
+  const output = [];
+  const options = serialOptions({
+    startIso: fixedIso(1),
+    until: fixedIso(2),
+    sinceMs: 0,
+    limit: 2,
+    json: true,
+  });
+  const context = {
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(serialTimelineEvents(2)),
+  };
+
+  const result = await runSerialLoop(context, { deviceId: 'device123' }, options, {
+    now: () => new Date(fixedIso(2)),
+    write: line => output.push(line),
+    warn: message => warnings.push(message),
+  });
+
+  const records = parseNdjson(output.join('\n'));
+  assert.equal(result.truncated, false);
+  assert.deepEqual(records.slice(0, -1).map(record => record.event.eventId), ['event-1', 'event-2']);
+  assert.deepEqual(records.at(-1), {
+    record: 'summary',
+    truncated: false,
+    count: 2,
+    limit: 2,
+  });
+  assert.deepEqual(warnings, []);
+});
+
+test('serial exact-limit complete window at 3 events does not truncate or emit duplicate event IDs', async () => {
+  const warnings = [];
+  const output = [];
+  const options = serialOptions({
+    startIso: fixedIso(1),
+    until: fixedIso(3),
+    sinceMs: 0,
+    limit: 3,
+    json: true,
+  });
+  const context = {
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(serialTimelineEvents(3)),
+  };
+
+  const result = await runSerialLoop(context, { deviceId: 'device123' }, options, {
+    now: () => new Date(fixedIso(3)),
+    write: line => output.push(line),
+    warn: message => warnings.push(message),
+  });
+
+  const records = parseNdjson(output.join('\n'));
+  assert.equal(result.truncated, false);
+  assert.deepEqual(records.slice(0, -1).map(record => record.event.eventId), ['event-1', 'event-2', 'event-3']);
+  assert.deepEqual(records.at(-1), {
+    record: 'summary',
+    truncated: false,
+    count: 3,
+    limit: 3,
+  });
+  assert.deepEqual(warnings, []);
+});
+
+test('serial exact-limit complete window at 25 events does not truncate or emit duplicate event IDs', async () => {
+  const warnings = [];
+  const output = [];
+  const options = serialOptions({
+    startIso: fixedIso(1),
+    until: fixedIso(25),
+    sinceMs: 0,
+    limit: 25,
+    json: true,
+  });
+  const context = {
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(serialTimelineEvents(25)),
+  };
+
+  const result = await runSerialLoop(context, { deviceId: 'device123' }, options, {
+    now: () => new Date(fixedIso(25)),
+    write: line => output.push(line),
+    warn: message => warnings.push(message),
+  });
+
+  const records = parseNdjson(output.join('\n'));
+  assert.equal(result.truncated, false);
+  assert.deepEqual(records.slice(0, -1).map(record => record.event.eventId), serialTimelineEvents(25).map(item => item.eventId));
+  assert.equal(new Set(records.slice(0, -1).map(record => record.event.eventId)).size, 25);
+  assert.deepEqual(records.at(-1), {
+    record: 'summary',
+    truncated: false,
+    count: 25,
+    limit: 25,
+  });
+  assert.deepEqual(warnings, []);
+});
+
 test('serial --follow does not emit a summary record', async () => {
   const output = [];
   const controller = new AbortController();

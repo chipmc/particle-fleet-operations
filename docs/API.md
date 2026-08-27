@@ -624,6 +624,10 @@ WARN: results truncated at <N> events (--limit), narrow your window or raise --l
 - Complete bounded results keep `truncated: false` and exit `0`, including
   complete windows with exactly `--limit` events on the DynamoDB path and other
   non-clamped paths.
+- One bounded serial edge case remains conservative: at `--limit 1`, the
+  inclusive paging boundary can make a single-event window indistinguishable
+  from a partial one, so the trailing summary may still report
+  `truncated: true`.
 
 **`watch --start` is not supported.** The `watch` command tails near-live events and
 uses a cursor-based poll loop; `--start` is rejected with a clear error:
