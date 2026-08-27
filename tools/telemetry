@@ -892,7 +892,7 @@ function queryTimelineRecordsFromDynamo(context, deviceId, start, end, options) 
 
   return {
     records,
-    hitMaxRows: records.length >= maxRows && maxRows >= WATCH_DYNAMO_MAX_ROWS,
+    hitMaxRows: maxRows === WATCH_DYNAMO_MAX_ROWS && records.length >= maxRows,
   };
 }
 
