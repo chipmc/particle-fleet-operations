@@ -867,7 +867,8 @@ function annotateTimelineHttpPagePayload(payload, requestedLimit) {
     ...payload,
     events,
     limit: requestedLimit,
-    truncated: requestedLimit > TIMELINE_HTTP_MAX_LIMIT && responseCount >= TIMELINE_HTTP_MAX_LIMIT,
+    truncated: events.length > requestedLimit
+      || (requestedLimit > TIMELINE_HTTP_MAX_LIMIT && responseCount >= TIMELINE_HTTP_MAX_LIMIT),
   };
 }
 
