@@ -494,6 +494,7 @@ function parsePreciseInstant(value) {
   const offsetSign = match[9] === '-' ? -1 : 1;
   const offsetHours = Number(match[10] || 0);
   const offsetMinutes = Number(match[11] || 0);
+  if (offsetToken !== 'Z' && (offsetHours > 23 || offsetMinutes > 59)) return null;
   const baseMs = Date.UTC(year, month - 1, day, hour, minute, second);
   const date = new Date(baseMs);
   if (Number.isNaN(date.getTime())
@@ -857,15 +858,31 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
   if (!context.webhookSecret) return queryTimelineFromDynamo(context, deviceId, { ...options, probeForTruncation: true });
 
   const { start, end } = resolveTimelineWindow(options, nowFn);
+  if (start) {
+    const probeLimit = Math.min(requestedLimit + 1, TIMELINE_HTTP_MAX_LIMIT);
+    const page = await fetchTimelinePage(context, deviceId, {
+      start,
+      end,
+      limit: probeLimit,
+    });
+    const events = (page.events || []).slice(0, requestedLimit);
+    return {
+      deviceId,
+      start,
+      end,
+      count: events.length,
+      events,
+      limit: requestedLimit,
+      truncated: page.truncated || (page.events || []).length > requestedLimit,
+      source: page.source,
+    };
+  }
+
   const probeLimit = Math.min(requestedLimit + 1, TIMELINE_HTTP_MAX_LIMIT);
   const params = new URLSearchParams({
     limit: String(probeLimit),
   });
-  if (start) {
-    const widened = widenTimelineBounds(start, end);
-    params.set('start', widened.start);
-    params.set('end', widened.end);
-  } else {
+  if (!start) {
     params.set('hours', String(timelineLookbackHours(options)));
   }
   const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${params.toString()}`;
@@ -906,6 +923,7 @@ function queryTimelineFromDynamo(context, deviceId, options) {
     ? queryFilteredTimelineRecordsFromDynamo(context, deviceId, widened.start, widened.end, {
       ...options,
       limit: queryLimit,
+      maxRows: WATCH_DYNAMO_MAX_ROWS,
       filterRecord: record => isEventWithinExactWindow(record, exactStart, exactEnd),
     })
     : queryTimelineRecordsFromDynamo(context, deviceId, exactStart, exactEnd, {
@@ -2209,17 +2227,16 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
 }
 
 async function fetchTimelinePage(context, deviceId, params) {
+  const widened = widenTimelineBounds(params.start, params.end);
   if (!context.webhookSecret) {
-    const rawLimit = Math.min(params.limit, WATCH_DYNAMO_MAX_ROWS);
-    const widenedStart = floorIsoTimestampToLowSortSecond(params.start);
-    const widenedEnd = ceilIsoTimestampToNextSecond(params.end);
     const page = queryFilteredTimelinePageFromDynamo(
       context,
       deviceId,
-      widenedStart,
-      widenedEnd,
+      widened.start,
+      widened.end,
       {
-        limit: rawLimit,
+        limit: Math.min(params.limit, WATCH_DYNAMO_MAX_ROWS),
+        maxRows: WATCH_DYNAMO_MAX_ROWS,
         filterRecord: record => isEventWithinExactWindow(record, params.start, params.end),
         exclusiveStartKey: params.exclusiveStartKey,
       }
@@ -2242,10 +2259,33 @@ async function fetchTimelinePage(context, deviceId, params) {
     };
   }
 
-  const rawLimit = Math.min(Math.max(params.limit + 1, params.limit * 4), TIMELINE_HTTP_MAX_LIMIT);
+  let rawLimit = Math.min(params.limit, TIMELINE_HTTP_MAX_LIMIT);
+  let page;
+  let filteredEvents = [];
+  let rawPageMayContinue = false;
+  do {
+    page = await fetchTimelineHttpPage(context, deviceId, widened.start, widened.end, rawLimit);
+    filteredEvents = (page.events || [])
+      .filter(event => isEventWithinExactWindow(event, params.start, params.end))
+      .sort((left, right) => compareWatchEvents(right, left));
+    rawPageMayContinue = (page.events || []).length >= rawLimit;
+    if (filteredEvents.length >= params.limit || !rawPageMayContinue || rawLimit >= TIMELINE_HTTP_MAX_LIMIT) break;
+    rawLimit = Math.min(TIMELINE_HTTP_MAX_LIMIT, Math.max(rawLimit + 1, rawLimit * 2));
+  } while (true);
+  const events = filteredEvents.slice(0, params.limit);
+  return {
+    ...page,
+    count: events.length,
+    events,
+    truncated: filteredEvents.length > params.limit || rawPageMayContinue,
+    nextPageEnd: nextPageEndForFilteredTimelinePage(page.events || [], events, filteredEvents.length > params.limit || rawPageMayContinue, params.limit),
+  };
+}
+
+async function fetchTimelineHttpPage(context, deviceId, start, end, rawLimit) {
   const query = new URLSearchParams({
-    start: params.start,
-    end: params.end,
+    start,
+    end,
     limit: String(rawLimit),
   });
   const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${query.toString()}`;
@@ -2275,18 +2315,7 @@ async function fetchTimelinePage(context, deviceId, params) {
     fail(message);
   }
 
-  const page = annotateTimelineHttpPagePayload(payload, params.limit);
-  const filteredEvents = (page.events || [])
-    .filter(event => isEventWithinExactWindow(event, params.start, params.end))
-    .sort((left, right) => compareWatchEvents(right, left));
-  const events = filteredEvents.slice(0, params.limit);
-  return {
-    ...page,
-    count: events.length,
-    events,
-    truncated: page.truncated || filteredEvents.length > params.limit,
-    nextPageEnd: nextPageEndForFilteredTimelinePage(page.events || [], events, page.truncated, params.limit),
-  };
+  return annotateTimelineHttpPagePayload(payload, rawLimit);
 }
 
 function nextPageEndForFilteredTimelinePage(rawEvents, returnedEvents, moreAvailable, limit) {
@@ -2307,8 +2336,12 @@ function queryFilteredTimelinePageFromDynamo(context, deviceId, start, end, opti
   const rawRecords = [];
   let rawScanned = 0;
   let exclusiveStartKey = options.exclusiveStartKey;
+  const filteredLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
+  const maxRows = Math.min(options.maxRows || WATCH_DYNAMO_MAX_ROWS, WATCH_DYNAMO_MAX_ROWS);
 
-  while (rawScanned < options.limit) {
+  while (rawScanned < maxRows) {
+    const remainingFiltered = Math.max(1, filteredLimit - records.length);
+    const remainingRaw = maxRows - rawScanned;
     const args = [
       'dynamodb', 'query',
       '--table-name', context.logEventsTableName,
@@ -2319,7 +2352,7 @@ function queryFilteredTimelinePageFromDynamo(context, deviceId, start, end, opti
         ':end': { S: end },
       }),
       '--no-scan-index-forward',
-      '--limit', String(Math.min(options.limit - rawScanned, WATCH_DYNAMO_PAGE_LIMIT)),
+      '--limit', String(Math.min(remainingFiltered, remainingRaw, WATCH_DYNAMO_PAGE_LIMIT)),
     ];
     if (exclusiveStartKey) args.push('--exclusive-start-key', JSON.stringify(exclusiveStartKey));
 
@@ -2335,7 +2368,7 @@ function queryFilteredTimelinePageFromDynamo(context, deviceId, start, end, opti
     records.push(...(options.filterRecord ? pageRecords.filter(options.filterRecord) : pageRecords));
     exclusiveStartKey = page.LastEvaluatedKey;
 
-    if (!exclusiveStartKey) break;
+    if (!exclusiveStartKey || records.length >= filteredLimit) break;
   }
 
   return {

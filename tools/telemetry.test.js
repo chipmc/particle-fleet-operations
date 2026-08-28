@@ -222,6 +222,29 @@ function createPaginatedTimelineAwsJson(records, calls = []) {
   };
 }
 
+function createTimelineHttpFetch(records, calls = []) {
+  return async (url) => {
+    const requestedUrl = new URL(String(url));
+    calls.push(requestedUrl);
+    const start = requestedUrl.searchParams.get('start');
+    const end = requestedUrl.searchParams.get('end');
+    const limit = Number(requestedUrl.searchParams.get('limit') || records.length);
+    const eligible = records
+      .filter(record => (!start || record.eventTime >= start) && (!end || record.eventTime <= end))
+      .sort((left, right) => right.eventTime.localeCompare(left.eventTime));
+    const events = eligible.slice(0, limit);
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        deviceId: 'device123',
+        count: events.length,
+        events,
+      }),
+    };
+  };
+}
+
 function parseNdjson(output) {
   return output
     .trim()
@@ -268,6 +291,28 @@ async function runSerialJsonWindow(records, overrides = {}) {
     warn: message => warnings.push(message),
   });
   return { result, records: parseNdjson(output.join('\n')), warnings };
+}
+
+async function fetchSerialWindowHttp(records, overrides = {}, calls = []) {
+  const originalFetch = global.fetch;
+  global.fetch = createTimelineHttpFetch(records, calls);
+  try {
+    const options = serialOptions({
+      sinceMs: 0,
+      startIso: overrides.startIso || records[0].eventTime,
+      until: overrides.until || records.at(-1).eventTime,
+      limit: overrides.limit || 25,
+      ...overrides,
+    });
+    const state = createSerialState(options, new Date(options.until));
+    state.includeInitialTimeline = true;
+    return await fetchSerialTimeline({
+      webhookSecret: 'secret',
+      queryApiBaseUrl: 'https://query.example.test',
+    }, 'device123', state, options.until, options);
+  } finally {
+    global.fetch = originalFetch;
+  }
 }
 
 async function createTelemetryCliFixture(t, fixture) {
@@ -839,6 +884,28 @@ test('serial option parsing supports since, until, follow, collector, grep, json
   assert.equal(options.limit, 7);
 });
 
+test('CLI rejects invalid ISO timezone offsets for --start', () => {
+  for (const value of [
+    '2026-07-14T08:00:00.000+00:60',
+    '2026-07-14T08:00:00.000+24:00',
+    '2026-07-14T08:00:00.000+99:99',
+  ]) {
+    const result = runTelemetry(['timeline', '--start', value, 'Boron-Dev-09']);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /--start must be a valid ISO timestamp/);
+  }
+});
+
+test('valid ISO timezone offsets remain accepted', () => {
+  const positive = parseOptions(['--start', '2026-07-14T08:00:00.000+00:00', 'device123']);
+  const negative = parseOptions(['--start', '2026-07-14T08:00:00.000-05:00', 'device123']);
+  const zulu = parseOptions(['--start', '2026-07-14T08:00:00.000Z', 'device123']);
+
+  assert.equal(positive.startIso, '2026-07-14T08:00:00.000Z');
+  assert.equal(negative.startIso, '2026-07-14T13:00:00.000Z');
+  assert.equal(zulu.startIso, '2026-07-14T08:00:00.000Z');
+});
+
 test('timeline --since overrides the default 24-hour lookback', () => {
   const options = parseOptions(['--since', '1h', 'Boron-Dev-09']);
   assert.equal(timelineLookbackHours(options), 1);
@@ -1193,6 +1260,96 @@ test('timeline HTTP returns the cross-format in-window collision row and uses wi
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('timeline bounded windows keep in-window rows across Dynamo and HTTP at limits 1, 2, and 5', async () => {
+  const records = [
+    serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.600Z', eventId: 'spill-6' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.500000+00:00', eventId: 'spill-5' }),
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.400Z', eventId: 'spill-4' }),
+    serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.300000+00:00', eventId: 'spill-3' }),
+    serialTimelineEvent(5, { eventTime: '2026-07-14T08:00:40.200Z', eventId: 'in-2' }),
+    serialTimelineEvent(6, { eventTime: '2026-07-14T08:00:40.100000+00:00', eventId: 'in-1' }),
+  ];
+  const args = ['--start', '2026-07-14T08:00:40.000Z', '--until', '2026-07-14T08:00:40.250Z', 'device123'];
+
+  for (const limit of [1, 2, 5]) {
+    const expectedIds = limit === 1 ? ['in-2'] : ['in-2', 'in-1'];
+
+    const dynamoTimeline = await fetchTimeline({
+      options: {},
+      logEventsTableName: 'events-table',
+      awsJson: createPaginatedTimelineAwsJson(records),
+    }, 'device123', {
+      ...parseOptions(args),
+      limit,
+    });
+    assert.deepEqual(dynamoTimeline.events.map(item => item.eventId), expectedIds);
+    assert.equal(dynamoTimeline.truncated, limit === 1);
+
+    const originalFetch = global.fetch;
+    global.fetch = createTimelineHttpFetch(records);
+    try {
+      const httpTimeline = await fetchTimeline({
+        webhookSecret: 'secret',
+        queryApiBaseUrl: 'https://query.example.test',
+      }, 'device123', {
+        ...parseOptions(args),
+        limit,
+      });
+      assert.deepEqual(httpTimeline.events.map(item => item.eventId), expectedIds);
+      assert.equal(httpTimeline.truncated, limit === 1);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  }
+});
+
+test('serial bounded windows keep matching rows across Dynamo and HTTP at limits 1, 2, and 5', async () => {
+  const records = [
+    serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.600Z', eventId: 'spill-6' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.500000+00:00', eventId: 'spill-5' }),
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.400Z', eventId: 'spill-4' }),
+    serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.300000+00:00', eventId: 'spill-3' }),
+    serialTimelineEvent(5, { eventTime: '2026-07-14T08:00:40.200Z', eventId: 'in-2' }),
+    serialTimelineEvent(6, { eventTime: '2026-07-14T08:00:40.100000+00:00', eventId: 'in-1' }),
+  ];
+
+  for (const limit of [1, 2, 5]) {
+    const dynamoTimeline = await fetchSerialWindow(records, {
+      startIso: '2026-07-14T08:00:40.000Z',
+      until: '2026-07-14T08:00:40.250Z',
+      limit,
+    });
+    assert.equal(dynamoTimeline.truncated, false);
+    assert.deepEqual(dynamoTimeline.events.map(item => item.eventId), ['in-2', 'in-1']);
+
+    const httpTimeline = await fetchSerialWindowHttp(records, {
+      startIso: '2026-07-14T08:00:40.000Z',
+      until: '2026-07-14T08:00:40.250Z',
+      limit,
+    });
+    assert.equal(httpTimeline.truncated, false);
+    assert.deepEqual(httpTimeline.events.map(item => item.eventId), ['in-2', 'in-1']);
+  }
+});
+
+test('serial HTTP returns the cross-format in-window collision row with the widened start bound', async () => {
+  const calls = [];
+  const timeline = await fetchSerialWindowHttp([
+    serialTimelineEvent(1, { eventTime: fixedZuluIso(39, 999), eventId: 'before-z' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.397Z', eventId: 'collision-z' }),
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.397813+00:00', eventId: 'collision-offset' }),
+    serialTimelineEvent(4, { eventTime: fixedOffsetIso(40, 900000), eventId: 'after-offset' }),
+  ], {
+    startIso: '2026-07-14T08:00:40.397Z',
+    until: '2026-07-14T08:00:40.900000+00:00',
+    limit: 10,
+  }, calls);
+
+  assert.match(calls[0].search, /[?&]start=2026-07-14T08%3A00%3A40\.000000%2B00%3A00(?:&|$)/);
+  assert.match(calls[0].search, /[?&]end=2026-07-14T08%3A00%3A41\.000Z(?:&|$)/);
+  assert.deepEqual(timeline.events.map(item => item.eventId), ['after-offset', 'collision-offset', 'collision-z']);
 });
 
 test('timeline preserves a precise --until boundary instead of truncating the exact end instant', async () => {
@@ -2685,8 +2842,8 @@ test('serial timeline fetch paginates API history pages', async () => {
 
     assert.equal(urls.length, 3);
     assert.deepEqual(timeline.events.map(item => item.eventId), ['newer', 'older']);
-    assert.match(urls[1], /end=2026-07-14T08%3A00%3A01\.999999999Z/);
-    assert.match(urls[2], /end=2026-07-14T08%3A00%3A00\.999999999Z/);
+    assert.match(urls[1], /end=2026-07-14T08%3A00%3A02\.000Z/);
+    assert.match(urls[2], /end=2026-07-14T08%3A00%3A01\.000Z/);
   } finally {
     global.fetch = originalFetch;
   }
