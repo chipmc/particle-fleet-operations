@@ -25,6 +25,8 @@ const DEFAULT_WATCH_INTERVAL_SECONDS = 3;
 const WATCH_TIMELINE_LIMIT = 200;
 const WATCH_DYNAMO_PAGE_LIMIT = 200;
 const WATCH_DYNAMO_MAX_ROWS = 2000;
+const TIMELINE_HTTP_MAX_LIMIT = 1000;
+const TRUNCATED_EXIT_CODE = 3;
 const WATCH_CURSOR_LOOKBACK_MS = 5 * 60 * 1000;
 const WATCH_LINE_MAX_LENGTH = 160;
 const DEVICE_ID_PATTERN = /^[a-fA-F0-9]{24}$/;
@@ -100,9 +102,10 @@ async function main() {
       const devices = await loadDeviceInventory(context, { productId: options.productId });
       const device = resolveDeviceSelector(devices, selector, context);
       const timeline = await fetchTimeline(context, device.deviceId, options);
-      const warning = formatTruncationWarning(timeline.count, options.limit, 'timeline');
+      const warning = formatTruncationWarning(timeline.truncated, options.limit, 'timeline');
       if (warning) console.error(warning);
       outputTimeline(device, timeline, options.json);
+      if (timeline.truncated) process.exitCode = TRUNCATED_EXIT_CODE;
       return;
     }
 
@@ -119,7 +122,8 @@ async function main() {
       validateSerialOptions(options);
       const devices = await loadDeviceInventory(context, { productId: options.productId });
       const device = resolveDeviceSelector(devices, selector, context);
-      await startSerial(context, device, options);
+      const result = await startSerial(context, device, options);
+      if (result && result.truncated) process.exitCode = TRUNCATED_EXIT_CODE;
       return;
     }
 
@@ -750,10 +754,14 @@ function resolveDeviceSelector(devices, selector, context = undefined) {
 }
 
 async function fetchTimeline(context, deviceId, options, nowFn) {
-  if (!context.webhookSecret) return queryTimelineFromDynamo(context, deviceId, options);
+  const requestedLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
+  if (!context.webhookSecret) return queryTimelineFromDynamo(context, deviceId, { ...options, probeForTruncation: true });
 
   const { start, end } = resolveTimelineWindow(options, nowFn);
-  const params = new URLSearchParams({ limit: String(options.limit) });
+  const probeLimit = Math.min(requestedLimit + 1, TIMELINE_HTTP_MAX_LIMIT);
+  const params = new URLSearchParams({
+    limit: String(probeLimit),
+  });
   if (start) {
     params.set('start', start);
     params.set('end', end);
@@ -778,23 +786,32 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
   if (!response.ok) {
     fail(`Timeline API request failed with HTTP ${response.status}: ${payload.message || payload.error || 'unknown error'}`);
   }
-  return payload;
+  return annotateTimelineHttpPayload(payload, requestedLimit, { trimEvents: true });
 }
 
 function queryTimelineFromDynamo(context, deviceId, options) {
   const resolved = resolveTimelineWindow(options);
   const end = resolved.end ? new Date(resolved.end) : new Date();
   const start = resolved.start ? new Date(resolved.start) : new Date(end.getTime() - timelineLookbackHours(options) * 60 * 60 * 1000);
-  const records = queryTimelineRecordsFromDynamo(context, deviceId, start.toISOString(), end.toISOString(), options);
+  const requestedLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
+  const queryLimit = options.probeForTruncation ? requestedLimit + 1 : requestedLimit;
+  const timelineRecords = queryTimelineRecordsFromDynamo(context, deviceId, start.toISOString(), end.toISOString(), {
+    ...options,
+    limit: queryLimit,
+  });
+  const records = timelineRecords.records;
+  const trimmedRecords = records.slice(0, requestedLimit);
 
-  if (records.length === 0 && !options.allowEmpty) fail(`No data found for device: ${deviceId}`);
+  if (trimmedRecords.length === 0 && !options.allowEmpty) fail(`No data found for device: ${deviceId}`);
 
   return {
     deviceId,
     start: start.toISOString(),
     end: end.toISOString(),
-    count: records.length,
-    events: records.map(formatTimelineRecord),
+    count: trimmedRecords.length,
+    events: trimmedRecords.map(formatTimelineRecord),
+    limit: requestedLimit,
+    truncated: records.length > requestedLimit || timelineRecords.moreAvailable,
     source: 'dynamodb',
   };
 }
@@ -822,11 +839,37 @@ function resolveTimelineWindow(options, nowFn) {
   return { start: null, end: null };
 }
 
-function formatTruncationWarning(eventCount, limit, command) {
-  if (eventCount >= limit) {
+function formatTruncationWarning(truncated, limit, command) {
+  if (truncated) {
     return `WARN: results truncated at ${limit} events (--limit), narrow your window or raise --limit.`;
   }
   return null;
+}
+
+function annotateTimelineHttpPayload(payload, requestedLimit, options = {}) {
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  const responseCount = Number.isFinite(payload.count) ? payload.count : events.length;
+  const returnedEvents = options.trimEvents ? events.slice(0, requestedLimit) : events;
+  return {
+    ...payload,
+    ...(options.trimEvents ? { count: returnedEvents.length } : {}),
+    events: returnedEvents,
+    limit: requestedLimit,
+    truncated: events.length > requestedLimit
+      || (requestedLimit >= TIMELINE_HTTP_MAX_LIMIT && responseCount >= TIMELINE_HTTP_MAX_LIMIT),
+  };
+}
+
+function annotateTimelineHttpPagePayload(payload, requestedLimit) {
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  const responseCount = Number.isFinite(payload.count) ? payload.count : events.length;
+  return {
+    ...payload,
+    events,
+    limit: requestedLimit,
+    truncated: events.length > requestedLimit
+      || (requestedLimit > TIMELINE_HTTP_MAX_LIMIT && responseCount >= TIMELINE_HTTP_MAX_LIMIT),
+  };
 }
 
 function queryTimelineRecordsFromDynamo(context, deviceId, start, end, options) {
@@ -864,7 +907,10 @@ function queryTimelineRecordsFromDynamo(context, deviceId, start, end, options) 
     exclusiveStartKey = page.LastEvaluatedKey;
   } while (exclusiveStartKey && records.length < requestedLimit && records.length < maxRows);
 
-  return records;
+  return {
+    records,
+    moreAvailable: Boolean(exclusiveStartKey),
+  };
 }
 
 function formatTimelineRecord(record) {
@@ -1759,7 +1805,7 @@ async function startSerial(context, device, options) {
   process.once('SIGINT', onSigint);
 
   try {
-    await runSerialLoop(context, device, options, {
+    return await runSerialLoop(context, device, options, {
       signal: controller.signal,
       write,
       warn,
@@ -1797,9 +1843,16 @@ async function runSerialLoop(context, device, options, deps = {}) {
       consecutiveFailures = 0;
 
       if (!options.follow) {
-        const truncWarn = formatTruncationWarning(state.serialRowsEmitted, options.limit, 'serial');
+        const truncated = Boolean(timeline.truncated || state.serialRowsSkipped > 0);
+        if (options.json) write(JSON.stringify({
+          record: 'summary',
+          truncated,
+          count: state.serialRowsEmitted,
+          limit: options.limit,
+        }));
+        const truncWarn = formatTruncationWarning(truncated, options.limit, 'serial');
         if (truncWarn) warn(truncWarn);
-        break;
+        return { truncated };
       }
       await sleepFn(options.intervalSeconds * 1000, signal);
     } catch (err) {
@@ -1813,6 +1866,7 @@ async function runSerialLoop(context, device, options, deps = {}) {
       await sleepFn(getWatchBackoffMs(consecutiveFailures), signal);
     }
   }
+  return { truncated: false };
 }
 
 function validateSerialOptions(options) {
@@ -1824,6 +1878,7 @@ function createSerialState(options, now) {
   const state = createWatchState(options, now);
   state.includeInitialTimeline = options.sinceMs > 0 || Boolean(options.startIso);
   state.serialRowsEmitted = 0;
+  state.serialRowsSkipped = 0;
   return state;
 }
 
@@ -1834,14 +1889,21 @@ async function fetchSerialTimeline(context, deviceId, state, now, options) {
 function buildSerialEntries(events, state, options) {
   const entries = [];
   const newEvents = collectNewTimelineEvents(events, state);
+  const seenInBatch = new Set();
 
   for (const event of newEvents) {
+    const rowIdentity = `${event.eventTime}:${watchEventId(event)}`;
+    if (seenInBatch.has(rowIdentity)) continue;
+    seenInBatch.add(rowIdentity);
     markWatchEventSeen(state, event);
     if (!state.includeInitialTimeline && !state.initialized) continue;
     const entry = watchEntryFromEvent(event, options);
     if (!entry || (entry.kind !== 'SERIAL' && !(options.includeCollector && entry.kind === 'COLLECTOR'))) continue;
     if (options.grep && !entry.summary.includes(options.grep)) continue;
-    if (!options.follow && state.serialRowsEmitted >= options.limit) continue;
+    if (!options.follow && state.serialRowsEmitted >= options.limit) {
+      state.serialRowsSkipped += 1;
+      continue;
+    }
     entries.push(entry);
     state.serialRowsEmitted += 1;
   }
@@ -1981,9 +2043,13 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
   const events = [];
   let pageEnd = end;
   const visitedPageEnds = new Set();
+  let truncated = false;
 
   while (true) {
-    if (visitedPageEnds.has(pageEnd)) break;
+    if (visitedPageEnds.has(pageEnd)) {
+      truncated = true;
+      break;
+    }
     visitedPageEnds.add(pageEnd);
 
     const page = await fetchTimelinePage(context, deviceId, {
@@ -1992,6 +2058,7 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
       limit,
     });
     const pageEvents = page.events || [];
+    if (page.truncated && pageEvents.length < limit) truncated = true;
     events.push(...pageEvents);
 
     if (pageEvents.length < limit) break;
@@ -2001,7 +2068,7 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
     pageEnd = oldest.eventTime;
   }
 
-  return { events };
+  return { events, truncated };
 }
 
 async function fetchTimelinePage(context, deviceId, params) {
@@ -2017,7 +2084,7 @@ async function fetchTimelinePage(context, deviceId, params) {
   const query = new URLSearchParams({
     start: params.start,
     end: params.end,
-    limit: String(params.limit),
+    limit: String(Math.min(params.limit, TIMELINE_HTTP_MAX_LIMIT)),
   });
   const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${query.toString()}`;
   let response;
@@ -2046,7 +2113,7 @@ async function fetchTimelinePage(context, deviceId, params) {
     fail(message);
   }
 
-  return payload;
+  return annotateTimelineHttpPagePayload(payload, params.limit);
 }
 
 function loadDeviceCurrentState(context, deviceId) {

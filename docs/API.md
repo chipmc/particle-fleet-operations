@@ -598,12 +598,36 @@ commands, both of which accept `--start`/`--until`/`--since` flags.
 ERROR: --start and --since are mutually exclusive; use one or the other.
 ```
 
-**Truncation warning:** When the number of returned events equals `--limit`, a warning
-is printed to stderr:
+**Truncation signaling:** When a bounded `timeline` or non-`--follow` `serial`
+result is partial, the CLI still writes the data to stdout, then exits with code
+`3` and prints this warning to stderr:
 
 ```
 WARN: results truncated at <N> events (--limit), narrow your window or raise --limit.
 ```
+
+- `timeline --json` includes `truncated: true|false` and `limit`, and its
+  `count`/`events` reflect the emitted (trimmed) result set.
+- For `timeline`, and for bounded `serial` runs that fetch through the HTTP
+  query API, results at or above the upstream 1000-event clamp may
+  conservatively report `truncated: true` because the CLI cannot distinguish a
+  complete 1000-event window from a clamped partial response on that path.
+- `serial --json` remains NDJSON. For bounded, non-`--follow` runs it appends
+  one trailing summary record after the data lines:
+
+  ```json
+  {"record":"summary","truncated":true,"count":25,"limit":25}
+  ```
+
+- `serial --follow` emits no summary record and does not use truncation exit
+  code `3`.
+- Complete bounded results keep `truncated: false` and exit `0`, including
+  complete windows with exactly `--limit` events on the DynamoDB path and other
+  non-clamped paths.
+- One bounded serial edge case remains conservative: at `--limit 1`, the
+  inclusive paging boundary can make a single-event window indistinguishable
+  from a partial one, so the trailing summary may still report
+  `truncated: true`.
 
 **`watch --start` is not supported.** The `watch` command tails near-live events and
 uses a cursor-based poll loop; `--start` is rejected with a clear error:
