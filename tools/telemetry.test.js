@@ -17,6 +17,7 @@ const {
 
 const {
   TransientWatchError,
+  WATCH_DYNAMO_MAX_ROWS,
   buildSerialEntries,
   buildFleetSummary,
   buildWatchEntries,
@@ -4471,4 +4472,39 @@ test('fleet summary verbose text row includes SCHEMA VER for schemaVersion 2 dev
   const text = renderFleetSummary(summary, { verbose: true, color: false }).join('\n');
   assert.match(text, /SCHEMA VER/);
   assert.match(text, /2/);
+});
+test('serial mixed-format paging caps widened Dynamo raw work and reports truncation when the cap is hit', async () => {
+  const calls = [];
+  const limit = 25;
+  const records = [
+    ...Array.from({ length: 1994 }, (_, index) => serialTimelineEvent(index + 1, {
+      eventTime: `2026-07-14T08:00:40.${String(105001 + index).padStart(6, '0')}+00:00`,
+      eventId: `spill-${index + 1}`,
+    })),
+    ...Array.from({ length: 6 }, (_, index) => serialTimelineEvent(6000 + index, {
+      eventTime: `2026-07-14T08:00:40.${String(100000 + index).padStart(6, '0')}+00:00`,
+      eventId: `in-${index + 1}`,
+    })),
+    ...Array.from({ length: 3000 }, (_, index) => serialTimelineEvent(7000 + index, {
+      eventTime: `2026-07-14T08:00:40.${String(99999 - index).padStart(6, '0')}+00:00`,
+      eventId: `older-${index + 1}`,
+    })),
+  ];
+  const timeline = await fetchSerialWindow(records, {
+    startIso: '2026-07-14T08:00:40.100Z',
+    until: '2026-07-14T08:00:40.105000+00:00',
+    limit,
+  }, calls);
+  // The budget bounds raw ROWS scanned (sourceCap + min(limit, sourceCap)). Before the
+  // round-5 consolidation each Dynamo query returned up to `limit` usable rows, so the
+  // query bound was rows/limit. On the consolidated widen-and-filter path a widened
+  // query can be split across the second boundary, so a batch can cost up to two
+  // queries. The bound below reflects that; the property under test is unchanged —
+  // query work must stay bounded and must not scale with dataset size.
+  const maxRawRows = WATCH_DYNAMO_MAX_ROWS + Math.min(limit, WATCH_DYNAMO_MAX_ROWS);
+  const maxExpectedQueries = 2 * Math.ceil(maxRawRows / limit);
+
+  assert.equal(timeline.truncated, true);
+  assert.deepEqual(timeline.events.map(item => item.eventId), ['in-6', 'in-5', 'in-4', 'in-3', 'in-2', 'in-1']);
+  assert.ok(calls.length <= maxExpectedQueries, `expected capped Dynamo query work, saw ${calls.length} queries`);
 });
