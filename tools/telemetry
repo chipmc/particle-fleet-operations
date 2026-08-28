@@ -2231,7 +2231,7 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
     if (oldest && compareEventToCursor(oldest, state.cursor) <= 0) break;
     pageEnd = page.nextPageEnd || pageEnd;
     pageExclusiveStartKey = page.nextExclusiveStartKey || null;
-    widenPageEnd = Boolean(pageExclusiveStartKey);
+    widenPageEnd = false;
   }
 
   events.sort((left, right) => compareWatchEvents(right, left));
