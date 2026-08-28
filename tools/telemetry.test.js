@@ -17,6 +17,7 @@ const {
 
 const {
   TransientWatchError,
+  WATCH_DYNAMO_MAX_ROWS,
   buildSerialEntries,
   buildFleetSummary,
   buildWatchEntries,
@@ -3171,7 +3172,6 @@ test('serial HTTP paging still advances when the caller limit is above the 1000-
 test('serial mixed-format paging caps widened Dynamo raw work and reports truncation when the cap is hit', async () => {
   const calls = [];
   const limit = 25;
-  const dynamoRawSourceCap = 2000;
   const records = [
     ...Array.from({ length: 1994 }, (_, index) => serialTimelineEvent(index + 1, {
       eventTime: `2026-07-14T08:00:40.${String(105001 + index).padStart(6, '0')}+00:00`,
@@ -3191,7 +3191,7 @@ test('serial mixed-format paging caps widened Dynamo raw work and reports trunca
     until: '2026-07-14T08:00:40.105000+00:00',
     limit,
   }, calls);
-  const maxExpectedQueries = Math.ceil((dynamoRawSourceCap + Math.min(limit, dynamoRawSourceCap)) / limit);
+  const maxExpectedQueries = Math.ceil((WATCH_DYNAMO_MAX_ROWS + Math.min(limit, WATCH_DYNAMO_MAX_ROWS)) / limit);
 
   assert.equal(timeline.truncated, true);
   assert.deepEqual(timeline.events.map(item => item.eventId), ['in-6', 'in-5', 'in-4', 'in-3', 'in-2', 'in-1']);

@@ -2845,6 +2845,7 @@ if (require.main === module) {
 module.exports = {
   OperatorError,
   TransientWatchError,
+  WATCH_DYNAMO_MAX_ROWS,
   buildWatchEntries,
   buildSerialEntries,
   buildFleetSummary,
