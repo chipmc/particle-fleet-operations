@@ -1195,6 +1195,23 @@ test('timeline HTTP returns the cross-format in-window collision row and uses wi
   }
 });
 
+test('timeline preserves a precise --until boundary instead of truncating the exact end instant', async () => {
+  const timeline = await fetchTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson([
+      serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.397Z', eventId: 'collision-z' }),
+      serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.397813+00:00', eventId: 'collision-offset' }),
+    ]),
+  }, 'device123', {
+    ...parseOptions(['--start', '2026-07-14T08:00:40.397Z', '--until', '2026-07-14T08:00:40.397813+00:00', 'device123']),
+    limit: 10,
+  });
+
+  assert.equal(timeline.end, '2026-07-14T08:00:40.397813Z');
+  assert.deepEqual(timeline.events.map(item => item.eventId), ['collision-offset', 'collision-z']);
+});
+
 test('validateStartSince rejects --start and --since together', () => {
   assert.throws(
     () => validateStartSince({ sinceMs: 3600000, startIso: '2026-08-05T10:00:00.000Z' }),
@@ -2790,6 +2807,220 @@ test('serial summary/truncation uses post-filter rows when widened fetch pulls i
     limit: 25,
   });
   assert.deepEqual(warnings, []);
+});
+
+test('serial mixed-format paging continues when a short filtered page still has more raw rows', async () => {
+  let calls = 0;
+  const seenExclusiveStartKeys = [];
+  const options = serialOptions({
+    sinceMs: 0,
+    startIso: '2026-07-14T08:00:40.600Z',
+    until: '2026-07-14T08:00:40.700Z',
+    limit: 2,
+  });
+  const state = createSerialState(options, new Date(options.until));
+  state.includeInitialTimeline = true;
+  const timeline = await fetchSerialTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: (_options, args) => {
+      calls += 1;
+      seenExclusiveStartKeys.push(args.includes('--exclusive-start-key'));
+      if (calls === 1) {
+        return {
+          Items: [
+            dynamoTimelineItem(serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.709000+00:00', eventId: 'spill-offset-9' })),
+            dynamoTimelineItem(serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.708Z', eventId: 'spill-z-8' })),
+            dynamoTimelineItem(serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.707000+00:00', eventId: 'spill-offset-7' })),
+            dynamoTimelineItem(serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.706Z', eventId: 'spill-z-6' })),
+            dynamoTimelineItem(serialTimelineEvent(5, { eventTime: '2026-07-14T08:00:40.705000+00:00', eventId: 'spill-offset-5' })),
+            dynamoTimelineItem(serialTimelineEvent(6, { eventTime: '2026-07-14T08:00:40.704Z', eventId: 'spill-z-4' })),
+            dynamoTimelineItem(serialTimelineEvent(7, { eventTime: '2026-07-14T08:00:40.703000+00:00', eventId: 'spill-offset-3' })),
+            dynamoTimelineItem(serialTimelineEvent(8, { eventTime: '2026-07-14T08:00:40.700Z', eventId: 'in-2' })),
+          ],
+          LastEvaluatedKey: { deviceId: { S: 'device123' }, eventTime: { S: '2026-07-14T08:00:40.700Z' } },
+        };
+      }
+      return {
+        Items: [
+          dynamoTimelineItem(serialTimelineEvent(9, { eventTime: '2026-07-14T08:00:40.650000+00:00', eventId: 'in-1' })),
+        ],
+      };
+    },
+  }, 'device123', state, options.until, options);
+
+  assert.equal(calls, 2);
+  assert.deepEqual(seenExclusiveStartKeys, [false, true]);
+  assert.deepEqual(timeline.events.map(item => item.eventId), ['in-2', 'in-1']);
+});
+
+test('serial mixed-format paging still advances when the widened raw page hits 2000 rows below the caller limit', async () => {
+  let calls = 0;
+  const options = serialOptions({
+    sinceMs: 0,
+    startIso: '2026-07-14T08:00:40.600Z',
+    until: '2026-07-14T08:00:40.700Z',
+    limit: 500,
+  });
+  const state = createSerialState(options, new Date(options.until));
+  state.includeInitialTimeline = true;
+  const spillItems = Array.from({ length: 2000 }, (_, index) => {
+    const eventTime = index < 299
+      ? `2026-07-14T08:00:40.${String(701 + index).padStart(3, '0')}Z`
+      : `2026-07-14T08:00:40.${String(700001 + (index - 299)).padStart(6, '0')}+00:00`;
+    return dynamoTimelineItem(serialTimelineEvent(index + 1, {
+      eventTime,
+      eventId: `spill-${index + 1}`,
+    }));
+  });
+  const timeline = await fetchSerialTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          Items: spillItems,
+          LastEvaluatedKey: { deviceId: { S: 'device123' }, eventTime: { S: '2026-07-14T08:00:40.000000+00:00' } },
+        };
+      }
+      return {
+        Items: [
+          dynamoTimelineItem(serialTimelineEvent(2001, { eventTime: '2026-07-14T08:00:40.650000+00:00', eventId: 'in-1' })),
+        ],
+      };
+    },
+  }, 'device123', state, options.until, options);
+
+  assert.equal(calls, 2);
+  assert.deepEqual(timeline.events.map(item => item.eventId), ['in-1']);
+});
+
+test('serial mixed-format paging still advances when the caller limit is exactly the 2000-row Dynamo cap', async () => {
+  let calls = 0;
+  const options = serialOptions({
+    sinceMs: 0,
+    startIso: '2026-07-14T08:00:40.600Z',
+    until: '2026-07-14T08:00:40.700Z',
+    limit: 2000,
+  });
+  const state = createSerialState(options, new Date(options.until));
+  state.includeInitialTimeline = true;
+  const spillItems = Array.from({ length: 2000 }, (_, index) => {
+    const eventTime = index < 299
+      ? `2026-07-14T08:00:40.${String(701 + index).padStart(3, '0')}Z`
+      : `2026-07-14T08:00:40.${String(700001 + (index - 299)).padStart(6, '0')}+00:00`;
+    return dynamoTimelineItem(serialTimelineEvent(index + 1, {
+      eventTime,
+      eventId: `spill-cap-${index + 1}`,
+    }));
+  });
+  const timeline = await fetchSerialTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          Items: spillItems,
+          LastEvaluatedKey: { deviceId: { S: 'device123' }, eventTime: { S: '2026-07-14T08:00:40.000000+00:00' } },
+        };
+      }
+      return {
+        Items: [
+          dynamoTimelineItem(serialTimelineEvent(2001, { eventTime: '2026-07-14T08:00:40.650000+00:00', eventId: 'in-cap' })),
+        ],
+      };
+    },
+  }, 'device123', state, options.until, options);
+
+  assert.equal(calls, 2);
+  assert.equal(timeline.truncated, false);
+  assert.deepEqual(timeline.events.map(item => item.eventId), ['in-cap']);
+});
+
+test('serial HTTP paging continues when a 1000-row widened page is full but filtered empty', async () => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        count: calls === 1 ? 1000 : 1,
+        events: calls === 1
+          ? Array.from({ length: 1000 }, (_, index) => serialTimelineEvent(index + 1, {
+            eventTime: `2026-07-14T08:00:40.${String(700001 + index).padStart(6, '0')}+00:00`,
+            eventId: `spill-${index + 1}`,
+          }))
+          : [serialTimelineEvent(1001, { eventTime: '2026-07-14T08:00:40.650000+00:00', eventId: 'in-1' })],
+      }),
+    };
+  };
+
+  try {
+    const options = serialOptions({
+      sinceMs: 0,
+      startIso: '2026-07-14T08:00:40.600Z',
+      until: '2026-07-14T08:00:40.700Z',
+      limit: 1000,
+    });
+    const state = createSerialState(options, new Date(options.until));
+    state.includeInitialTimeline = true;
+    const timeline = await fetchSerialTimeline({
+      webhookSecret: 'secret',
+      queryApiBaseUrl: 'https://query.example.test',
+    }, 'device123', state, options.until, options);
+
+    assert.equal(calls, 2);
+    assert.equal(timeline.truncated, false);
+    assert.deepEqual(timeline.events.map(item => item.eventId), ['in-1']);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('serial HTTP paging still advances when the caller limit is above the 1000-row HTTP cap', async () => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        count: calls === 1 ? 1000 : 1,
+        events: calls === 1
+          ? Array.from({ length: 1000 }, (_, index) => serialTimelineEvent(index + 1, {
+            eventTime: `2026-07-14T08:00:40.${String(700001 + index).padStart(6, '0')}+00:00`,
+            eventId: `spill-cap-${index + 1}`,
+          }))
+          : [serialTimelineEvent(1001, { eventTime: '2026-07-14T08:00:40.650000+00:00', eventId: 'in-cap' })],
+      }),
+    };
+  };
+
+  try {
+    const options = serialOptions({
+      sinceMs: 0,
+      startIso: '2026-07-14T08:00:40.600Z',
+      until: '2026-07-14T08:00:40.700Z',
+      limit: 1500,
+    });
+    const state = createSerialState(options, new Date(options.until));
+    state.includeInitialTimeline = true;
+    const timeline = await fetchSerialTimeline({
+      webhookSecret: 'secret',
+      queryApiBaseUrl: 'https://query.example.test',
+    }, 'device123', state, options.until, options);
+
+    assert.equal(calls, 2);
+    assert.equal(timeline.truncated, false);
+    assert.deepEqual(timeline.events.map(item => item.eventId), ['in-cap']);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 test('serial timeline fetch reports truncation for Dynamo windows above the 2000-row internal cap', async () => {
