@@ -2181,11 +2181,14 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
   const events = [];
   let pageEnd = end;
   let pageExclusiveStartKey = null;
+  let widenPageEnd = true;
   const visitedPageEnds = new Set();
   let truncated = false;
   const sourceCap = context.webhookSecret ? TIMELINE_HTTP_MAX_LIMIT : WATCH_DYNAMO_MAX_ROWS;
   const capApplies = limit >= sourceCap;
   const maxCollectedEvents = capApplies ? sourceCap + 1 : Number.POSITIVE_INFINITY;
+  const maxRawRows = sourceCap + Math.min(limit, sourceCap);
+  let rawRowsScanned = 0;
 
   while (true) {
     const visitKey = `${pageEnd}|${pageExclusiveStartKey ? JSON.stringify(pageExclusiveStartKey) : ''}`;
@@ -2200,10 +2203,17 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
       end: pageEnd,
       limit,
       exclusiveStartKey: pageExclusiveStartKey,
+      maxRows: Math.max(1, maxRawRows - rawRowsScanned),
+      widenEnd: widenPageEnd,
     });
     const pageEvents = page.events || [];
+    rawRowsScanned += page.rawCount || 0;
     events.push(...pageEvents);
     if (events.length >= maxCollectedEvents) {
+      truncated = true;
+      break;
+    }
+    if (rawRowsScanned >= maxRawRows && (page.nextPageEnd || page.nextExclusiveStartKey || page.truncated)) {
       truncated = true;
       break;
     }
@@ -2217,6 +2227,7 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
     if (oldest && compareEventToCursor(oldest, state.cursor) <= 0) break;
     pageEnd = page.nextPageEnd || pageEnd;
     pageExclusiveStartKey = page.nextExclusiveStartKey || null;
+    widenPageEnd = Boolean(pageExclusiveStartKey);
   }
 
   events.sort((left, right) => compareWatchEvents(right, left));
@@ -2227,7 +2238,12 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
 }
 
 async function fetchTimelinePage(context, deviceId, params) {
-  const widened = widenTimelineBounds(params.start, params.end);
+  const widened = {
+    start: floorIsoTimestampToLowSortSecond(params.start),
+    end: params.widenEnd === false
+      ? (normalizeIsoTimestamp(params.end) || params.end)
+      : ceilIsoTimestampToNextSecond(params.end),
+  };
   if (!context.webhookSecret) {
     const page = queryFilteredTimelinePageFromDynamo(
       context,
@@ -2236,7 +2252,7 @@ async function fetchTimelinePage(context, deviceId, params) {
       widened.end,
       {
         limit: Math.min(params.limit, WATCH_DYNAMO_MAX_ROWS),
-        maxRows: WATCH_DYNAMO_MAX_ROWS,
+        maxRows: Math.min(params.maxRows || WATCH_DYNAMO_MAX_ROWS, WATCH_DYNAMO_MAX_ROWS),
         filterRecord: record => isEventWithinExactWindow(record, params.start, params.end),
         exclusiveStartKey: params.exclusiveStartKey,
       }
@@ -2252,6 +2268,7 @@ async function fetchTimelinePage(context, deviceId, params) {
       count: events.length,
       events,
       limit: params.limit,
+      rawCount: page.rawRecords.length,
       truncated: page.moreAvailable || page.records.length > params.limit,
       nextPageEnd: page.moreAvailable ? params.end : null,
       nextExclusiveStartKey: page.lastEvaluatedKey,
@@ -2263,12 +2280,14 @@ async function fetchTimelinePage(context, deviceId, params) {
   let page;
   let filteredEvents = [];
   let rawPageMayContinue = false;
+  let rawEvents = [];
   do {
     page = await fetchTimelineHttpPage(context, deviceId, widened.start, widened.end, rawLimit);
-    filteredEvents = (page.events || [])
+    rawEvents = page.events || [];
+    filteredEvents = rawEvents
       .filter(event => isEventWithinExactWindow(event, params.start, params.end))
       .sort((left, right) => compareWatchEvents(right, left));
-    rawPageMayContinue = (page.events || []).length >= rawLimit;
+    rawPageMayContinue = rawEvents.length >= rawLimit;
     if (filteredEvents.length >= params.limit || !rawPageMayContinue || rawLimit >= TIMELINE_HTTP_MAX_LIMIT) break;
     rawLimit = Math.min(TIMELINE_HTTP_MAX_LIMIT, Math.max(rawLimit + 1, rawLimit * 2));
   } while (true);
@@ -2277,8 +2296,9 @@ async function fetchTimelinePage(context, deviceId, params) {
     ...page,
     count: events.length,
     events,
+    rawCount: rawEvents.length,
     truncated: filteredEvents.length > params.limit || rawPageMayContinue,
-    nextPageEnd: nextPageEndForFilteredTimelinePage(page.events || [], events, filteredEvents.length > params.limit || rawPageMayContinue, params.limit),
+    nextPageEnd: nextPageEndForFilteredTimelinePage(rawEvents, events, filteredEvents.length > params.limit || rawPageMayContinue, params.limit),
   };
 }
 

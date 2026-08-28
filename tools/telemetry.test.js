@@ -2842,8 +2842,8 @@ test('serial timeline fetch paginates API history pages', async () => {
 
     assert.equal(urls.length, 3);
     assert.deepEqual(timeline.events.map(item => item.eventId), ['newer', 'older']);
-    assert.match(urls[1], /end=2026-07-14T08%3A00%3A02\.000Z/);
-    assert.match(urls[2], /end=2026-07-14T08%3A00%3A01\.000Z/);
+    assert.match(urls[1], /end=2026-07-14T08%3A00%3A01\.999999999Z/);
+    assert.match(urls[2], /end=2026-07-14T08%3A00%3A00\.999999999Z/);
   } finally {
     global.fetch = originalFetch;
   }
@@ -3098,23 +3098,15 @@ test('serial mixed-format paging still advances when the caller limit is exactly
 
 test('serial HTTP paging continues when a 1000-row widened page is full but filtered empty', async () => {
   const originalFetch = global.fetch;
-  let calls = 0;
-  global.fetch = async () => {
-    calls += 1;
-    return {
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify({
-        count: calls === 1 ? 1000 : 1,
-        events: calls === 1
-          ? Array.from({ length: 1000 }, (_, index) => serialTimelineEvent(index + 1, {
-            eventTime: `2026-07-14T08:00:40.${String(700001 + index).padStart(6, '0')}+00:00`,
-            eventId: `spill-${index + 1}`,
-          }))
-          : [serialTimelineEvent(1001, { eventTime: '2026-07-14T08:00:40.650000+00:00', eventId: 'in-1' })],
-      }),
-    };
-  };
+  const calls = [];
+  const records = [
+    ...Array.from({ length: 1000 }, (_, index) => serialTimelineEvent(index + 1, {
+      eventTime: `2026-07-14T08:00:40.${String(700001 + index).padStart(6, '0')}+00:00`,
+      eventId: `spill-${index + 1}`,
+    })),
+    serialTimelineEvent(1001, { eventTime: '2026-07-14T08:00:40.650000+00:00', eventId: 'in-1' }),
+  ];
+  global.fetch = createTimelineHttpFetch(records, calls);
 
   try {
     const options = serialOptions({
@@ -3130,7 +3122,9 @@ test('serial HTTP paging continues when a 1000-row widened page is full but filt
       queryApiBaseUrl: 'https://query.example.test',
     }, 'device123', state, options.until, options);
 
-    assert.equal(calls, 2);
+    assert.equal(calls.length, 2);
+    assert.match(calls[0].search, /[?&]limit=1000(?:&|$)/);
+    assert.match(calls[1].search, /[?&]end=2026-07-14T08%3A00%3A40\.700000999Z(?:&|$)/);
     assert.equal(timeline.truncated, false);
     assert.deepEqual(timeline.events.map(item => item.eventId), ['in-1']);
   } finally {
@@ -3140,23 +3134,15 @@ test('serial HTTP paging continues when a 1000-row widened page is full but filt
 
 test('serial HTTP paging still advances when the caller limit is above the 1000-row HTTP cap', async () => {
   const originalFetch = global.fetch;
-  let calls = 0;
-  global.fetch = async () => {
-    calls += 1;
-    return {
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify({
-        count: calls === 1 ? 1000 : 1,
-        events: calls === 1
-          ? Array.from({ length: 1000 }, (_, index) => serialTimelineEvent(index + 1, {
-            eventTime: `2026-07-14T08:00:40.${String(700001 + index).padStart(6, '0')}+00:00`,
-            eventId: `spill-cap-${index + 1}`,
-          }))
-          : [serialTimelineEvent(1001, { eventTime: '2026-07-14T08:00:40.650000+00:00', eventId: 'in-cap' })],
-      }),
-    };
-  };
+  const calls = [];
+  const records = [
+    ...Array.from({ length: 1000 }, (_, index) => serialTimelineEvent(index + 1, {
+      eventTime: `2026-07-14T08:00:40.${String(700001 + index).padStart(6, '0')}+00:00`,
+      eventId: `spill-cap-${index + 1}`,
+    })),
+    serialTimelineEvent(1001, { eventTime: '2026-07-14T08:00:40.650000+00:00', eventId: 'in-cap' }),
+  ];
+  global.fetch = createTimelineHttpFetch(records, calls);
 
   try {
     const options = serialOptions({
@@ -3172,12 +3158,41 @@ test('serial HTTP paging still advances when the caller limit is above the 1000-
       queryApiBaseUrl: 'https://query.example.test',
     }, 'device123', state, options.until, options);
 
-    assert.equal(calls, 2);
+    assert.equal(calls.length, 2);
+    assert.match(calls[0].search, /[?&]limit=1000(?:&|$)/);
+    assert.match(calls[1].search, /[?&]end=2026-07-14T08%3A00%3A40\.700000999Z(?:&|$)/);
     assert.equal(timeline.truncated, false);
     assert.deepEqual(timeline.events.map(item => item.eventId), ['in-cap']);
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('serial mixed-format paging caps widened Dynamo raw work and reports truncation when the cap is hit', async () => {
+  const calls = [];
+  const records = [
+    ...Array.from({ length: 1994 }, (_, index) => serialTimelineEvent(index + 1, {
+      eventTime: `2026-07-14T08:00:40.${String(105001 + index).padStart(6, '0')}+00:00`,
+      eventId: `spill-${index + 1}`,
+    })),
+    ...Array.from({ length: 6 }, (_, index) => serialTimelineEvent(6000 + index, {
+      eventTime: `2026-07-14T08:00:40.${String(100000 + index).padStart(6, '0')}+00:00`,
+      eventId: `in-${index + 1}`,
+    })),
+    ...Array.from({ length: 3000 }, (_, index) => serialTimelineEvent(7000 + index, {
+      eventTime: `2026-07-14T08:00:40.${String(99999 - index).padStart(6, '0')}+00:00`,
+      eventId: `older-${index + 1}`,
+    })),
+  ];
+  const timeline = await fetchSerialWindow(records, {
+    startIso: '2026-07-14T08:00:40.100Z',
+    until: '2026-07-14T08:00:40.105000+00:00',
+    limit: 25,
+  }, calls);
+
+  assert.equal(timeline.truncated, true);
+  assert.deepEqual(timeline.events.map(item => item.eventId), ['in-6', 'in-5', 'in-4', 'in-3', 'in-2', 'in-1']);
+  assert.ok(calls.length <= 81, `expected capped Dynamo query work, saw ${calls.length} queries`);
 });
 
 test('serial timeline fetch reports truncation for Dynamo windows above the 2000-row internal cap', async () => {
