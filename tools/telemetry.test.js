@@ -3189,10 +3189,11 @@ test('serial mixed-format paging caps widened Dynamo raw work and reports trunca
     until: '2026-07-14T08:00:40.105000+00:00',
     limit: 25,
   }, calls);
+  const maxExpectedQueries = Math.ceil((2000 + 25) / 25);
 
   assert.equal(timeline.truncated, true);
   assert.deepEqual(timeline.events.map(item => item.eventId), ['in-6', 'in-5', 'in-4', 'in-3', 'in-2', 'in-1']);
-  assert.ok(calls.length <= 81, `expected capped Dynamo query work, saw ${calls.length} queries`);
+  assert.ok(calls.length <= maxExpectedQueries, `expected capped Dynamo query work, saw ${calls.length} queries`);
 });
 
 test('serial timeline fetch reports truncation for Dynamo windows above the 2000-row internal cap', async () => {
