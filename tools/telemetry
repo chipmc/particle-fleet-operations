@@ -2248,6 +2248,7 @@ async function fetchTimelinePage(context, deviceId, params) {
       count: events.length,
       events,
       limit: params.limit,
+      rawCount: page.rawRecords.length,
       truncated: page.moreAvailable || page.records.length > params.limit,
       nextPageEnd: page.moreAvailable ? params.end : null,
       nextExclusiveStartKey: page.lastEvaluatedKey,
@@ -2255,21 +2256,32 @@ async function fetchTimelinePage(context, deviceId, params) {
     };
   }
 
-  const rawLimit = Math.min(Math.max(params.limit + 1, params.limit * 4), TIMELINE_HTTP_MAX_LIMIT);
-  const page = await fetchTimelineHttpPage(context, deviceId, {
-    start: boundedQuery.queryStart,
-    end: boundedQuery.queryEnd,
-    limit: rawLimit,
-    requestedLimit: params.limit,
-  });
-  const filteredEvents = filterTimelineWindowEvents(page.events || [], params.start, params.end);
+  let rawLimit = Math.min(params.limit, TIMELINE_HTTP_MAX_LIMIT);
+  let page;
+  let filteredEvents = [];
+  let rawPageMayContinue = false;
+  let rawEvents = [];
+  do {
+    page = await fetchTimelineHttpPage(context, deviceId, {
+      start: boundedQuery.queryStart,
+      end: boundedQuery.queryEnd,
+      limit: rawLimit,
+      requestedLimit: params.limit,
+    });
+    rawEvents = page.events || [];
+    filteredEvents = filterTimelineWindowEvents(rawEvents, params.start, params.end);
+    rawPageMayContinue = rawEvents.length >= rawLimit;
+    if (filteredEvents.length >= params.limit || !rawPageMayContinue || rawLimit >= TIMELINE_HTTP_MAX_LIMIT) break;
+    rawLimit = Math.min(TIMELINE_HTTP_MAX_LIMIT, Math.max(rawLimit + 1, rawLimit * 2));
+  } while (true);
   const events = filteredEvents.slice(0, params.limit);
   return {
     ...page,
     count: events.length,
     events,
-    truncated: page.truncated || filteredEvents.length > params.limit,
-    nextPageEnd: nextPageEndForFilteredTimelinePage(page.events || [], events, page.truncated, params.limit),
+    rawCount: rawEvents.length,
+    truncated: filteredEvents.length > params.limit || rawPageMayContinue,
+    nextPageEnd: nextPageEndForFilteredTimelinePage(rawEvents, events, filteredEvents.length > params.limit || rawPageMayContinue, params.limit),
   };
 }
 
