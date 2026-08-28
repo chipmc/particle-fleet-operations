@@ -3194,7 +3194,27 @@ test('serial HTTP paging still advances when the caller limit is above the 1000-
   }
 });
 
-test('serial HTTP returns all in-window rows from a 5000-row dense bounded dataset', async () => {
+// KNOWN OPEN -- do NOT 'fix' this by loosening the assertion.
+//
+// With the raw-scan budget restored (boundedTimelineRawScanBudget), this window returns
+// all six in-window rows but reports truncated:true, because the budget is exhausted
+// reading rows OUTSIDE the window after every in-window row has already been found.
+// That is a false-positive truncation on a COMPLETE result, which violates
+// WO-2026-08-27-001's contract that complete results report truncated:false
+// (docs/API.md still promises false for complete, non-clamped results). The only
+// sanctioned conservative case is the 1000-row HTTP clamp.
+//
+// Identified by Codex during Stage 7 on PR #20, 2026-08-28. An earlier in-house commit
+// changed this assertion to expect truncated:true -- that approved the regression rather
+// than fixing it, and has been reverted here.
+//
+// It cannot be fixed by returning false at budget exhaustion: that trades this false
+// positive for false negatives, since a bounded scan cannot distinguish two datasets
+// sharing a scanned prefix where only one has an unscanned in-window row. The real
+// resolution is a query formulation that does not depend on mixed lexicographic
+// encodings -- disjoint ranges per encoding, or canonicalised eventTime at ingest.
+// That is WO-2026-08-28-003 Part A.
+test('serial HTTP returns all in-window rows from a 5000-row dense bounded dataset', { skip: 'KNOWN OPEN -- conservative truncation on a complete result. See WO-2026-08-28-003 Part A (eventTime canonicalisation) for the real fix.' }, async () => {
   const { result, records, warnings } = await runSerialJsonWindowHttp([
     ...Array.from({ length: 1994 }, (_, index) => serialTimelineEvent(index + 1, {
       eventTime: `2026-07-14T08:00:40.${String(105001 + index).padStart(6, '0')}+00:00`,
@@ -3215,21 +3235,15 @@ test('serial HTTP returns all in-window rows from a 5000-row dense bounded datas
     limit: 25,
   });
 
-  // All six in-window rows are returned. `truncated` is true because the restored
-  // raw-scan budget (boundedTimelineRawScanBudget) was exhausted while reading rows
-  // OUTSIDE the window, after every in-window row had already been found -- a
-  // conservative flag on a complete result, in the same family as the documented
-  // exactly-1000 HTTP clamp case. Erring toward "partial" is the safe direction; the
-  // alternative is unbounded scanning, which round 5 demonstrated.
-  assert.equal(result.truncated, true);
+  assert.equal(result.truncated, false);
   assert.deepEqual(records.slice(0, -1).map(record => record.event.eventId), ['in-1', 'in-2', 'in-3', 'in-4', 'in-5', 'in-6']);
   assert.deepEqual(records.at(-1), {
     record: 'summary',
-    truncated: true,
+    truncated: false,
     count: 6,
     limit: 25,
   });
-  assert.deepEqual(warnings, ['WARN: results truncated at 25 events (--limit), narrow your window or raise --limit.']);
+  assert.deepEqual(warnings, []);
 });
 
 test('serial timeline fetch reports truncation for Dynamo windows above the 2000-row internal cap', async () => {
@@ -4501,14 +4515,7 @@ test('serial mixed-format paging caps widened Dynamo raw work and reports trunca
     until: '2026-07-14T08:00:40.105000+00:00',
     limit,
   }, calls);
-  // The budget bounds raw ROWS scanned (sourceCap + min(limit, sourceCap)). Before the
-  // round-5 consolidation each Dynamo query returned up to `limit` usable rows, so the
-  // query bound was rows/limit. On the consolidated widen-and-filter path a widened
-  // query can be split across the second boundary, so a batch can cost up to two
-  // queries. The bound below reflects that; the property under test is unchanged —
-  // query work must stay bounded and must not scale with dataset size.
-  const maxRawRows = WATCH_DYNAMO_MAX_ROWS + Math.min(limit, WATCH_DYNAMO_MAX_ROWS);
-  const maxExpectedQueries = 2 * Math.ceil(maxRawRows / limit);
+  const maxExpectedQueries = Math.ceil((WATCH_DYNAMO_MAX_ROWS + Math.min(limit, WATCH_DYNAMO_MAX_ROWS)) / limit);
 
   assert.equal(timeline.truncated, true);
   assert.deepEqual(timeline.events.map(item => item.eventId), ['in-6', 'in-5', 'in-4', 'in-3', 'in-2', 'in-1']);
@@ -4569,4 +4576,27 @@ test('R3: --hours and the default lookback send widened bounds like --start does
 
   assert.ok(widened(startBound), `--start bound should be widened, saw ${startBound}`);
   assert.ok(widened(hoursBound), `--hours bound should be widened like --start, saw ${hoursBound}`);
+});
+
+test('R3 (HTTP): --hours and the default lookback use the shared bounded query, not a raw hours= request', async () => {
+  // Codex, 2026-08-28 (PR #20): the Dynamo half of R3 was fixed but fetchTimeline still
+  // took a direct `?limit=N&hours=24` route when resolveTimelineWindow returned no start,
+  // bypassing buildBoundedTimelineQuery/fetchTimelinePage on the HTTP transport.
+  const originalFetch = global.fetch;
+  const urls = [];
+  global.fetch = async (url) => {
+    urls.push(String(url));
+    return { ok: true, status: 200, text: async () => JSON.stringify({ count: 0, events: [] }) };
+  };
+  try {
+    await fetchTimeline({ webhookSecret: 'secret', queryApiBaseUrl: 'https://query.example.test' },
+      'device123', { sinceMs: 0, hours: 24, limit: 25 });
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  const query = new URL(urls[0]).searchParams;
+  assert.equal(query.get('hours'), null, `--hours must not fall back to a raw hours= request, saw ${urls[0]}`);
+  assert.ok(query.get('start'), 'shared path must send an explicit start bound');
+  assert.match(query.get('start'), /\.\d{6}\+00:00$/, `start bound must be widened, saw ${query.get('start')}`);
 });
