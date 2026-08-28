@@ -137,6 +137,16 @@ function fixedIso(offsetSeconds) {
   return new Date(Date.UTC(2026, 6, 14, 8, 0, offsetSeconds, 0)).toISOString();
 }
 
+function fixedZuluIso(offsetSeconds, milliseconds = 0) {
+  const date = new Date(Date.UTC(2026, 6, 14, 8, 0, offsetSeconds, milliseconds));
+  return `${date.toISOString().slice(0, 19)}.${String(milliseconds).padStart(3, '0')}Z`;
+}
+
+function fixedOffsetIso(offsetSeconds, microseconds = 0) {
+  const date = new Date(Date.UTC(2026, 6, 14, 8, 0, offsetSeconds, 0));
+  return `${date.toISOString().slice(0, 19)}.${String(microseconds).padStart(6, '0')}+00:00`;
+}
+
 function serialTimelineEvent(index, overrides = {}) {
   return event({
     deviceId: overrides.deviceId || 'device123',
@@ -153,6 +163,19 @@ function serialTimelineEvent(index, overrides = {}) {
 
 function serialTimelineEvents(count, overrides = {}) {
   return Array.from({ length: count }, (_, index) => serialTimelineEvent(index + 1, overrides));
+}
+
+function mixedFormatSerialTimelineEvents(count, overrides = {}) {
+  return Array.from({ length: count }, (_, index) => {
+    const pairSecond = Math.floor(index / 2) + 1;
+    const eventTime = index % 2 === 0
+      ? fixedZuluIso(pairSecond, 0)
+      : fixedOffsetIso(pairSecond, 500);
+    return serialTimelineEvent(index + 1, {
+      eventTime,
+      ...overrides,
+    });
+  });
 }
 
 function dynamoTimelineItem(record) {
@@ -205,6 +228,46 @@ function parseNdjson(output) {
     .split('\n')
     .filter(Boolean)
     .map(line => JSON.parse(line));
+}
+
+async function fetchSerialWindow(records, overrides = {}, calls = []) {
+  const options = serialOptions({
+    sinceMs: 0,
+    startIso: overrides.startIso || records[0].eventTime,
+    until: overrides.until || records.at(-1).eventTime,
+    limit: overrides.limit || 25,
+    ...overrides,
+  });
+  const state = createSerialState(options, new Date(options.until));
+  state.includeInitialTimeline = true;
+  return fetchSerialTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(records, calls),
+  }, 'device123', state, options.until, options);
+}
+
+async function runSerialJsonWindow(records, overrides = {}) {
+  const output = [];
+  const warnings = [];
+  const options = serialOptions({
+    sinceMs: 0,
+    startIso: overrides.startIso || records[0].eventTime,
+    until: overrides.until || records.at(-1).eventTime,
+    limit: overrides.limit || 25,
+    json: true,
+    ...overrides,
+  });
+  const result = await runSerialLoop({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(records),
+  }, { deviceId: 'device123' }, options, {
+    now: () => new Date(options.until),
+    write: line => output.push(line),
+    warn: message => warnings.push(message),
+  });
+  return { result, records: parseNdjson(output.join('\n')), warnings };
 }
 
 async function createTelemetryCliFixture(t, fixture) {
@@ -646,16 +709,16 @@ test('CLI exit codes distinguish truncated, complete, error, and ambiguous resul
   assert.match(ambiguous.stderr, /ERROR: Ambiguous device selector: Boron/);
 });
 
-test('serial CLI reports truncated grep no-match results with exit 3, summary record, and WARN', async (t) => {
+test('serial CLI reports complete grep no-match results after full boundary-safe fetch', async (t) => {
   const deviceId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
   const env = await createTelemetryCliFixture(t, {
     devices: [
       { deviceId, deviceName: 'Boron Alpha', projectId: 'generalized-core-counter' },
     ],
     events: [
-      serialTimelineEvent(1, { deviceId, eventId: 'event-1', s3Key: 's3/event-1', serialLogLine: 'alpha' }),
-      serialTimelineEvent(2, { deviceId, eventId: 'event-2', s3Key: 's3/event-2', serialLogLine: 'beta' }),
-      serialTimelineEvent(3, { deviceId, eventId: 'event-3', s3Key: 's3/event-3', serialLogLine: 'gamma' }),
+      serialTimelineEvent(1, { deviceId, eventId: 'event-1', s3Key: 's3/event-1', eventTime: fixedZuluIso(1, 0), serialLogLine: 'alpha' }),
+      serialTimelineEvent(2, { deviceId, eventId: 'event-2', s3Key: 's3/event-2', eventTime: fixedOffsetIso(1, 500), serialLogLine: 'beta' }),
+      serialTimelineEvent(3, { deviceId, eventId: 'event-3', s3Key: 's3/event-3', eventTime: fixedZuluIso(2, 0), serialLogLine: 'gamma' }),
     ],
   });
 
@@ -669,11 +732,11 @@ test('serial CLI reports truncated grep no-match results with exit 3, summary re
     '--json',
   ], env);
 
-  assert.equal(result.status, 3);
-  assert.equal(result.stderr.trim(), 'WARN: results truncated at 1 events (--limit), narrow your window or raise --limit.');
+  assert.equal(result.status, 0);
+  assert.equal(result.stderr.trim(), '');
   assert.deepEqual(parseNdjson(result.stdout), [{
     record: 'summary',
-    truncated: true,
+    truncated: false,
     count: 0,
     limit: 1,
   }]);
@@ -2570,11 +2633,128 @@ test('serial timeline fetch paginates API history pages', async () => {
 
     assert.equal(urls.length, 3);
     assert.deepEqual(timeline.events.map(item => item.eventId), ['newer', 'older']);
-    assert.match(urls[1], /end=2026-07-14T08%3A00%3A02\.000Z/);
-    assert.match(urls[2], /end=2026-07-14T08%3A00%3A01\.000Z/);
+    assert.match(urls[1], /end=2026-07-14T08%3A00%3A01\.999999999Z/);
+    assert.match(urls[2], /end=2026-07-14T08%3A00%3A00\.999999999Z/);
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('serial mixed-format --limit 1 fetches the whole window without duplicate rows', async () => {
+  const records = mixedFormatSerialTimelineEvents(10);
+  const calls = [];
+  const timeline = await fetchSerialWindow(records, { limit: 1 }, calls);
+
+  assert.equal(timeline.events.length, 10);
+  assert.equal(new Set(timeline.events.map(item => `${item.eventTime}:${item.eventId}`)).size, 10);
+  assert.ok(calls.length >= 10 && calls.length <= 11);
+});
+
+test('serial mixed-format query count stays within ceil(N / limit) ± 1 at limits 2, 5, and 25', async () => {
+  const records = mixedFormatSerialTimelineEvents(200);
+
+  for (const limit of [2, 5, 25]) {
+    const calls = [];
+    const timeline = await fetchSerialWindow(records, { limit }, calls);
+    const ideal = Math.ceil(records.length / limit);
+
+    assert.equal(timeline.events.length, records.length);
+    assert.ok(calls.length >= ideal && calls.length <= ideal + 1, `limit ${limit} expected ${ideal}..${ideal + 1} queries, saw ${calls.length}`);
+  }
+});
+
+test('serial mixed-format fetch returns each row once in one fetchWatchTimeline call', async () => {
+  const records = mixedFormatSerialTimelineEvents(26);
+  const timeline = await fetchSerialWindow(records, { limit: 5 });
+
+  assert.equal(timeline.events.length, 26);
+  assert.equal(new Set(timeline.events.map(item => `${item.eventTime}:${item.eventId}`)).size, 26);
+});
+
+test('serial mixed-format start boundary includes and excludes the collision row at the exact instant', async () => {
+  const records = [
+    serialTimelineEvent(1, { eventTime: fixedZuluIso(39, 999), eventId: 'before-z' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.397Z', eventId: 'collision-z' }),
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.397813+00:00', eventId: 'collision-offset' }),
+    serialTimelineEvent(4, { eventTime: fixedOffsetIso(40, 900000), eventId: 'after-offset' }),
+  ];
+
+  const inclusive = await fetchSerialWindow(records, {
+    startIso: '2026-07-14T08:00:40.397Z',
+    until: '2026-07-14T08:00:40.900000+00:00',
+    limit: 10,
+  });
+  assert.deepEqual(inclusive.events.map(item => item.eventId), ['after-offset', 'collision-offset', 'collision-z']);
+
+  const exclusiveOfEarlier = await fetchSerialWindow(records, {
+    startIso: '2026-07-14T08:00:40.397813Z',
+    until: '2026-07-14T08:00:40.900000+00:00',
+    limit: 10,
+  });
+  assert.deepEqual(exclusiveOfEarlier.events.map(item => item.eventId), ['after-offset', 'collision-offset']);
+});
+
+test('second-boundary instant, both :start flooring forms', async () => {
+  const records = [
+    serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:39.999Z', eventId: 'before-z' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.000Z', eventId: 'boundary-z' }),
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.000000+00:00', eventId: 'boundary-offset' }),
+    serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.000500+00:00', eventId: 'after-offset' }),
+  ];
+  const timeline = await fetchSerialWindow(records, {
+    startIso: '2026-07-14T08:00:40.000Z',
+    until: '2026-07-14T08:00:40.000500+00:00',
+    limit: 10,
+  });
+
+  assert.deepEqual(timeline.events.map(item => item.eventId), ['after-offset', 'boundary-z', 'boundary-offset']);
+
+  const naiveFloorStart = '2026-07-14T08:00:40.000Z';
+  const naiveWidenedEnd = '2026-07-14T08:00:41.000Z';
+  const naiveIds = records
+    .filter(record => record.eventTime >= naiveFloorStart && record.eventTime <= naiveWidenedEnd)
+    .sort((left, right) => right.eventTime.localeCompare(left.eventTime))
+    .map(record => record.eventId);
+
+  assert.deepEqual(naiveIds, ['boundary-z']);
+});
+
+test('serial summary/truncation uses post-filter rows when widened fetch pulls in out-of-window rows', async () => {
+  const output = [];
+  const warnings = [];
+  const options = serialOptions({
+    sinceMs: 0,
+    startIso: '2026-07-14T08:00:40.397Z',
+    until: '2026-07-14T08:00:40.397813Z',
+    limit: 25,
+    json: true,
+  });
+  const context = {
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson([
+      serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.396000+00:00', eventId: 'before-offset', serialLogLine: 'before' }),
+      serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.397Z', eventId: 'boundary-z', serialLogLine: 'boundary' }),
+      serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.397813+00:00', eventId: 'inside-offset', serialLogLine: 'inside' }),
+      serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.900000+00:00', eventId: 'after-offset', serialLogLine: 'after' }),
+    ]),
+  };
+
+  const result = await runSerialLoop(context, { deviceId: 'device123' }, options, {
+    write: line => output.push(line),
+    warn: message => warnings.push(message),
+  });
+
+  const records = parseNdjson(output.join('\n'));
+  assert.equal(result.truncated, false);
+  assert.deepEqual(records.slice(0, -1).map(record => record.event.eventId), ['boundary-z', 'inside-offset']);
+  assert.deepEqual(records.at(-1), {
+    record: 'summary',
+    truncated: false,
+    count: 2,
+    limit: 25,
+  });
+  assert.deepEqual(warnings, []);
 });
 
 test('serial timeline fetch reports truncation for Dynamo windows above the 2000-row internal cap', async () => {
@@ -2758,7 +2938,7 @@ test('serial JSON emits a trailing summary record when emission is capped', asyn
   });
 });
 
-test('serial --limit 1 --grep with no matches still reports fetch-side truncation', async () => {
+test('serial --limit 1 --grep with no matches stays complete after full window recovery', async () => {
   const warnings = [];
   const output = [];
   const options = serialOptions({
@@ -2773,9 +2953,9 @@ test('serial --limit 1 --grep with no matches still reports fetch-side truncatio
     options: {},
     logEventsTableName: 'events-table',
     awsJson: createPaginatedTimelineAwsJson([
-      serialTimelineEvent(1, { serialLogLine: 'alpha' }),
-      serialTimelineEvent(2, { serialLogLine: 'beta' }),
-      serialTimelineEvent(3, { serialLogLine: 'gamma' }),
+      serialTimelineEvent(1, { eventTime: fixedZuluIso(1, 0), serialLogLine: 'alpha' }),
+      serialTimelineEvent(2, { eventTime: fixedOffsetIso(1, 500), serialLogLine: 'beta' }),
+      serialTimelineEvent(3, { eventTime: fixedZuluIso(2, 0), serialLogLine: 'gamma' }),
     ]),
   };
 
@@ -2786,14 +2966,14 @@ test('serial --limit 1 --grep with no matches still reports fetch-side truncatio
   });
 
   const records = parseNdjson(output.join('\n'));
-  assert.equal(result.truncated, true);
+  assert.equal(result.truncated, false);
   assert.deepEqual(records, [{
     record: 'summary',
-    truncated: true,
+    truncated: false,
     count: 0,
     limit: 1,
   }]);
-  assert.deepEqual(warnings, ['WARN: results truncated at 1 events (--limit), narrow your window or raise --limit.']);
+  assert.deepEqual(warnings, []);
 });
 
 test('serial grep with a fully fetched window does not over-report truncation', async () => {
@@ -3114,6 +3294,68 @@ test('serial exact-limit complete window at 25 events does not truncate or emit 
   assert.deepEqual(warnings, []);
 });
 
+for (const limit of [2, 3, 5, 25, 100]) {
+  test(`serial mixed-format regression keeps an exact ${limit}-row window complete`, async () => {
+    const { result, records, warnings } = await runSerialJsonWindow(mixedFormatSerialTimelineEvents(limit), { limit });
+
+    assert.equal(result.truncated, false);
+    assert.equal(records.slice(0, -1).length, limit);
+    assert.equal(new Set(records.slice(0, -1).map(record => `${record.time}:${record.event.eventId}`)).size, limit);
+    assert.deepEqual(records.at(-1), {
+      record: 'summary',
+      truncated: false,
+      count: limit,
+      limit,
+    });
+    assert.deepEqual(warnings, []);
+  });
+}
+
+for (const count of [26, 200]) {
+  test(`serial mixed-format regression truncates a ${count}-row window at limit 25`, async () => {
+    const { result, records, warnings } = await runSerialJsonWindow(mixedFormatSerialTimelineEvents(count), { limit: 25 });
+
+    assert.equal(result.truncated, true);
+    assert.equal(records.slice(0, -1).length, 25);
+    assert.equal(new Set(records.slice(0, -1).map(record => `${record.time}:${record.event.eventId}`)).size, 25);
+    assert.deepEqual(records.at(-1), {
+      record: 'summary',
+      truncated: true,
+      count: 25,
+      limit: 25,
+    });
+    assert.deepEqual(warnings, ['WARN: results truncated at 25 events (--limit), narrow your window or raise --limit.']);
+  });
+}
+
+test('serial mixed-format regression truncates a 2500-row window at limit 3000 after the 2000-row cap', async () => {
+  const { result, records, warnings } = await runSerialJsonWindow(mixedFormatSerialTimelineEvents(2500), { limit: 3000 });
+
+  assert.equal(result.truncated, true);
+  assert.equal(records.slice(0, -1).length, 2000);
+  assert.deepEqual(records.at(-1), {
+    record: 'summary',
+    truncated: true,
+    count: 2000,
+    limit: 3000,
+  });
+  assert.deepEqual(warnings, ['WARN: results truncated at 3000 events (--limit), narrow your window or raise --limit.']);
+});
+
+test('serial mixed-format regression keeps a complete 2000-row window untruncated at limit 3000', async () => {
+  const { result, records, warnings } = await runSerialJsonWindow(mixedFormatSerialTimelineEvents(2000), { limit: 3000 });
+
+  assert.equal(result.truncated, false);
+  assert.equal(records.slice(0, -1).length, 2000);
+  assert.deepEqual(records.at(-1), {
+    record: 'summary',
+    truncated: false,
+    count: 2000,
+    limit: 3000,
+  });
+  assert.deepEqual(warnings, []);
+});
+
 test('serial --follow does not emit a summary record', async () => {
   const output = [];
   const controller = new AbortController();
@@ -3178,6 +3420,45 @@ test('serial --follow advances past shared event IDs without duplicating rows', 
   const records = parseNdjson(output.join('\n'));
   assert.deepEqual(records.map(record => record.line), ['first shared row', 'second shared row', 'next row']);
   assert.deepEqual(records.map(record => record.event.s3Key), ['s3/shared-11', 's3/shared-12', 's3/next-13']);
+});
+
+test('serial --follow emits each mixed-format row once as the cursor advances', async () => {
+  const output = [];
+  const controller = new AbortController();
+  let calls = 0;
+  let sleeps = 0;
+
+  await runSerialLoop({}, { deviceId: 'device123' }, serialOptions({ sinceMs: 0, follow: true, json: true }), {
+    signal: controller.signal,
+    now: () => new Date('2026-07-14T08:00:10.000Z'),
+    fetchTimeline: async () => {
+      calls += 1;
+      if (calls === 1) return { events: [] };
+      if (calls === 2) {
+        return {
+          events: [
+            serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.397Z', eventId: 'collision-z', serialLogLine: 'boundary z' }),
+            serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.397813+00:00', eventId: 'collision-offset', serialLogLine: 'boundary offset' }),
+          ],
+        };
+      }
+      return {
+        events: [
+          serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.397813+00:00', eventId: 'collision-offset', serialLogLine: 'boundary offset' }),
+          serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:41.000Z', eventId: 'next-z', serialLogLine: 'next z' }),
+        ],
+      };
+    },
+    write: line => output.push(line),
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps >= 3) controller.abort();
+    },
+  });
+
+  const records = parseNdjson(output.join('\n'));
+  assert.deepEqual(records.map(record => record.line), ['boundary z', 'boundary offset', 'next z']);
+  assert.deepEqual(records.map(record => record.event.eventId), ['collision-z', 'collision-offset', 'next-z']);
 });
 
 test('serial --since regression: existing --since behavior is unchanged', async () => {
@@ -3392,6 +3673,44 @@ test('watch retries transient API failures and recovers without losing cursor', 
   assert.equal(warnings.length, 0);
 });
 
+test('watch mixed-format follow emits each row once while the cursor advances semantically', async () => {
+  const output = [];
+  const controller = new AbortController();
+  let calls = 0;
+  let sleeps = 0;
+
+  await runWatchLoop({}, { deviceId: 'device123' }, watchOptions({ sinceMs: 60000, json: true }), {
+    signal: controller.signal,
+    now: () => new Date('2026-07-14T08:00:10.000Z'),
+    fetchTimeline: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          events: [
+            event({ eventTime: '2026-07-14T08:00:40.397Z', eventId: 'collision-z', s3Key: 'collision-z', eventName: 'serialLog', serialLogLine: 'boundary z' }),
+            event({ eventTime: '2026-07-14T08:00:40.397813+00:00', eventId: 'collision-offset', s3Key: 'collision-offset', eventName: 'serialLog', serialLogLine: 'boundary offset' }),
+          ],
+        };
+      }
+      return {
+        events: [
+          event({ eventTime: '2026-07-14T08:00:40.397813+00:00', eventId: 'collision-offset', s3Key: 'collision-offset', eventName: 'serialLog', serialLogLine: 'boundary offset' }),
+          event({ eventTime: '2026-07-14T08:00:41.000Z', eventId: 'next-z', s3Key: 'next-z', eventName: 'serialLog', serialLogLine: 'next z' }),
+        ],
+      };
+    },
+    loadCurrentState: async () => null,
+    write: line => output.push(line),
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps >= 2) controller.abort();
+    },
+  });
+
+  const records = output.map(line => JSON.parse(line));
+  assert.deepEqual(records.map(record => record.event.eventId), ['collision-z', 'collision-offset', 'next-z']);
+});
+
 test('watch exits cleanly when aborted during sleep', async () => {
   const controller = new AbortController();
   let sleeps = 0;
@@ -3518,7 +3837,7 @@ test('timeline --start/--until Dynamo path sends correct :start/:end expression 
   assert.equal(capturedExprValues[':end'].S, '2026-08-05T11:00:00.000Z');
 });
 
-test('serial --start/--until Dynamo path (via fetchTimelinePage) sends correct :start/:end expression values', async () => {
+test('serial --start/--until Dynamo path (via fetchTimelinePage) widens :start/:end defensively', async () => {
   let capturedExprValues;
   const context = {
     options: {},
@@ -3540,8 +3859,8 @@ test('serial --start/--until Dynamo path (via fetchTimelinePage) sends correct :
   await fetchSerialTimeline(context, 'device123', state, new Date('2026-08-05T11:00:00.000Z'), options);
 
   assert.ok(capturedExprValues, 'awsJson was called with expression-attribute-values');
-  assert.equal(capturedExprValues[':start'].S, '2026-08-05T10:00:00.000Z');
-  assert.equal(capturedExprValues[':end'].S, '2026-08-05T11:00:00.000Z');
+  assert.equal(capturedExprValues[':start'].S, '2026-08-05T10:00:00.000000+00:00');
+  assert.equal(capturedExprValues[':end'].S, '2026-08-05T11:00:01.000Z');
 });
 
 test('extractDeviceOsVersion resolves startup.deviceOS for schemaVersion 2 devices', () => {

@@ -30,6 +30,9 @@ const TRUNCATED_EXIT_CODE = 3;
 const WATCH_CURSOR_LOOKBACK_MS = 5 * 60 * 1000;
 const WATCH_LINE_MAX_LENGTH = 160;
 const DEVICE_ID_PATTERN = /^[a-fA-F0-9]{24}$/;
+const ISO_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/;
+const NS_PER_SECOND = 1000000000n;
+const NS_PER_MILLISECOND = 1000000n;
 const COMMANDS = new Set(['devices', 'device', 'timeline', 'watch', 'serial', 'fleet']);
 
 async function main() {
@@ -466,9 +469,98 @@ function parseDurationMs(value, option) {
 }
 
 function parseIsoTimestamp(value, option) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) fail(`${option} must be a valid ISO timestamp.`);
-  return date.toISOString();
+  const normalized = normalizeIsoTimestamp(value);
+  if (!normalized) fail(`${option} must be a valid ISO timestamp.`);
+  return normalized;
+}
+
+function normalizeIsoTimestamp(value) {
+  const parsed = parsePreciseInstant(value);
+  if (!parsed) return null;
+  return formatPreciseInstant(parsed.epochNs);
+}
+
+function parsePreciseInstant(value) {
+  const match = String(value || '').match(ISO_TIMESTAMP_PATTERN);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const fraction = match[7] || '';
+  const offsetToken = match[8];
+  const offsetSign = match[9] === '-' ? -1 : 1;
+  const offsetHours = Number(match[10] || 0);
+  const offsetMinutes = Number(match[11] || 0);
+  const baseMs = Date.UTC(year, month - 1, day, hour, minute, second);
+  const date = new Date(baseMs);
+  if (Number.isNaN(date.getTime())
+    || date.getUTCFullYear() !== year
+    || date.getUTCMonth() !== month - 1
+    || date.getUTCDate() !== day
+    || date.getUTCHours() !== hour
+    || date.getUTCMinutes() !== minute
+    || date.getUTCSeconds() !== second) {
+    return null;
+  }
+  const offsetTotalMinutes = offsetToken === 'Z' ? 0 : offsetSign * ((offsetHours * 60) + offsetMinutes);
+  const fractionNs = BigInt((fraction.padEnd(9, '0')).slice(0, 9) || '0');
+  return {
+    epochNs: (BigInt(baseMs) * NS_PER_MILLISECOND) - (BigInt(offsetTotalMinutes) * 60n * NS_PER_SECOND) + fractionNs,
+  };
+}
+
+function comparePreciseInstants(left, right) {
+  const leftParsed = parsePreciseInstant(left);
+  const rightParsed = parsePreciseInstant(right);
+  if (!leftParsed || !rightParsed) return String(left || '').localeCompare(String(right || ''));
+  if (leftParsed.epochNs < rightParsed.epochNs) return -1;
+  if (leftParsed.epochNs > rightParsed.epochNs) return 1;
+  return 0;
+}
+
+function preciseInstantToEpochSecond(epochNs) {
+  let seconds = epochNs / NS_PER_SECOND;
+  let remainder = epochNs % NS_PER_SECOND;
+  if (remainder < 0) {
+    seconds -= 1n;
+    remainder += NS_PER_SECOND;
+  }
+  return { seconds, remainder };
+}
+
+function formatPreciseInstant(epochNs) {
+  const { seconds, remainder } = preciseInstantToEpochSecond(epochNs);
+  const prefix = new Date(Number(seconds * 1000n)).toISOString().slice(0, 19);
+  const fraction = String(remainder).padStart(9, '0').replace(/0+$/, '');
+  return `${prefix}.${fraction.padEnd(Math.max(3, fraction.length), '0')}Z`;
+}
+
+function floorIsoTimestampToLowSortSecond(value) {
+  const parsed = parsePreciseInstant(value);
+  if (!parsed) return value;
+  const { seconds } = preciseInstantToEpochSecond(parsed.epochNs);
+  return `${new Date(Number(seconds * 1000n)).toISOString().slice(0, 19)}.000000+00:00`;
+}
+
+function ceilIsoTimestampToNextSecond(value) {
+  const parsed = parsePreciseInstant(value);
+  if (!parsed) return value;
+  const { seconds } = preciseInstantToEpochSecond(parsed.epochNs);
+  return `${new Date(Number((seconds + 1n) * 1000n)).toISOString().slice(0, 19)}.000Z`;
+}
+
+function previousIsoTimestamp(value) {
+  const parsed = parsePreciseInstant(value);
+  if (!parsed) return value;
+  return formatPreciseInstant(parsed.epochNs - 1n);
+}
+
+function isEventWithinExactWindow(event, start, end) {
+  return comparePreciseInstants(event.eventTime, start) >= 0
+    && comparePreciseInstants(event.eventTime, end) <= 0;
 }
 
 function formatDuration(ms) {
@@ -1883,7 +1975,8 @@ function createSerialState(options, now) {
 }
 
 async function fetchSerialTimeline(context, deviceId, state, now, options) {
-  return fetchWatchTimeline(context, deviceId, state, now, options.limit || DEFAULT_TIMELINE_LIMIT);
+  const effectiveNow = !state.initialized && options.until ? options.until : now;
+  return fetchWatchTimeline(context, deviceId, state, effectiveNow, options.limit || DEFAULT_TIMELINE_LIMIT);
 }
 
 function buildSerialEntries(events, state, options) {
@@ -1909,7 +2002,7 @@ function buildSerialEntries(events, state, options) {
   }
 
   state.initialized = true;
-  entries.sort((left, right) => String(left.time || '').localeCompare(String(right.time || '')) || watchEventId(left.event).localeCompare(watchEventId(right.event)));
+  entries.sort((left, right) => comparePreciseInstants(left.time, right.time) || watchEventId(left.event).localeCompare(watchEventId(right.event)));
   return entries;
 }
 
@@ -2019,27 +2112,27 @@ async function runWatchLoop(context, device, options, deps = {}) {
 }
 
 function createWatchState(options, now) {
-  let startMs;
+  let timelineStart;
   if (options.startIso) {
-    startMs = new Date(options.startIso).getTime();
+    timelineStart = options.startIso;
   } else if (options.sinceMs > 0) {
-    startMs = now.getTime() - options.sinceMs;
+    timelineStart = new Date(now.getTime() - options.sinceMs).toISOString();
   } else {
-    startMs = now.getTime() - WATCH_CURSOR_LOOKBACK_MS;
+    timelineStart = new Date(now.getTime() - WATCH_CURSOR_LOOKBACK_MS).toISOString();
   }
   return {
     initialized: false,
     includeInitialTimeline: options.sinceMs > 0,
     cursor: null,
     seenEventIds: new Set(),
-    timelineStart: new Date(startMs).toISOString(),
+    timelineStart,
     currentStateSnapshot: null,
   };
 }
 
 async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_TIMELINE_LIMIT) {
   const start = state.cursor ? state.cursor.eventTime : state.timelineStart;
-  const end = now.toISOString();
+  const end = typeof now === 'string' ? now : now.toISOString();
   const events = [];
   let pageEnd = end;
   const visitedPageEnds = new Set();
@@ -2065,7 +2158,7 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
 
     const oldest = [...pageEvents].sort(compareWatchEvents)[0];
     if (!oldest || compareEventToCursor(oldest, state.cursor) <= 0) break;
-    pageEnd = oldest.eventTime;
+    pageEnd = previousIsoTimestamp(oldest.eventTime);
   }
 
   return { events, truncated };
@@ -2073,18 +2166,37 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
 
 async function fetchTimelinePage(context, deviceId, params) {
   if (!context.webhookSecret) {
-    return queryTimelineFromDynamo(context, deviceId, {
-      startIso: params.start,
-      until: params.end,
+    const rawLimit = Math.min(Math.max(params.limit + 1, params.limit * 4), WATCH_DYNAMO_MAX_ROWS);
+    const page = queryFilteredTimelinePageFromDynamo(
+      context,
+      deviceId,
+      floorIsoTimestampToLowSortSecond(params.start),
+      ceilIsoTimestampToNextSecond(params.end),
+      {
+        limit: rawLimit,
+        filterRecord: record => isEventWithinExactWindow(record, params.start, params.end),
+      }
+    );
+    const events = [...page.records]
+      .sort((left, right) => compareWatchEvents(right, left))
+      .slice(0, params.limit)
+      .map(formatTimelineRecord);
+    return {
+      deviceId,
+      start: params.start,
+      end: params.end,
+      count: events.length,
+      events,
       limit: params.limit,
-      allowEmpty: true,
-    });
+      truncated: page.moreAvailable || page.records.length > params.limit,
+      source: 'dynamodb',
+    };
   }
 
   const query = new URLSearchParams({
     start: params.start,
     end: params.end,
-    limit: String(Math.min(params.limit, TIMELINE_HTTP_MAX_LIMIT)),
+    limit: String(Math.min(Math.max(params.limit + 1, params.limit * 4), TIMELINE_HTTP_MAX_LIMIT)),
   });
   const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${query.toString()}`;
   let response;
@@ -2113,7 +2225,62 @@ async function fetchTimelinePage(context, deviceId, params) {
     fail(message);
   }
 
-  return annotateTimelineHttpPagePayload(payload, params.limit);
+  const page = annotateTimelineHttpPagePayload(payload, params.limit);
+  const events = (page.events || [])
+    .filter(event => isEventWithinExactWindow(event, params.start, params.end))
+    .sort((left, right) => compareWatchEvents(right, left));
+  return {
+    ...page,
+    count: Math.min(events.length, params.limit),
+    events: events.slice(0, params.limit),
+    truncated: page.truncated || events.length > params.limit,
+  };
+}
+
+function queryFilteredTimelinePageFromDynamo(context, deviceId, start, end, options) {
+  const readAwsJson = context.awsJson || awsJson;
+  const records = [];
+  let rawScanned = 0;
+  let exclusiveStartKey;
+
+  do {
+    const args = [
+      'dynamodb', 'query',
+      '--table-name', context.logEventsTableName,
+      '--key-condition-expression', 'deviceId = :deviceId AND eventTime BETWEEN :start AND :end',
+      '--expression-attribute-values', JSON.stringify({
+        ':deviceId': { S: deviceId },
+        ':start': { S: start },
+        ':end': { S: end },
+      }),
+      '--no-scan-index-forward',
+      '--limit', String(Math.min(options.limit - rawScanned, WATCH_DYNAMO_PAGE_LIMIT)),
+    ];
+    if (exclusiveStartKey) args.push('--exclusive-start-key', JSON.stringify(exclusiveStartKey));
+
+    const page = readAwsJson(context.options, args, {
+      operation: 'dynamodb query timeline',
+      tableName: context.logEventsTableName,
+      deviceId,
+      pagination: true,
+    });
+    const pageRecords = (page.Items || []).map(unmarshall);
+    rawScanned += pageRecords.length;
+    records.push(...(options.filterRecord ? pageRecords.filter(options.filterRecord) : pageRecords));
+    exclusiveStartKey = page.LastEvaluatedKey;
+
+    if (rawScanned >= options.limit) {
+      return {
+        records,
+        moreAvailable: Boolean(exclusiveStartKey),
+      };
+    }
+  } while (exclusiveStartKey);
+
+  return {
+    records,
+    moreAvailable: false,
+  };
 }
 
 function loadDeviceCurrentState(context, deviceId) {
@@ -2149,7 +2316,7 @@ function buildWatchEntries(events, currentState, state, options) {
 
     state.currentStateSnapshot = snapshotCurrentState(currentState);
     state.initialized = true;
-    entries.sort((left, right) => left.time.localeCompare(right.time) || left.category.localeCompare(right.category));
+    entries.sort((left, right) => comparePreciseInstants(left.time, right.time) || left.category.localeCompare(right.category));
     return entries;
   }
 
@@ -2164,7 +2331,7 @@ function buildWatchEntries(events, currentState, state, options) {
   }
   state.currentStateSnapshot = snapshotCurrentState(currentState);
 
-  entries.sort((left, right) => left.time.localeCompare(right.time) || left.category.localeCompare(right.category));
+  entries.sort((left, right) => comparePreciseInstants(left.time, right.time) || left.category.localeCompare(right.category));
   return entries;
 }
 
@@ -2183,13 +2350,13 @@ function markWatchEventSeen(state, event) {
 
 function compareEventToCursor(event, cursor) {
   if (!cursor) return 1;
-  const timeCompare = String(event.eventTime || '').localeCompare(cursor.eventTime);
+  const timeCompare = comparePreciseInstants(event.eventTime, cursor.eventTime);
   if (timeCompare !== 0) return timeCompare;
   return watchEventId(event).localeCompare(cursor.id);
 }
 
 function compareWatchEvents(left, right) {
-  return String(left.eventTime || '').localeCompare(String(right.eventTime || '')) || watchEventId(left).localeCompare(watchEventId(right));
+  return comparePreciseInstants(left.eventTime, right.eventTime) || watchEventId(left).localeCompare(watchEventId(right));
 }
 
 function watchEventId(event) {
