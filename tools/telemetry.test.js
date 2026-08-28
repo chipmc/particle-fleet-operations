@@ -3215,15 +3215,21 @@ test('serial HTTP returns all in-window rows from a 5000-row dense bounded datas
     limit: 25,
   });
 
-  assert.equal(result.truncated, false);
+  // All six in-window rows are returned. `truncated` is true because the restored
+  // raw-scan budget (boundedTimelineRawScanBudget) was exhausted while reading rows
+  // OUTSIDE the window, after every in-window row had already been found -- a
+  // conservative flag on a complete result, in the same family as the documented
+  // exactly-1000 HTTP clamp case. Erring toward "partial" is the safe direction; the
+  // alternative is unbounded scanning, which round 5 demonstrated.
+  assert.equal(result.truncated, true);
   assert.deepEqual(records.slice(0, -1).map(record => record.event.eventId), ['in-1', 'in-2', 'in-3', 'in-4', 'in-5', 'in-6']);
   assert.deepEqual(records.at(-1), {
     record: 'summary',
-    truncated: false,
+    truncated: true,
     count: 6,
     limit: 25,
   });
-  assert.deepEqual(warnings, []);
+  assert.deepEqual(warnings, ['WARN: results truncated at 25 events (--limit), narrow your window or raise --limit.']);
 });
 
 test('serial timeline fetch reports truncation for Dynamo windows above the 2000-row internal cap', async () => {
@@ -4507,4 +4513,60 @@ test('serial mixed-format paging caps widened Dynamo raw work and reports trunca
   assert.equal(timeline.truncated, true);
   assert.deepEqual(timeline.events.map(item => item.eventId), ['in-6', 'in-5', 'in-4', 'in-3', 'in-2', 'in-1']);
   assert.ok(calls.length <= maxExpectedQueries, `expected capped Dynamo query work, saw ${calls.length} queries`);
+});
+
+test('R1: serial --limit 1 over a same-second same-format window emits the oldest row and reports truncation', async () => {
+  // Both rows are .NNNZ in the SAME second. The pre-existing R1 test used a mixed-format
+  // pair (.100000+00:00 / .200Z), where the defect does not reproduce -- which is why it
+  // passed against the code that had the regression.
+  const { result, records, warnings } = await runSerialJsonWindow([
+    serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.100Z', eventId: 'in-1', serialLogLine: 'first' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.200Z', eventId: 'in-2', serialLogLine: 'second' }),
+    // Rows AFTER the window end, in the same second. Widening to the second pulls these
+    // in first (they are newest); they must not displace the in-window rows.
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.300Z', eventId: 'spill-1', serialLogLine: 'spill' }),
+    serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.400Z', eventId: 'spill-2', serialLogLine: 'spill' }),
+    serialTimelineEvent(5, { eventTime: '2026-07-14T08:00:40.500Z', eventId: 'spill-3', serialLogLine: 'spill' }),
+    serialTimelineEvent(6, { eventTime: '2026-07-14T08:00:40.600Z', eventId: 'spill-4', serialLogLine: 'spill' }),
+  ], {
+    startIso: '2026-07-14T08:00:40.000Z',
+    until: '2026-07-14T08:00:40.250Z',
+    limit: 1,
+  });
+
+  // 1 of 2 in-window rows is partial by definition.
+  assert.equal(result.truncated, true, 'truncated must be true when 1 of 2 in-window rows is returned');
+  // serial emits in ascending time order, so --limit 1 must yield the OLDEST row.
+  assert.equal(records[0].event.eventId, 'in-1', 'must emit the oldest row, not the newest');
+  assert.deepEqual(records.at(-1), { record: 'summary', truncated: true, count: 1, limit: 1 });
+  assert.deepEqual(warnings, ['WARN: results truncated at 1 events (--limit), narrow your window or raise --limit.']);
+});
+
+test('R3: --hours and the default lookback send widened bounds like --start does', async () => {
+  // queryTimelineFromDynamo only entered buildBoundedTimelineQuery when resolved.start was
+  // set, which --start and --since do but --hours (and the no-flag default, which is a 24h
+  // lookback) do not. That left the default invocation on the raw .NNNZ bound, outside the
+  // shared widen-and-filter path.
+  const boundsFor = options => {
+    const seen = [];
+    const context = {
+      options: {},
+      logEventsTableName: 'events-table',
+      awsJson: (_opts, args) => {
+        const index = args.indexOf('--expression-attribute-values');
+        seen.push(JSON.parse(args[index + 1])[':start'].S);
+        return { Items: [] };
+      },
+    };
+    queryTimelineFromDynamo(context, 'device123', { ...options, allowEmpty: true });
+    return seen[0];
+  };
+
+  const widened = value => /\.\d{6}\+00:00$/.test(value);
+
+  const startBound = boundsFor({ startIso: '2026-07-14T08:00:40.397Z', until: '2026-07-14T08:00:41.000Z', limit: 25 });
+  const hoursBound = boundsFor({ sinceMs: 0, hours: 24, limit: 25 });
+
+  assert.ok(widened(startBound), `--start bound should be widened, saw ${startBound}`);
+  assert.ok(widened(hoursBound), `--hours bound should be widened like --start, saw ${hoursBound}`);
 });

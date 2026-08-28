@@ -938,17 +938,15 @@ function queryTimelineFromDynamo(context, deviceId, options) {
   const queryLimit = options.probeForTruncation ? requestedLimit + 1 : requestedLimit;
   const exactStart = resolved.start || start.toISOString();
   const exactEnd = resolved.end || end.toISOString();
-  const boundedQuery = resolved.start ? buildBoundedTimelineQuery(exactStart, exactEnd, { widenStart: true }) : null;
-  const timelineRecords = boundedQuery
-    ? queryFilteredTimelineRecordsFromDynamo(context, deviceId, boundedQuery.queryStart, boundedQuery.queryEnd, {
-      ...options,
-      limit: queryLimit,
-      filterRecord: record => isEventWithinExactWindow(record, exactStart, exactEnd),
-    })
-    : queryTimelineRecordsFromDynamo(context, deviceId, exactStart, exactEnd, {
-      ...options,
-      limit: queryLimit,
-    });
+  // Every window shape -- --start, --since, --hours and the default lookback -- goes
+  // through the one shared widen-and-filter path. Gating this on `resolved.start` left
+  // --hours and the no-flag default on raw .NNNZ bounds, outside the shared path.
+  const boundedQuery = buildBoundedTimelineQuery(exactStart, exactEnd, { widenStart: true });
+  const timelineRecords = queryFilteredTimelineRecordsFromDynamo(context, deviceId, boundedQuery.queryStart, boundedQuery.queryEnd, {
+    ...options,
+    limit: queryLimit,
+    filterRecord: record => isEventWithinExactWindow(record, exactStart, exactEnd),
+  });
   const records = timelineRecords.records;
   const trimmedRecords = [...records]
     .sort((left, right) => compareWatchEvents(right, left))
