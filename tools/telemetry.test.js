@@ -137,13 +137,13 @@ function fixedIso(offsetSeconds) {
   return new Date(Date.UTC(2026, 6, 14, 8, 0, offsetSeconds, 0)).toISOString();
 }
 
-function fixedZuluIso(offsetSeconds, milliseconds = 0) {
-  const date = new Date(Date.UTC(2026, 6, 14, 8, 0, offsetSeconds, milliseconds));
+function fixedZuluIso(second, milliseconds = 0) {
+  const date = new Date(Date.UTC(2026, 6, 14, 8, 0, second, milliseconds));
   return `${date.toISOString().slice(0, 19)}.${String(milliseconds).padStart(3, '0')}Z`;
 }
 
-function fixedOffsetIso(offsetSeconds, microseconds = 0) {
-  const date = new Date(Date.UTC(2026, 6, 14, 8, 0, offsetSeconds, 0));
+function fixedOffsetIso(second, microseconds = 0) {
+  const date = new Date(Date.UTC(2026, 6, 14, 8, 0, second, 0));
   return `${date.toISOString().slice(0, 19)}.${String(microseconds).padStart(6, '0')}+00:00`;
 }
 

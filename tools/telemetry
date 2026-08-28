@@ -2226,14 +2226,15 @@ async function fetchTimelinePage(context, deviceId, params) {
   }
 
   const page = annotateTimelineHttpPagePayload(payload, params.limit);
-  const events = (page.events || [])
+  const filteredEvents = (page.events || [])
     .filter(event => isEventWithinExactWindow(event, params.start, params.end))
     .sort((left, right) => compareWatchEvents(right, left));
+  const events = filteredEvents.slice(0, params.limit);
   return {
     ...page,
-    count: Math.min(events.length, params.limit),
-    events: events.slice(0, params.limit),
-    truncated: page.truncated || events.length > params.limit,
+    count: events.length,
+    events,
+    truncated: page.truncated || filteredEvents.length > params.limit,
   };
 }
 
