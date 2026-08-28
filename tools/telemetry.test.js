@@ -897,7 +897,7 @@ test('timeline --start sends start/end params instead of hours', async () => {
   }
 });
 
-test('timeline --start + --until sends both bounds', async () => {
+test('timeline --start + --until widens HTTP bounds defensively', async () => {
   const originalFetch = global.fetch;
   let requestedUrl = '';
   global.fetch = async (url) => {
@@ -914,8 +914,8 @@ test('timeline --start + --until sends both bounds', async () => {
       ...parseOptions(['--start', '2026-08-05T10:00:00.000Z', '--until', '2026-08-05T11:00:00.000Z', 'Boron-Dev-09']),
       limit: 25,
     });
-    assert.match(requestedUrl, /[?&]start=2026-08-05T10/);
-    assert.match(requestedUrl, /[?&]end=2026-08-05T11/);
+    assert.match(requestedUrl, /[?&]start=2026-08-05T10%3A00%3A00\.000000%2B00%3A00/);
+    assert.match(requestedUrl, /[?&]end=2026-08-05T11%3A00%3A01\.000Z/);
     assert.doesNotMatch(requestedUrl, /[?&]hours=/);
   } finally {
     global.fetch = originalFetch;
@@ -1090,7 +1090,7 @@ test('timeline HTTP requests limit plus one and injects truncation into the trim
     assert.equal(timeline.count, 5);
     assert.equal(timeline.limit, 5);
     assert.equal(timeline.truncated, true);
-    assert.deepEqual(timeline.events.map(item => item.eventId), ['event-1', 'event-2', 'event-3', 'event-4', 'event-5']);
+    assert.deepEqual(timeline.events.map(item => item.eventId), ['event-6', 'event-5', 'event-4', 'event-3', 'event-2']);
   } finally {
     global.fetch = originalFetch;
   }
@@ -1155,6 +1155,41 @@ test('timeline HTTP reports truncation for requested limits above the 1000-event
     assert.equal(timeline.count, 1000);
     assert.equal(timeline.limit, 1001);
     assert.equal(timeline.truncated, true);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('timeline HTTP returns the cross-format in-window collision row and uses widened query bounds', async () => {
+  const originalFetch = global.fetch;
+  let requestedUrl = '';
+  global.fetch = async (url) => {
+    requestedUrl = String(url);
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        deviceId: 'device123',
+        count: 4,
+        events: [
+          serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.900000+00:00', eventId: 'after-offset' }),
+          serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.397813+00:00', eventId: 'collision-offset' }),
+          serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.397Z', eventId: 'collision-z' }),
+          serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.396000+00:00', eventId: 'before-offset' }),
+        ],
+      }),
+    };
+  };
+
+  try {
+    const timeline = await fetchTimeline({ webhookSecret: 'secret', queryApiBaseUrl: 'https://query.example.test' }, 'device123', {
+      ...parseOptions(['--start', '2026-07-14T08:00:40.397Z', '--until', '2026-07-14T08:00:40.900000+00:00', 'device123']),
+      limit: 10,
+    });
+
+    assert.match(requestedUrl, /[?&]start=2026-07-14T08%3A00%3A40\.000000%2B00%3A00/);
+    assert.match(requestedUrl, /[?&]end=2026-07-14T08%3A00%3A41\.000Z/);
+    assert.deepEqual(timeline.events.map(item => item.eventId), ['after-offset', 'collision-offset', 'collision-z']);
   } finally {
     global.fetch = originalFetch;
   }
@@ -3812,7 +3847,7 @@ test('Dynamo fallback treats empty quiet polls as valid when allowed', () => {
   assert.deepEqual(timeline.events, []);
 });
 
-test('timeline --start/--until Dynamo path sends correct :start/:end expression values', () => {
+test('timeline --start/--until Dynamo path widens query bounds but preserves the exact envelope bounds', () => {
   let capturedExprValues;
   const context = {
     options: {},
@@ -3830,11 +3865,33 @@ test('timeline --start/--until Dynamo path sends correct :start/:end expression 
     allowEmpty: true,
   };
 
-  queryTimelineFromDynamo(context, 'device123', options);
+  const timeline = queryTimelineFromDynamo(context, 'device123', options);
 
   assert.ok(capturedExprValues, 'awsJson was called with expression-attribute-values');
-  assert.equal(capturedExprValues[':start'].S, '2026-08-05T10:00:00.000Z');
-  assert.equal(capturedExprValues[':end'].S, '2026-08-05T11:00:00.000Z');
+  assert.equal(capturedExprValues[':start'].S, '2026-08-05T10:00:00.000000+00:00');
+  assert.equal(capturedExprValues[':end'].S, '2026-08-05T11:00:01.000Z');
+  assert.equal(timeline.start, '2026-08-05T10:00:00.000Z');
+  assert.equal(timeline.end, '2026-08-05T11:00:00.000Z');
+});
+
+test('timeline Dynamo returns the cross-format in-window collision row', () => {
+  const timeline = queryTimelineFromDynamo({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson([
+      serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.396000+00:00', eventId: 'before-offset' }),
+      serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.397Z', eventId: 'collision-z' }),
+      serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.397813+00:00', eventId: 'collision-offset' }),
+      serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.900000+00:00', eventId: 'after-offset' }),
+    ]),
+  }, 'device123', {
+    ...parseOptions(['--start', '2026-07-14T08:00:40.397Z', '--until', '2026-07-14T08:00:40.900000+00:00', 'device123']),
+    limit: 10,
+  });
+
+  assert.equal(timeline.start, '2026-07-14T08:00:40.397Z');
+  assert.equal(timeline.end, '2026-07-14T08:00:40.900Z');
+  assert.deepEqual(timeline.events.map(item => item.eventId), ['after-offset', 'collision-offset', 'collision-z']);
 });
 
 test('serial --start/--until Dynamo path (via fetchTimelinePage) widens :start/:end defensively', async () => {
