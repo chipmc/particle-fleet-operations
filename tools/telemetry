@@ -560,6 +560,10 @@ function widenTimelineBounds(start, end) {
   };
 }
 
+function boundedTimelineRawScanBudget(sourceCap, limit) {
+  return sourceCap + Math.min(limit, sourceCap);
+}
+
 function previousIsoTimestamp(value) {
   const parsed = parsePreciseInstant(value);
   if (!parsed) return value;
@@ -2187,7 +2191,7 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
   const sourceCap = context.webhookSecret ? TIMELINE_HTTP_MAX_LIMIT : WATCH_DYNAMO_MAX_ROWS;
   const capApplies = limit >= sourceCap;
   const maxCollectedEvents = capApplies ? sourceCap + 1 : Number.POSITIVE_INFINITY;
-  const maxRawRows = sourceCap + Math.min(limit, sourceCap);
+  const maxRawRows = boundedTimelineRawScanBudget(sourceCap, limit);
   let rawRowsScanned = 0;
 
   while (true) {
@@ -2238,9 +2242,10 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
 }
 
 async function fetchTimelinePage(context, deviceId, params) {
+  const widenEnd = params.widenEnd !== false;
   const widened = {
     start: floorIsoTimestampToLowSortSecond(params.start),
-    end: params.widenEnd === false
+    end: !widenEnd
       ? (normalizeIsoTimestamp(params.end) || params.end)
       : ceilIsoTimestampToNextSecond(params.end),
   };
