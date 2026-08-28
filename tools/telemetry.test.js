@@ -270,6 +270,28 @@ async function fetchSerialWindow(records, overrides = {}, calls = []) {
   }, 'device123', state, options.until, options);
 }
 
+async function fetchSerialWindowHttp(records, overrides = {}, calls = []) {
+  const originalFetch = global.fetch;
+  global.fetch = createTimelineHttpFetch(records, calls);
+  try {
+    const options = serialOptions({
+      sinceMs: 0,
+      startIso: overrides.startIso || records[0].eventTime,
+      until: overrides.until || records.at(-1).eventTime,
+      limit: overrides.limit || 25,
+      ...overrides,
+    });
+    const state = createSerialState(options, new Date(options.until));
+    state.includeInitialTimeline = true;
+    return await fetchSerialTimeline({
+      webhookSecret: 'secret',
+      queryApiBaseUrl: 'https://query.example.test',
+    }, 'device123', state, options.until, options);
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
 async function runSerialJsonWindow(records, overrides = {}) {
   const output = [];
   const warnings = [];
@@ -291,6 +313,34 @@ async function runSerialJsonWindow(records, overrides = {}) {
     warn: message => warnings.push(message),
   });
   return { result, records: parseNdjson(output.join('\n')), warnings };
+}
+
+async function runSerialJsonWindowHttp(records, overrides = {}, calls = []) {
+  const originalFetch = global.fetch;
+  global.fetch = createTimelineHttpFetch(records, calls);
+  try {
+    const output = [];
+    const warnings = [];
+    const options = serialOptions({
+      sinceMs: 0,
+      startIso: overrides.startIso || records[0].eventTime,
+      until: overrides.until || records.at(-1).eventTime,
+      limit: overrides.limit || 25,
+      json: true,
+      ...overrides,
+    });
+    const result = await runSerialLoop({
+      webhookSecret: 'secret',
+      queryApiBaseUrl: 'https://query.example.test',
+    }, { deviceId: 'device123' }, options, {
+      now: () => new Date(options.until),
+      write: line => output.push(line),
+      warn: message => warnings.push(message),
+    });
+    return { result, records: parseNdjson(output.join('\n')), warnings };
+  } finally {
+    global.fetch = originalFetch;
+  }
 }
 
 async function createTelemetryCliFixture(t, fixture) {
@@ -767,10 +817,13 @@ test('serial CLI reports complete grep no-match results after full boundary-safe
 
 test('Particle-resolved name works for device selector resolution', async () => {
   const originalFetch = global.fetch;
-  global.fetch = async () => ({
-    ok: true,
-    json: async () => ({ name: 'Boron-Dev-09' }),
-  });
+  global.fetch = async (url) => {
+    assert.equal(String(url), 'https://particle.example.test/v1/devices/e00fce68399ee6244a963935');
+    return {
+      ok: true,
+      json: async () => ({ name: 'Boron-Dev-09' }),
+    };
+  };
 
   try {
     const devices = [{
@@ -860,6 +913,28 @@ test('serial option parsing supports since, until, follow, collector, grep, json
   assert.equal(options.json, true);
   assert.equal(options.raw, true);
   assert.equal(options.limit, 7);
+});
+
+test('CLI rejects invalid ISO timezone offsets for --start', () => {
+  for (const value of [
+    '2026-07-14T08:00:00.000+00:60',
+    '2026-07-14T08:00:00.000+24:00',
+    '2026-07-14T08:00:00.000+99:99',
+  ]) {
+    const result = runTelemetry(['timeline', '--start', value, 'Boron-Dev-09']);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /--start must be a valid ISO timestamp/);
+  }
+});
+
+test('valid ISO timezone offsets remain accepted', () => {
+  const positive = parseOptions(['--start', '2026-07-14T08:00:00.000+00:00', 'device123']);
+  const negative = parseOptions(['--start', '2026-07-14T08:00:00.000-05:00', 'device123']);
+  const zulu = parseOptions(['--start', '2026-07-14T08:00:00.000Z', 'device123']);
+
+  assert.equal(positive.startIso, '2026-07-14T08:00:00.000Z');
+  assert.equal(negative.startIso, '2026-07-14T13:00:00.000Z');
+  assert.equal(zulu.startIso, '2026-07-14T08:00:00.000Z');
 });
 
 test('timeline --since overrides the default 24-hour lookback', () => {
@@ -1216,6 +1291,96 @@ test('timeline HTTP returns the cross-format in-window collision row and uses wi
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('timeline bounded windows keep in-window rows across Dynamo and HTTP at limits 1, 2, and 5', async () => {
+  const records = [
+    serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.600Z', eventId: 'spill-6' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.500000+00:00', eventId: 'spill-5' }),
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.400Z', eventId: 'spill-4' }),
+    serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.300000+00:00', eventId: 'spill-3' }),
+    serialTimelineEvent(5, { eventTime: '2026-07-14T08:00:40.200Z', eventId: 'in-2' }),
+    serialTimelineEvent(6, { eventTime: '2026-07-14T08:00:40.100000+00:00', eventId: 'in-1' }),
+  ];
+  const args = ['--start', '2026-07-14T08:00:40.000Z', '--until', '2026-07-14T08:00:40.250Z', 'device123'];
+
+  for (const limit of [1, 2, 5]) {
+    const expectedIds = limit === 1 ? ['in-2'] : ['in-2', 'in-1'];
+
+    const dynamoTimeline = await fetchTimeline({
+      options: {},
+      logEventsTableName: 'events-table',
+      awsJson: createPaginatedTimelineAwsJson(records),
+    }, 'device123', {
+      ...parseOptions(args),
+      limit,
+    });
+    assert.deepEqual(dynamoTimeline.events.map(item => item.eventId), expectedIds);
+    assert.equal(dynamoTimeline.truncated, limit === 1);
+
+    const originalFetch = global.fetch;
+    global.fetch = createTimelineHttpFetch(records);
+    try {
+      const httpTimeline = await fetchTimeline({
+        webhookSecret: 'secret',
+        queryApiBaseUrl: 'https://query.example.test',
+      }, 'device123', {
+        ...parseOptions(args),
+        limit,
+      });
+      assert.deepEqual(httpTimeline.events.map(item => item.eventId), expectedIds);
+      assert.equal(httpTimeline.truncated, limit === 1);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  }
+});
+
+test('serial bounded windows keep matching rows across Dynamo and HTTP at limits 1, 2, and 5', async () => {
+  const records = [
+    serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.600Z', eventId: 'spill-6' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.500000+00:00', eventId: 'spill-5' }),
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.400Z', eventId: 'spill-4' }),
+    serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.300000+00:00', eventId: 'spill-3' }),
+    serialTimelineEvent(5, { eventTime: '2026-07-14T08:00:40.200Z', eventId: 'in-2' }),
+    serialTimelineEvent(6, { eventTime: '2026-07-14T08:00:40.100000+00:00', eventId: 'in-1' }),
+  ];
+
+  for (const limit of [1, 2, 5]) {
+    const dynamoTimeline = await fetchSerialWindow(records, {
+      startIso: '2026-07-14T08:00:40.000Z',
+      until: '2026-07-14T08:00:40.250Z',
+      limit,
+    });
+    assert.equal(dynamoTimeline.truncated, false);
+    assert.deepEqual(dynamoTimeline.events.map(item => item.eventId), ['in-2', 'in-1']);
+
+    const httpTimeline = await fetchSerialWindowHttp(records, {
+      startIso: '2026-07-14T08:00:40.000Z',
+      until: '2026-07-14T08:00:40.250Z',
+      limit,
+    });
+    assert.equal(httpTimeline.truncated, false);
+    assert.deepEqual(httpTimeline.events.map(item => item.eventId), ['in-2', 'in-1']);
+  }
+});
+
+test('serial HTTP returns the cross-format in-window collision row with the widened start bound', async () => {
+  const calls = [];
+  const timeline = await fetchSerialWindowHttp([
+    serialTimelineEvent(1, { eventTime: fixedZuluIso(39, 999), eventId: 'before-z' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.397Z', eventId: 'collision-z' }),
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.397813+00:00', eventId: 'collision-offset' }),
+    serialTimelineEvent(4, { eventTime: fixedOffsetIso(40, 900000), eventId: 'after-offset' }),
+  ], {
+    startIso: '2026-07-14T08:00:40.397Z',
+    until: '2026-07-14T08:00:40.900000+00:00',
+    limit: 10,
+  }, calls);
+
+  assert.match(calls[0].search, /[?&]start=2026-07-14T08%3A00%3A40\.000000%2B00%3A00(?:&|$)/);
+  assert.match(calls[0].search, /[?&]end=2026-07-14T08%3A00%3A41\.000Z(?:&|$)/);
+  assert.deepEqual(timeline.events.map(item => item.eventId), ['after-offset', 'collision-offset', 'collision-z']);
 });
 
 test('timeline preserves a precise --until boundary instead of truncating the exact end instant', async () => {
@@ -3028,6 +3193,38 @@ test('serial HTTP paging still advances when the caller limit is above the 1000-
   }
 });
 
+test('serial HTTP returns all in-window rows from a 5000-row dense bounded dataset', async () => {
+  const { result, records, warnings } = await runSerialJsonWindowHttp([
+    ...Array.from({ length: 1994 }, (_, index) => serialTimelineEvent(index + 1, {
+      eventTime: `2026-07-14T08:00:40.${String(105001 + index).padStart(6, '0')}+00:00`,
+      eventId: `spill-${index + 1}`,
+    })),
+    ...Array.from({ length: 6 }, (_, index) => serialTimelineEvent(6000 + index, {
+      eventTime: `2026-07-14T08:00:40.${String(100000 + index).padStart(6, '0')}+00:00`,
+      eventId: `in-${index + 1}`,
+      serialLogLine: `line ${index + 1}`,
+    })),
+    ...Array.from({ length: 3000 }, (_, index) => serialTimelineEvent(7000 + index, {
+      eventTime: `2026-07-14T08:00:40.${String(99999 - index).padStart(6, '0')}+00:00`,
+      eventId: `older-${index + 1}`,
+    })),
+  ], {
+    startIso: '2026-07-14T08:00:40.100Z',
+    until: '2026-07-14T08:00:40.105000+00:00',
+    limit: 25,
+  });
+
+  assert.equal(result.truncated, false);
+  assert.deepEqual(records.slice(0, -1).map(record => record.event.eventId), ['in-1', 'in-2', 'in-3', 'in-4', 'in-5', 'in-6']);
+  assert.deepEqual(records.at(-1), {
+    record: 'summary',
+    truncated: false,
+    count: 6,
+    limit: 25,
+  });
+  assert.deepEqual(warnings, []);
+});
+
 test('serial timeline fetch reports truncation for Dynamo windows above the 2000-row internal cap', async () => {
   const options = serialOptions({
     sinceMs: 0,
@@ -3207,6 +3404,27 @@ test('serial JSON emits a trailing summary record when emission is capped', asyn
     count: 1,
     limit: 1,
   });
+});
+
+test('serial --limit 1 bounded windows emit the oldest row and report truncation for partial output', async () => {
+  const { result, records, warnings } = await runSerialJsonWindow([
+    serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.100000+00:00', eventId: 'in-1', serialLogLine: 'first' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.200Z', eventId: 'in-2', serialLogLine: 'second' }),
+  ], {
+    startIso: '2026-07-14T08:00:40.000Z',
+    until: '2026-07-14T08:00:40.250Z',
+    limit: 1,
+  });
+
+  assert.equal(result.truncated, true);
+  assert.equal(records[0].event.eventId, 'in-1');
+  assert.deepEqual(records.at(-1), {
+    record: 'summary',
+    truncated: true,
+    count: 1,
+    limit: 1,
+  });
+  assert.deepEqual(warnings, ['WARN: results truncated at 1 events (--limit), narrow your window or raise --limit.']);
 });
 
 test('serial --limit 1 --grep with no matches stays complete after full window recovery', async () => {
