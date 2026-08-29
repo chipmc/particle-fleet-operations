@@ -2194,11 +2194,11 @@ function compareWatchEvents(left, right) {
 }
 
 function watchEventId(event) {
-  return stringValue(event.eventId) || stringValue(event.s3Key) || `${event.eventTime}:${event.eventName}`;
+  return stringValue(event.eventId) || stringValue(event.s3Key) || String(event.eventName || '');
 }
 
 function watchEventRowIdentity(event) {
-  return `${String(event.eventTime || '')}:${stringValue(event.eventId) || stringValue(event.s3Key) || String(event.eventName || '')}`;
+  return `${String(event.eventTime || '')}:${watchEventId(event)}`;
 }
 
 function watchEntryFromEvent(event, options) {
