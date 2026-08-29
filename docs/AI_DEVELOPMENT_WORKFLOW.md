@@ -219,6 +219,40 @@ Implementor
 
 --- 
 
+Verification Fixtures
+
+Fixture parameters are specified by the reviewer, not the implementer.
+
+For any work order whose verification depends on dataset shape, the reviewer specifies —
+before implementation begins — the dataset sizes, the counts of rows deliberately placed
+outside the window, the timestamp encodings present, the limit values, and the expected
+row counts and identities. An implementer may add cases. An implementer may not narrow,
+resize, or re-encode a specified one. A bound that has to be widened to make a test pass
+is a finding to report, not an edit to make.
+
+This is a structural rule, not a matter of diligence. Across WO-2026-08-28-004 three
+separate verification fixtures, each chosen by whoever wrote the code under test, were too
+small or too favourable to reach the defect they were written to catch:
+
+* A four-cell dense-window test used four out-of-window rows where the defect needed
+  roughly two thousand. It passed while one transport returned zero of six matching rows.
+* A query-count bound was doubled to accommodate the implementation, concealing a scan
+  budget running at roughly twice its intended size.
+* A boundary test used a row pair in an encoding where the defect does not reproduce, so
+  it passed against the code that contained it.
+
+Two of those three were written by the reviewer, not the implementer. Whoever knows how
+the code works tends to pick parameters it handles, and that bias does not respond to
+being more careful. Separating who sets the parameters from who writes the code removes
+it.
+
+Related: any test harness or mock standing in for a real service must be cross-checked
+against that service before its results are used as evidence. A mock that modelled
+DynamoDB ExclusiveStartKey as a positional offset rather than a key produced two false
+blocking defect reports across two review rounds before the discrepancy was noticed.
+
+⸻
+
 Current Project Focus
 
 Current priorities:
