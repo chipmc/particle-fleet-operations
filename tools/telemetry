@@ -877,17 +877,8 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
   const requestedLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
   if (!context.webhookSecret) return queryTimelineFromDynamo(context, deviceId, { ...options, probeForTruncation: true });
 
-  const resolved = resolveTimelineWindow(options, nowFn);
-  // Derive an explicit window for --hours and the no-flag default too, so every window
-  // shape uses the shared bounded query on HTTP exactly as it now does on DynamoDB.
-  // Leaving these to the raw `hours=` request was the last transport-specific bypass.
-  const resolvedEnd = resolved.end ? new Date(resolved.end) : (nowFn ? nowFn() : new Date());
-  const resolvedStart = resolved.start
-    ? new Date(resolved.start)
-    : new Date(resolvedEnd.getTime() - timelineLookbackHours(options) * 60 * 60 * 1000);
-  const start = resolved.start || resolvedStart.toISOString();
-  const end = resolved.end || resolvedEnd.toISOString();
-  {
+  const { start, end } = resolveTimelineWindow(options, nowFn);
+  if (start) {
     const probeLimit = Math.min(requestedLimit + 1, TIMELINE_HTTP_MAX_LIMIT);
     const page = await fetchTimelinePage(context, deviceId, {
       start,
@@ -906,6 +897,37 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
       source: page.source,
     };
   }
+
+  const probeLimit = Math.min(requestedLimit + 1, TIMELINE_HTTP_MAX_LIMIT);
+  const params = new URLSearchParams({
+    limit: String(probeLimit),
+  });
+  if (!start) {
+    params.set('hours', String(timelineLookbackHours(options)));
+  }
+  const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${params.toString()}`;
+  const response = await fetch(url, {
+    headers: {
+      'x-particle-webhook-secret': context.webhookSecret,
+      Accept: 'application/json',
+    },
+  });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    fail(`Timeline API returned non-JSON response with HTTP ${response.status}.`);
+  }
+
+  if (!response.ok) {
+    fail(`Timeline API request failed with HTTP ${response.status}: ${payload.message || payload.error || 'unknown error'}`);
+  }
+  return annotateTimelineHttpPayload(payload, requestedLimit, {
+    trimEvents: true,
+    exactStart: start,
+    exactEnd: end,
+  });
 }
 
 function queryTimelineFromDynamo(context, deviceId, options) {

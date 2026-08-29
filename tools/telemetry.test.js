@@ -3212,8 +3212,12 @@ test('serial HTTP paging still advances when the caller limit is above the 1000-
 // positive for false negatives, since a bounded scan cannot distinguish two datasets
 // sharing a scanned prefix where only one has an unscanned in-window row. The real
 // resolution is a query formulation that does not depend on mixed lexicographic
-// encodings -- disjoint ranges per encoding, or canonicalised eventTime at ingest.
-// That is WO-2026-08-28-003 Part A.
+// encodings -- disjoint ranges per encoding, or canonicalised eventTime.
+//
+// Corrected 2026-08-28 (Codex, PR #20): an earlier version of this note named
+// WO-2026-08-28-003 Part A as the fix. Part A only canonicalises FUTURE ingestion.
+// Historical rows already carry mixed encodings, so Part B's backfill is what actually
+// resolves this. Both parts are required.
 test('serial HTTP returns all in-window rows from a 5000-row dense bounded dataset', { skip: 'KNOWN OPEN -- conservative truncation on a complete result. See WO-2026-08-28-003 Part A (eventTime canonicalisation) for the real fix.' }, async () => {
   const { result, records, warnings } = await runSerialJsonWindowHttp([
     ...Array.from({ length: 1994 }, (_, index) => serialTimelineEvent(index + 1, {
@@ -4578,7 +4582,16 @@ test('R3: --hours and the default lookback send widened bounds like --start does
   assert.ok(widened(hoursBound), `--hours bound should be widened like --start, saw ${hoursBound}`);
 });
 
-test('R3 (HTTP): --hours and the default lookback use the shared bounded query, not a raw hours= request', async () => {
+// DEFERRED to WO-2026-08-29-001 (HTTP transport) -- do NOT re-enable by routing --hours
+// through the shared bounded query on HTTP. That was attempted in 0605718 and reverted:
+// replacing the `hours=` request with an explicit range silently removed the Lambda's
+// 168-hour cap (lambda/src/utils/query-params.ts maxHours=168), which only validates the
+// `hours` parameter. Codex, PR #20, 2026-08-28.
+//
+// The HTTP transport cannot be fixed client-side while the server re-normalises the
+// bounds it is sent; see WO-2026-08-29-001, which is sequenced after WO-2026-08-28-003
+// Parts A AND B.
+test('R3 (HTTP): --hours and the default lookback use the shared bounded query, not a raw hours= request', { skip: 'DEFERRED to WO-2026-08-29-001 -- HTTP --hours routing removed the Lambda 168-hour cap when attempted; blocked on eventTime canonicalisation (WO-2026-08-28-003 Parts A and B).' }, async () => {
   // Codex, 2026-08-28 (PR #20): the Dynamo half of R3 was fixed but fetchTimeline still
   // took a direct `?limit=N&hours=24` route when resolveTimelineWindow returned no start,
   // bypassing buildBoundedTimelineQuery/fetchTimelinePage on the HTTP transport.
