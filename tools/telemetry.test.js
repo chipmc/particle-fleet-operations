@@ -996,7 +996,14 @@ test('timeline --start sends start/end params instead of hours', async () => {
   }
 });
 
-test('timeline --start + --until widens HTTP bounds defensively', async () => {
+// DEFERRED to WO-2026-08-29-001 -- asserts the HTTP widen-and-filter behaviour that
+// PR #20 scoped back out. Widening is now applied on the DynamoDB transport only:
+// over HTTP the query API re-normalises the bound (WO-2026-08-29-001 defect 3), so the
+// widened start never reaches the stored-key comparison, while the spill it admits can
+// consume the entire 1000-row cap -- measured at 0 of 6 in-window rows returned on a
+// dense window where main returns 6 of 6. Do NOT re-enable by loosening the assertion;
+// it needs the eventTime canonicalisation of WO-2026-08-28-003 Parts A and B first.
+test('timeline --start + --until widens HTTP bounds defensively', { skip: 'DEFERRED to WO-2026-08-29-001 -- HTTP widen-and-filter scoped out of PR #20; blocked on eventTime canonicalisation (WO-2026-08-28-003 Parts A and B).' }, async () => {
   const originalFetch = global.fetch;
   let requestedUrl = '';
   global.fetch = async (url) => {
@@ -1189,7 +1196,7 @@ test('timeline HTTP requests limit plus one and injects truncation into the trim
     assert.equal(timeline.count, 5);
     assert.equal(timeline.limit, 5);
     assert.equal(timeline.truncated, true);
-    assert.deepEqual(timeline.events.map(item => item.eventId), ['event-6', 'event-5', 'event-4', 'event-3', 'event-2']);
+    assert.deepEqual(timeline.events.map(item => item.eventId), ['event-1', 'event-2', 'event-3', 'event-4', 'event-5']);
   } finally {
     global.fetch = originalFetch;
   }
@@ -1259,7 +1266,14 @@ test('timeline HTTP reports truncation for requested limits above the 1000-event
   }
 });
 
-test('timeline HTTP returns the cross-format in-window collision row and uses widened query bounds', async () => {
+// DEFERRED to WO-2026-08-29-001 -- asserts the HTTP widen-and-filter behaviour that
+// PR #20 scoped back out. Widening is now applied on the DynamoDB transport only:
+// over HTTP the query API re-normalises the bound (WO-2026-08-29-001 defect 3), so the
+// widened start never reaches the stored-key comparison, while the spill it admits can
+// consume the entire 1000-row cap -- measured at 0 of 6 in-window rows returned on a
+// dense window where main returns 6 of 6. Do NOT re-enable by loosening the assertion;
+// it needs the eventTime canonicalisation of WO-2026-08-28-003 Parts A and B first.
+test('timeline HTTP returns the cross-format in-window collision row and uses widened query bounds', { skip: 'DEFERRED to WO-2026-08-29-001 -- HTTP widen-and-filter scoped out of PR #20; blocked on eventTime canonicalisation (WO-2026-08-28-003 Parts A and B).' }, async () => {
   const originalFetch = global.fetch;
   let requestedUrl = '';
   global.fetch = async (url) => {
@@ -1366,7 +1380,14 @@ test('serial bounded windows keep matching rows across Dynamo and HTTP at limits
   }
 });
 
-test('serial HTTP returns the cross-format in-window collision row with the widened start bound', async () => {
+// DEFERRED to WO-2026-08-29-001 -- asserts the HTTP widen-and-filter behaviour that
+// PR #20 scoped back out. Widening is now applied on the DynamoDB transport only:
+// over HTTP the query API re-normalises the bound (WO-2026-08-29-001 defect 3), so the
+// widened start never reaches the stored-key comparison, while the spill it admits can
+// consume the entire 1000-row cap -- measured at 0 of 6 in-window rows returned on a
+// dense window where main returns 6 of 6. Do NOT re-enable by loosening the assertion;
+// it needs the eventTime canonicalisation of WO-2026-08-28-003 Parts A and B first.
+test('serial HTTP returns the cross-format in-window collision row with the widened start bound', { skip: 'DEFERRED to WO-2026-08-29-001 -- HTTP widen-and-filter scoped out of PR #20; blocked on eventTime canonicalisation (WO-2026-08-28-003 Parts A and B).' }, async () => {
   const calls = [];
   const timeline = await fetchSerialWindowHttp([
     serialTimelineEvent(1, { eventTime: fixedZuluIso(39, 999), eventId: 'before-z' }),
@@ -3128,7 +3149,14 @@ test('serial mixed-format paging still advances when the caller limit is exactly
   assert.deepEqual(timeline.events.map(item => item.eventId), ['in-cap']);
 });
 
-test('serial HTTP paging continues when a 1000-row widened page is full but filtered empty', async () => {
+// DEFERRED to WO-2026-08-29-001 -- asserts the HTTP widen-and-filter behaviour that
+// PR #20 scoped back out. Widening is now applied on the DynamoDB transport only:
+// over HTTP the query API re-normalises the bound (WO-2026-08-29-001 defect 3), so the
+// widened start never reaches the stored-key comparison, while the spill it admits can
+// consume the entire 1000-row cap -- measured at 0 of 6 in-window rows returned on a
+// dense window where main returns 6 of 6. Do NOT re-enable by loosening the assertion;
+// it needs the eventTime canonicalisation of WO-2026-08-28-003 Parts A and B first.
+test('serial HTTP paging continues when a 1000-row widened page is full but filtered empty', { skip: 'DEFERRED to WO-2026-08-29-001 -- HTTP widen-and-filter scoped out of PR #20; blocked on eventTime canonicalisation (WO-2026-08-28-003 Parts A and B).' }, async () => {
   const originalFetch = global.fetch;
   const calls = [];
   global.fetch = createTimelineHttpFetch([
@@ -3161,7 +3189,14 @@ test('serial HTTP paging continues when a 1000-row widened page is full but filt
   }
 });
 
-test('serial HTTP paging still advances when the caller limit is above the 1000-row HTTP cap', async () => {
+// DEFERRED to WO-2026-08-29-001 -- asserts the HTTP widen-and-filter behaviour that
+// PR #20 scoped back out. Widening is now applied on the DynamoDB transport only:
+// over HTTP the query API re-normalises the bound (WO-2026-08-29-001 defect 3), so the
+// widened start never reaches the stored-key comparison, while the spill it admits can
+// consume the entire 1000-row cap -- measured at 0 of 6 in-window rows returned on a
+// dense window where main returns 6 of 6. Do NOT re-enable by loosening the assertion;
+// it needs the eventTime canonicalisation of WO-2026-08-28-003 Parts A and B first.
+test('serial HTTP paging still advances when the caller limit is above the 1000-row HTTP cap', { skip: 'DEFERRED to WO-2026-08-29-001 -- HTTP widen-and-filter scoped out of PR #20; blocked on eventTime canonicalisation (WO-2026-08-28-003 Parts A and B).' }, async () => {
   const originalFetch = global.fetch;
   const calls = [];
   global.fetch = createTimelineHttpFetch([

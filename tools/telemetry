@@ -878,31 +878,19 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
   if (!context.webhookSecret) return queryTimelineFromDynamo(context, deviceId, { ...options, probeForTruncation: true });
 
   const { start, end } = resolveTimelineWindow(options, nowFn);
-  if (start) {
-    const probeLimit = Math.min(requestedLimit + 1, TIMELINE_HTTP_MAX_LIMIT);
-    const page = await fetchTimelinePage(context, deviceId, {
-      start,
-      end,
-      limit: probeLimit,
-    });
-    const events = (page.events || []).slice(0, requestedLimit);
-    return {
-      deviceId,
-      start,
-      end,
-      count: events.length,
-      events,
-      limit: requestedLimit,
-      truncated: page.truncated || (page.events || []).length > requestedLimit,
-      source: page.source,
-    };
-  }
-
   const probeLimit = Math.min(requestedLimit + 1, TIMELINE_HTTP_MAX_LIMIT);
   const params = new URLSearchParams({
     limit: String(probeLimit),
   });
-  if (!start) {
+  if (start) {
+    // Exact bounds, not widened. Same reason as fetchTimelinePage: the widened
+    // start does not survive the Lambda's re-normalisation, and the spill it
+    // admits can consume the whole 1000-row cap. WO-2026-08-29-001.
+    params.set('start', start);
+    params.set('end', end);
+  } else {
+    // Keep the hours= form: maxHours (168) is validated against that parameter
+    // only, so an explicit range silently removes the server-side cap.
     params.set('hours', String(timelineLookbackHours(options)));
   }
   const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${params.toString()}`;
@@ -923,11 +911,7 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
   if (!response.ok) {
     fail(`Timeline API request failed with HTTP ${response.status}: ${payload.message || payload.error || 'unknown error'}`);
   }
-  return annotateTimelineHttpPayload(payload, requestedLimit, {
-    trimEvents: true,
-    exactStart: start,
-    exactEnd: end,
-  });
+  return annotateTimelineHttpPayload(payload, requestedLimit, { trimEvents: true });
 }
 
 function queryTimelineFromDynamo(context, deviceId, options) {
@@ -2259,10 +2243,17 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
 async function fetchTimelinePage(context, deviceId, params) {
   const exactStart = params.exactStart || params.start;
   const exactEnd = params.exactEnd || params.end;
-  const boundedQuery = buildBoundedTimelineQuery(params.start, params.end, {
-    widenStart: true,
-    widenEnd: params.widenEnd !== false,
-  });
+  // Widen-and-filter is a DynamoDB-transport fix only. Over HTTP the query API
+  // re-normalises the bound it receives (lambda/src/query/timeline.ts), so the
+  // low-sort widened start does not survive to the stored-key comparison -- the
+  // widening buys nothing there and costs a spill window the 1000-row cap can be
+  // spent entirely inside. See WO-2026-08-29-001 defect 3.
+  const boundedQuery = context.webhookSecret
+    ? { queryStart: params.start, queryEnd: params.end }
+    : buildBoundedTimelineQuery(params.start, params.end, {
+      widenStart: true,
+      widenEnd: params.widenEnd !== false,
+    });
   if (!context.webhookSecret) {
     const rawLimit = Math.min(params.limit, WATCH_DYNAMO_MAX_ROWS);
     const page = queryFilteredTimelineRecordsFromDynamo(
@@ -2300,32 +2291,23 @@ async function fetchTimelinePage(context, deviceId, params) {
     };
   }
 
-  let rawLimit = Math.min(params.limit, TIMELINE_HTTP_MAX_LIMIT);
-  let page;
-  let filteredEvents = [];
-  let rawPageMayContinue = false;
-  let rawEvents = [];
-  do {
-    page = await fetchTimelineHttpPage(context, deviceId, {
-      start: boundedQuery.queryStart,
-      end: boundedQuery.queryEnd,
-      limit: rawLimit,
-      requestedLimit: params.limit,
-    });
-    rawEvents = page.events || [];
-    filteredEvents = filterTimelineWindowEvents(rawEvents, exactStart, exactEnd);
-    rawPageMayContinue = rawEvents.length >= rawLimit;
-    if (filteredEvents.length >= params.limit || !rawPageMayContinue || rawLimit >= TIMELINE_HTTP_MAX_LIMIT) break;
-    rawLimit = Math.min(TIMELINE_HTTP_MAX_LIMIT, Math.max(rawLimit + 1, rawLimit * 2));
-  } while (true);
-  const events = filteredEvents.slice(0, params.limit);
+  const rawLimit = Math.min(params.limit, TIMELINE_HTTP_MAX_LIMIT);
+  const page = await fetchTimelineHttpPage(context, deviceId, {
+    start: boundedQuery.queryStart,
+    end: boundedQuery.queryEnd,
+    limit: rawLimit,
+    requestedLimit: params.limit,
+  });
+  const rawEvents = page.events || [];
+  const events = rawEvents.slice(0, params.limit);
+  const moreAvailable = rawEvents.length > params.limit || rawEvents.length >= rawLimit;
   return {
     ...page,
     count: events.length,
     events,
     rawCount: rawEvents.length,
-    truncated: filteredEvents.length > params.limit || rawPageMayContinue,
-    nextPageEnd: nextPageEndForFilteredTimelinePage(rawEvents, events, filteredEvents.length > params.limit || rawPageMayContinue, params.limit),
+    truncated: page.truncated || rawEvents.length > params.limit,
+    nextPageEnd: nextPageEndForFilteredTimelinePage(rawEvents, events, moreAvailable, params.limit),
   };
 }
 
