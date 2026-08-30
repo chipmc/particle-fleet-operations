@@ -2148,8 +2148,14 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
   let widenPageEnd = true;
   const visitedPageEnds = new Set();
   let truncated = false;
-  const sourceCap = context.webhookSecret ? TIMELINE_HTTP_MAX_LIMIT : WATCH_DYNAMO_MAX_ROWS;
-  const capApplies = limit >= sourceCap;
+  const httpTransport = Boolean(context.webhookSecret);
+  const sourceCap = httpTransport ? TIMELINE_HTTP_MAX_LIMIT : WATCH_DYNAMO_MAX_ROWS;
+  // The collected-event cap is DynamoDB-transport work too. Over HTTP the server
+  // clamps each REQUEST at 1000 rows but paging continues past it, so capping the
+  // accumulated total at 1000 drops history main recovers: a 1202-row window at
+  // --limit 1000 returned 1000 rows with truncated:true against main's 1202 and
+  // truncated:false. WO-2026-08-29-001.
+  const capApplies = !httpTransport && limit >= sourceCap;
   const maxCollectedEvents = capApplies ? sourceCap + 1 : Number.POSITIVE_INFINITY;
   // Step 0's raw-scan budget and the exclusive page cursor are DynamoDB-transport
   // work, verified on that transport only. Over HTTP the budget cuts history short
@@ -2159,7 +2165,6 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
   // (lambda/src/utils/query-params.ts), so a microsecond boundary row is re-fetched
   // and the visited-cursor guard halts the walk early. Both stay off HTTP until
   // WO-2026-08-29-001.
-  const httpTransport = Boolean(context.webhookSecret);
   const maxRawRows = httpTransport
     ? Number.POSITIVE_INFINITY
     : boundedTimelineRawScanBudget(sourceCap, limit);
