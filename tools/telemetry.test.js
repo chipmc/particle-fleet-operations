@@ -996,14 +996,12 @@ test('timeline --start sends start/end params instead of hours', async () => {
   }
 });
 
-// DEFERRED to WO-2026-08-29-001 -- asserts the HTTP widen-and-filter behaviour that
-// PR #20 scoped back out. Widening is now applied on the DynamoDB transport only:
-// over HTTP the query API re-normalises the bound (WO-2026-08-29-001 defect 3), so the
-// widened start never reaches the stored-key comparison, while the spill it admits can
-// consume the entire 1000-row cap -- measured at 0 of 6 in-window rows returned on a
-// dense window where main returns 6 of 6. Do NOT re-enable by loosening the assertion;
-// it needs the eventTime canonicalisation of WO-2026-08-28-003 Parts A and B first.
-test('timeline --start + --until widens HTTP bounds defensively', { skip: 'DEFERRED to WO-2026-08-29-001 -- HTTP widen-and-filter scoped out of PR #20; blocked on eventTime canonicalisation (WO-2026-08-28-003 Parts A and B).' }, async () => {
+// Restored to main's form. This was an ACTIVE regression test on main asserting the
+// exact bounds are sent; PR #20 rewrote it to demand widened bounds. With widening
+// confined to the DynamoDB transport the original assertion is the correct one, so it
+// is re-enabled rather than skipped -- skipping it would have left the HTTP bound with
+// no coverage at all.
+test('timeline --start + --until sends both bounds', async () => {
   const originalFetch = global.fetch;
   let requestedUrl = '';
   global.fetch = async (url) => {
@@ -1020,8 +1018,8 @@ test('timeline --start + --until widens HTTP bounds defensively', { skip: 'DEFER
       ...parseOptions(['--start', '2026-08-05T10:00:00.000Z', '--until', '2026-08-05T11:00:00.000Z', 'Boron-Dev-09']),
       limit: 25,
     });
-    assert.match(requestedUrl, /[?&]start=2026-08-05T10%3A00%3A00\.000000%2B00%3A00/);
-    assert.match(requestedUrl, /[?&]end=2026-08-05T11%3A00%3A01\.000Z/);
+    assert.match(requestedUrl, /[?&]start=2026-08-05T10/);
+    assert.match(requestedUrl, /[?&]end=2026-08-05T11/);
     assert.doesNotMatch(requestedUrl, /[?&]hours=/);
   } finally {
     global.fetch = originalFetch;
@@ -1351,7 +1349,7 @@ test('timeline bounded windows keep in-window rows across Dynamo and HTTP at lim
   }
 });
 
-test('serial bounded windows keep matching rows across Dynamo and HTTP at limits 1, 2, and 5', async () => {
+test('serial bounded windows keep matching rows on Dynamo at limits 1, 2, and 5', async () => {
   const records = [
     serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.600Z', eventId: 'spill-6' }),
     serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.500000+00:00', eventId: 'spill-5' }),
@@ -1370,6 +1368,26 @@ test('serial bounded windows keep matching rows across Dynamo and HTTP at limits
     assert.equal(dynamoTimeline.truncated, false);
     assert.deepEqual(dynamoTimeline.events.map(item => item.eventId), ['in-2', 'in-1']);
 
+  }
+});
+
+// DEFERRED to WO-2026-08-29-001 -- the HTTP arm of the test above. Cross-format
+// windows are only correct over HTTP with client-side widen-and-filter, which PR #20
+// scoped back out: the widened bound does not survive the query API's re-normalisation
+// (WO-2026-08-29-001 defect 3), and the spill it admits can consume the whole 1000-row
+// cap. Blocked on eventTime canonicalisation, WO-2026-08-28-003 Parts A and B.
+// Do NOT re-enable by loosening the assertion.
+test('serial bounded windows keep matching rows on HTTP at limits 1, 2, and 5', { skip: 'DEFERRED to WO-2026-08-29-001 -- cross-format HTTP windows need eventTime canonicalisation (WO-2026-08-28-003 Parts A and B).' }, async () => {
+  const records = [
+    serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.600Z', eventId: 'spill-6' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.500000+00:00', eventId: 'spill-5' }),
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.400Z', eventId: 'spill-4' }),
+    serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.300000+00:00', eventId: 'spill-3' }),
+    serialTimelineEvent(5, { eventTime: '2026-07-14T08:00:40.200Z', eventId: 'in-2' }),
+    serialTimelineEvent(6, { eventTime: '2026-07-14T08:00:40.100000+00:00', eventId: 'in-1' }),
+  ];
+
+  for (const limit of [1, 2, 5]) {
     const httpTimeline = await fetchSerialWindowHttp(records, {
       startIso: '2026-07-14T08:00:40.000Z',
       until: '2026-07-14T08:00:40.250Z',
@@ -2895,8 +2913,11 @@ test('serial timeline fetch paginates API history pages', async () => {
 
     assert.equal(urls.length, 3);
     assert.deepEqual(timeline.events.map(item => item.eventId), ['newer', 'older']);
-    assert.match(urls[1], /end=2026-07-14T08%3A00%3A01\.999999999Z/);
-    assert.match(urls[2], /end=2026-07-14T08%3A00%3A00\.999999999Z/);
+    // main's inclusive HTTP page cursor. The exclusive (.999999999Z) form is a
+    // DynamoDB-transport fix: the query API truncates the bound to milliseconds
+    // (lambda/src/utils/query-params.ts), so it is not exclusive there anyway.
+    assert.match(urls[1], /end=2026-07-14T08%3A00%3A02\.000Z/);
+    assert.match(urls[2], /end=2026-07-14T08%3A00%3A01\.000Z/);
   } finally {
     global.fetch = originalFetch;
   }

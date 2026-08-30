@@ -1003,49 +1003,11 @@ function annotateTimelineHttpPagePayload(payload, requestedLimit) {
     ...payload,
     events,
     limit: requestedLimit,
+    // `>` not `>=`, matching main. At limit exactly 1000 this under-reports the
+    // server clamp, but tightening it is an HTTP-transport change and belongs to
+    // WO-2026-08-29-001, not to this PR's DynamoDB scope.
     truncated: events.length > requestedLimit
-      || (requestedLimit >= TIMELINE_HTTP_MAX_LIMIT && responseCount >= TIMELINE_HTTP_MAX_LIMIT),
-  };
-}
-
-function queryTimelineRecordsFromDynamo(context, deviceId, start, end, options) {
-  const records = [];
-  const readAwsJson = context.awsJson || awsJson;
-  const requestedLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
-  const pageLimit = Math.min(requestedLimit, options.pageLimit || WATCH_DYNAMO_PAGE_LIMIT);
-  const maxRows = Math.min(options.maxRows || requestedLimit, WATCH_DYNAMO_MAX_ROWS);
-  let exclusiveStartKey;
-
-  do {
-    const args = [
-      'dynamodb', 'query',
-      '--table-name', context.logEventsTableName,
-      '--key-condition-expression', 'deviceId = :deviceId AND eventTime BETWEEN :start AND :end',
-      '--expression-attribute-values', JSON.stringify({
-        ':deviceId': { S: deviceId },
-        ':start': { S: start },
-        ':end': { S: end },
-      }),
-      '--no-scan-index-forward',
-      '--limit', String(Math.min(pageLimit, requestedLimit - records.length, maxRows - records.length)),
-    ];
-    if (exclusiveStartKey) {
-      args.push('--exclusive-start-key', JSON.stringify(exclusiveStartKey));
-    }
-
-    const page = readAwsJson(context.options, args, {
-      operation: 'dynamodb query timeline',
-      tableName: context.logEventsTableName,
-      deviceId,
-      pagination: true,
-    });
-    records.push(...((page.Items || []).map(unmarshall)));
-    exclusiveStartKey = page.LastEvaluatedKey;
-  } while (exclusiveStartKey && records.length < requestedLimit && records.length < maxRows);
-
-  return {
-    records,
-    moreAvailable: Boolean(exclusiveStartKey),
+      || (requestedLimit > TIMELINE_HTTP_MAX_LIMIT && responseCount >= TIMELINE_HTTP_MAX_LIMIT),
   };
 }
 
@@ -2189,7 +2151,18 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
   const sourceCap = context.webhookSecret ? TIMELINE_HTTP_MAX_LIMIT : WATCH_DYNAMO_MAX_ROWS;
   const capApplies = limit >= sourceCap;
   const maxCollectedEvents = capApplies ? sourceCap + 1 : Number.POSITIVE_INFINITY;
-  const maxRawRows = boundedTimelineRawScanBudget(sourceCap, limit);
+  // Step 0's raw-scan budget and the exclusive page cursor are DynamoDB-transport
+  // work, verified on that transport only. Over HTTP the budget cuts history short
+  // that main would recover (a 1202-row window at --limit 200 stops at 1200), and
+  // the exclusive cursor is not actually exclusive: previousIsoTimestamp subtracts a
+  // nanosecond, and the query API truncates the bound to milliseconds
+  // (lambda/src/utils/query-params.ts), so a microsecond boundary row is re-fetched
+  // and the visited-cursor guard halts the walk early. Both stay off HTTP until
+  // WO-2026-08-29-001.
+  const httpTransport = Boolean(context.webhookSecret);
+  const maxRawRows = httpTransport
+    ? Number.POSITIVE_INFINITY
+    : boundedTimelineRawScanBudget(sourceCap, limit);
   let rawRowsScanned = 0;
 
   while (true) {
@@ -2206,7 +2179,7 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
       exactEnd,
       limit,
       exclusiveStartKey: pageExclusiveStartKey,
-      maxRows: Math.max(1, maxRawRows - rawRowsScanned),
+      maxRows: httpTransport ? undefined : Math.max(1, maxRawRows - rawRowsScanned),
       widenEnd: widenPageEnd,
     });
     const pageEvents = page.events || [];
@@ -2219,6 +2192,16 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
     if (rawRowsScanned >= maxRawRows && (page.nextPageEnd || page.nextExclusiveStartKey || page.truncated)) {
       truncated = true;
       break;
+    }
+
+    if (httpTransport) {
+      if (page.truncated && pageEvents.length < limit) truncated = true;
+      if (pageEvents.length < limit) break;
+      const oldestHttp = [...pageEvents].sort(compareWatchEvents)[0];
+      if (!oldestHttp || compareEventToCursor(oldestHttp, state.cursor) <= 0) break;
+      pageEnd = oldestHttp.eventTime;
+      widenPageEnd = false;
+      continue;
     }
 
     if (!page.nextPageEnd && !page.nextExclusiveStartKey) {
