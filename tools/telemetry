@@ -30,6 +30,9 @@ const TRUNCATED_EXIT_CODE = 3;
 const WATCH_CURSOR_LOOKBACK_MS = 5 * 60 * 1000;
 const WATCH_LINE_MAX_LENGTH = 160;
 const DEVICE_ID_PATTERN = /^[a-fA-F0-9]{24}$/;
+const ISO_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/;
+const NS_PER_SECOND = 1000000000n;
+const NS_PER_MILLISECOND = 1000000n;
 const COMMANDS = new Set(['devices', 'device', 'timeline', 'watch', 'serial', 'fleet']);
 
 async function main() {
@@ -466,9 +469,122 @@ function parseDurationMs(value, option) {
 }
 
 function parseIsoTimestamp(value, option) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) fail(`${option} must be a valid ISO timestamp.`);
-  return date.toISOString();
+  const normalized = normalizeIsoTimestamp(value);
+  if (!normalized) fail(`${option} must be a valid ISO timestamp.`);
+  return normalized;
+}
+
+function normalizeIsoTimestamp(value) {
+  const parsed = parsePreciseInstant(value);
+  if (!parsed) return null;
+  return formatPreciseInstant(parsed.epochNs);
+}
+
+function parsePreciseInstant(value) {
+  const match = String(value || '').match(ISO_TIMESTAMP_PATTERN);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const fraction = match[7] || '';
+  const offsetToken = match[8];
+  const offsetSign = match[9] === '-' ? -1 : 1;
+  const offsetHours = Number(match[10] || 0);
+  const offsetMinutes = Number(match[11] || 0);
+  if (offsetToken !== 'Z' && (offsetHours > 23 || offsetMinutes > 59)) return null;
+  const baseMs = Date.UTC(year, month - 1, day, hour, minute, second);
+  const date = new Date(baseMs);
+  if (Number.isNaN(date.getTime())
+    || date.getUTCFullYear() !== year
+    || date.getUTCMonth() !== month - 1
+    || date.getUTCDate() !== day
+    || date.getUTCHours() !== hour
+    || date.getUTCMinutes() !== minute
+    || date.getUTCSeconds() !== second) {
+    return null;
+  }
+  const offsetTotalMinutes = offsetToken === 'Z' ? 0 : offsetSign * ((offsetHours * 60) + offsetMinutes);
+  const fractionNs = BigInt((fraction.padEnd(9, '0')).slice(0, 9) || '0');
+  return {
+    epochNs: (BigInt(baseMs) * NS_PER_MILLISECOND) - (BigInt(offsetTotalMinutes) * 60n * NS_PER_SECOND) + fractionNs,
+  };
+}
+
+function comparePreciseInstants(left, right) {
+  const leftParsed = parsePreciseInstant(left);
+  const rightParsed = parsePreciseInstant(right);
+  if (!leftParsed || !rightParsed) return String(left || '').localeCompare(String(right || ''));
+  if (leftParsed.epochNs < rightParsed.epochNs) return -1;
+  if (leftParsed.epochNs > rightParsed.epochNs) return 1;
+  return 0;
+}
+
+function preciseInstantToEpochSecond(epochNs) {
+  let seconds = epochNs / NS_PER_SECOND;
+  let remainder = epochNs % NS_PER_SECOND;
+  if (remainder < 0) {
+    seconds -= 1n;
+    remainder += NS_PER_SECOND;
+  }
+  return { seconds, remainder };
+}
+
+function formatPreciseInstant(epochNs) {
+  const { seconds, remainder } = preciseInstantToEpochSecond(epochNs);
+  const prefix = new Date(Number(seconds * 1000n)).toISOString().slice(0, 19);
+  const fraction = String(remainder).padStart(9, '0').replace(/0+$/, '');
+  return `${prefix}.${fraction.padEnd(Math.max(3, fraction.length), '0')}Z`;
+}
+
+function floorIsoTimestampToLowSortSecond(value) {
+  const parsed = parsePreciseInstant(value);
+  if (!parsed) return value;
+  const { seconds } = preciseInstantToEpochSecond(parsed.epochNs);
+  return `${new Date(Number(seconds * 1000n)).toISOString().slice(0, 19)}.000000+00:00`;
+}
+
+function ceilIsoTimestampToNextSecond(value) {
+  const parsed = parsePreciseInstant(value);
+  if (!parsed) return value;
+  const { seconds } = preciseInstantToEpochSecond(parsed.epochNs);
+  return `${new Date(Number((seconds + 1n) * 1000n)).toISOString().slice(0, 19)}.000Z`;
+}
+
+function widenTimelineBounds(start, end) {
+  return {
+    start: floorIsoTimestampToLowSortSecond(start),
+    end: ceilIsoTimestampToNextSecond(end),
+  };
+}
+
+function buildBoundedTimelineQuery(start, end, options = {}) {
+  const bounds = widenTimelineBounds(start, end);
+  return {
+    exactStart: start,
+    exactEnd: end,
+    queryStart: options.widenStart === false ? start : bounds.start,
+    queryEnd: options.widenEnd === false ? end : bounds.end,
+  };
+}
+
+function previousIsoTimestamp(value) {
+  const parsed = parsePreciseInstant(value);
+  if (!parsed) return value;
+  return formatPreciseInstant(parsed.epochNs - 1n);
+}
+
+function isEventWithinExactWindow(event, start, end) {
+  return comparePreciseInstants(event.eventTime, start) >= 0
+    && comparePreciseInstants(event.eventTime, end) <= 0;
+}
+
+function filterTimelineWindowEvents(events, start, end) {
+  return (events || [])
+    .filter(event => isEventWithinExactWindow(event, start, end))
+    .sort((left, right) => compareWatchEvents(right, left));
 }
 
 function formatDuration(ms) {
@@ -763,9 +879,14 @@ async function fetchTimeline(context, deviceId, options, nowFn) {
     limit: String(probeLimit),
   });
   if (start) {
+    // Exact bounds, not widened. Same reason as fetchTimelinePage: the widened
+    // start does not survive the Lambda's re-normalisation, and the spill it
+    // admits can consume the whole 1000-row cap. WO-2026-08-29-001.
     params.set('start', start);
     params.set('end', end);
   } else {
+    // Keep the hours= form: maxHours (168) is validated against that parameter
+    // only, so an explicit range silently removes the server-side cap.
     params.set('hours', String(timelineLookbackHours(options)));
   }
   const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${params.toString()}`;
@@ -795,19 +916,28 @@ function queryTimelineFromDynamo(context, deviceId, options) {
   const start = resolved.start ? new Date(resolved.start) : new Date(end.getTime() - timelineLookbackHours(options) * 60 * 60 * 1000);
   const requestedLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
   const queryLimit = options.probeForTruncation ? requestedLimit + 1 : requestedLimit;
-  const timelineRecords = queryTimelineRecordsFromDynamo(context, deviceId, start.toISOString(), end.toISOString(), {
+  const exactStart = resolved.start || start.toISOString();
+  const exactEnd = resolved.end || end.toISOString();
+  // Every window shape -- --start, --since, --hours and the default lookback -- goes
+  // through the one shared widen-and-filter path. Gating this on `resolved.start` left
+  // --hours and the no-flag default on raw .NNNZ bounds, outside the shared path.
+  const boundedQuery = buildBoundedTimelineQuery(exactStart, exactEnd, { widenStart: true });
+  const timelineRecords = queryFilteredTimelineRecordsFromDynamo(context, deviceId, boundedQuery.queryStart, boundedQuery.queryEnd, {
     ...options,
     limit: queryLimit,
+    filterRecord: record => isEventWithinExactWindow(record, exactStart, exactEnd),
   });
   const records = timelineRecords.records;
-  const trimmedRecords = records.slice(0, requestedLimit);
+  const trimmedRecords = [...records]
+    .sort((left, right) => compareWatchEvents(right, left))
+    .slice(0, requestedLimit);
 
   if (trimmedRecords.length === 0 && !options.allowEmpty) fail(`No data found for device: ${deviceId}`);
 
   return {
     deviceId,
-    start: start.toISOString(),
-    end: end.toISOString(),
+    start: exactStart,
+    end: exactEnd,
     count: trimmedRecords.length,
     events: trimmedRecords.map(formatTimelineRecord),
     limit: requestedLimit,
@@ -829,8 +959,7 @@ function validateStartSince(options) {
 function resolveTimelineWindow(options, nowFn) {
   const now = nowFn ? nowFn() : new Date();
   if (options.startIso) {
-    const end = options.until ? new Date(options.until) : now;
-    return { start: options.startIso, end: end.toISOString() };
+    return { start: options.startIso, end: options.until || now.toISOString() };
   }
   if (options.sinceMs > 0) {
     const start = new Date(now.getTime() - options.sinceMs);
@@ -849,13 +978,16 @@ function formatTruncationWarning(truncated, limit, command) {
 function annotateTimelineHttpPayload(payload, requestedLimit, options = {}) {
   const events = Array.isArray(payload.events) ? payload.events : [];
   const responseCount = Number.isFinite(payload.count) ? payload.count : events.length;
-  const returnedEvents = options.trimEvents ? events.slice(0, requestedLimit) : events;
+  const filteredEvents = options.exactStart && options.exactEnd
+    ? filterTimelineWindowEvents(events, options.exactStart, options.exactEnd)
+    : events;
+  const returnedEvents = options.trimEvents ? filteredEvents.slice(0, requestedLimit) : filteredEvents;
   return {
     ...payload,
     ...(options.trimEvents ? { count: returnedEvents.length } : {}),
     events: returnedEvents,
     limit: requestedLimit,
-    truncated: events.length > requestedLimit
+    truncated: filteredEvents.length > requestedLimit
       || (requestedLimit >= TIMELINE_HTTP_MAX_LIMIT && responseCount >= TIMELINE_HTTP_MAX_LIMIT),
   };
 }
@@ -867,49 +999,11 @@ function annotateTimelineHttpPagePayload(payload, requestedLimit) {
     ...payload,
     events,
     limit: requestedLimit,
+    // `>` not `>=`, matching main. At limit exactly 1000 this under-reports the
+    // server clamp, but tightening it is an HTTP-transport change and belongs to
+    // WO-2026-08-29-001, not to this PR's DynamoDB scope.
     truncated: events.length > requestedLimit
       || (requestedLimit > TIMELINE_HTTP_MAX_LIMIT && responseCount >= TIMELINE_HTTP_MAX_LIMIT),
-  };
-}
-
-function queryTimelineRecordsFromDynamo(context, deviceId, start, end, options) {
-  const records = [];
-  const readAwsJson = context.awsJson || awsJson;
-  const requestedLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
-  const pageLimit = Math.min(requestedLimit, options.pageLimit || WATCH_DYNAMO_PAGE_LIMIT);
-  const maxRows = Math.min(options.maxRows || requestedLimit, WATCH_DYNAMO_MAX_ROWS);
-  let exclusiveStartKey;
-
-  do {
-    const args = [
-      'dynamodb', 'query',
-      '--table-name', context.logEventsTableName,
-      '--key-condition-expression', 'deviceId = :deviceId AND eventTime BETWEEN :start AND :end',
-      '--expression-attribute-values', JSON.stringify({
-        ':deviceId': { S: deviceId },
-        ':start': { S: start },
-        ':end': { S: end },
-      }),
-      '--no-scan-index-forward',
-      '--limit', String(Math.min(pageLimit, requestedLimit - records.length, maxRows - records.length)),
-    ];
-    if (exclusiveStartKey) {
-      args.push('--exclusive-start-key', JSON.stringify(exclusiveStartKey));
-    }
-
-    const page = readAwsJson(context.options, args, {
-      operation: 'dynamodb query timeline',
-      tableName: context.logEventsTableName,
-      deviceId,
-      pagination: true,
-    });
-    records.push(...((page.Items || []).map(unmarshall)));
-    exclusiveStartKey = page.LastEvaluatedKey;
-  } while (exclusiveStartKey && records.length < requestedLimit && records.length < maxRows);
-
-  return {
-    records,
-    moreAvailable: Boolean(exclusiveStartKey),
   };
 }
 
@@ -1883,7 +1977,8 @@ function createSerialState(options, now) {
 }
 
 async function fetchSerialTimeline(context, deviceId, state, now, options) {
-  return fetchWatchTimeline(context, deviceId, state, now, options.limit || DEFAULT_TIMELINE_LIMIT);
+  const effectiveNow = !state.initialized && options.until ? options.until : now;
+  return fetchWatchTimeline(context, deviceId, state, effectiveNow, options.limit || DEFAULT_TIMELINE_LIMIT);
 }
 
 function buildSerialEntries(events, state, options) {
@@ -1900,16 +1995,19 @@ function buildSerialEntries(events, state, options) {
     const entry = watchEntryFromEvent(event, options);
     if (!entry || (entry.kind !== 'SERIAL' && !(options.includeCollector && entry.kind === 'COLLECTOR'))) continue;
     if (options.grep && !entry.summary.includes(options.grep)) continue;
-    if (!options.follow && state.serialRowsEmitted >= options.limit) {
-      state.serialRowsSkipped += 1;
-      continue;
-    }
     entries.push(entry);
-    state.serialRowsEmitted += 1;
   }
 
   state.initialized = true;
-  entries.sort((left, right) => String(left.time || '').localeCompare(String(right.time || '')) || watchEventId(left.event).localeCompare(watchEventId(right.event)));
+  entries.sort((left, right) => comparePreciseInstants(left.time, right.time) || watchEventId(left.event).localeCompare(watchEventId(right.event)));
+  if (!options.follow) {
+    const remaining = Math.max(0, options.limit - state.serialRowsEmitted);
+    if (entries.length > remaining) {
+      state.serialRowsSkipped += entries.length - remaining;
+      entries.length = remaining;
+    }
+  }
+  state.serialRowsEmitted += entries.length;
   return entries;
 }
 
@@ -2019,72 +2117,149 @@ async function runWatchLoop(context, device, options, deps = {}) {
 }
 
 function createWatchState(options, now) {
-  let startMs;
+  let timelineStart;
   if (options.startIso) {
-    startMs = new Date(options.startIso).getTime();
+    timelineStart = options.startIso;
   } else if (options.sinceMs > 0) {
-    startMs = now.getTime() - options.sinceMs;
+    timelineStart = new Date(now.getTime() - options.sinceMs).toISOString();
   } else {
-    startMs = now.getTime() - WATCH_CURSOR_LOOKBACK_MS;
+    timelineStart = new Date(now.getTime() - WATCH_CURSOR_LOOKBACK_MS).toISOString();
   }
   return {
     initialized: false,
     includeInitialTimeline: options.sinceMs > 0,
     cursor: null,
     seenEventIds: new Set(),
-    timelineStart: new Date(startMs).toISOString(),
+    timelineStart,
     currentStateSnapshot: null,
   };
 }
 
 async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_TIMELINE_LIMIT) {
   const start = state.cursor ? state.cursor.eventTime : state.timelineStart;
-  const end = now.toISOString();
+  const exactEnd = typeof now === 'string' ? now : now.toISOString();
   const events = [];
-  let pageEnd = end;
+  let pageEnd = exactEnd;
+  let pageExclusiveStartKey = null;
+  let widenPageEnd = true;
   const visitedPageEnds = new Set();
   let truncated = false;
+  const httpTransport = Boolean(context.webhookSecret);
 
   while (true) {
-    if (visitedPageEnds.has(pageEnd)) {
+    const visitKey = `${pageEnd}|${pageExclusiveStartKey ? JSON.stringify(pageExclusiveStartKey) : ''}`;
+    if (visitedPageEnds.has(visitKey)) {
       truncated = true;
       break;
     }
-    visitedPageEnds.add(pageEnd);
+    visitedPageEnds.add(visitKey);
 
     const page = await fetchTimelinePage(context, deviceId, {
       start,
       end: pageEnd,
+      exactEnd,
       limit,
+      exclusiveStartKey: pageExclusiveStartKey,
+      widenEnd: widenPageEnd,
     });
     const pageEvents = page.events || [];
-    if (page.truncated && pageEvents.length < limit) truncated = true;
     events.push(...pageEvents);
 
-    if (pageEvents.length < limit) break;
+    if (httpTransport) {
+      if (page.truncated && pageEvents.length < limit) truncated = true;
+      if (pageEvents.length < limit) break;
+      const oldestHttp = [...pageEvents].sort(compareWatchEvents)[0];
+      if (!oldestHttp || compareEventToCursor(oldestHttp, state.cursor) <= 0) break;
+      pageEnd = oldestHttp.eventTime;
+      widenPageEnd = false;
+      continue;
+    }
 
-    const oldest = [...pageEvents].sort(compareWatchEvents)[0];
-    if (!oldest || compareEventToCursor(oldest, state.cursor) <= 0) break;
-    pageEnd = oldest.eventTime;
+    if (!page.nextPageEnd && !page.nextExclusiveStartKey) {
+      if (page.truncated && pageEvents.length < limit) truncated = true;
+      break;
+    }
+
+    const oldest = pageEvents.length > 0 ? [...pageEvents].sort(compareWatchEvents)[0] : null;
+    if (oldest && compareEventToCursor(oldest, state.cursor) <= 0) break;
+    pageEnd = page.nextPageEnd || pageEnd;
+    pageExclusiveStartKey = page.nextExclusiveStartKey || null;
+    widenPageEnd = false;
   }
 
+  events.sort((left, right) => compareWatchEvents(right, left));
   return { events, truncated };
 }
 
 async function fetchTimelinePage(context, deviceId, params) {
-  if (!context.webhookSecret) {
-    return queryTimelineFromDynamo(context, deviceId, {
-      startIso: params.start,
-      until: params.end,
-      limit: params.limit,
-      allowEmpty: true,
+  const exactStart = params.exactStart || params.start;
+  const exactEnd = params.exactEnd || params.end;
+  // Widen-and-filter is a DynamoDB-transport fix only. Over HTTP the query API
+  // re-normalises the bound it receives (lambda/src/query/timeline.ts), so the
+  // low-sort widened start does not survive to the stored-key comparison -- the
+  // widening buys nothing there and costs a spill window the 1000-row cap can be
+  // spent entirely inside. See WO-2026-08-29-001 defect 3.
+  const boundedQuery = context.webhookSecret
+    ? { queryStart: params.start, queryEnd: params.end }
+    : buildBoundedTimelineQuery(params.start, params.end, {
+      widenStart: true,
+      widenEnd: params.widenEnd !== false,
     });
+  if (!context.webhookSecret) {
+    const rawLimit = Math.min(params.limit, WATCH_DYNAMO_MAX_ROWS);
+    const page = queryFilteredTimelineRecordsFromDynamo(
+      context,
+      deviceId,
+      boundedQuery.queryStart,
+      boundedQuery.queryEnd,
+      {
+        limit: rawLimit,
+        filterRecord: record => isEventWithinExactWindow(record, exactStart, exactEnd),
+        exclusiveStartKey: params.exclusiveStartKey,
+      }
+    );
+    const pageRecords = [...page.records]
+      .sort((left, right) => compareWatchEvents(right, left))
+      .slice(0, params.limit);
+    const events = pageRecords.map(formatTimelineRecord);
+    return {
+      deviceId,
+      start: exactStart,
+      end: exactEnd,
+      count: events.length,
+      events,
+      limit: params.limit,
+      truncated: page.moreAvailable || page.records.length > params.limit,
+      nextPageEnd: page.moreAvailable ? params.end : null,
+      nextExclusiveStartKey: page.lastEvaluatedKey,
+      source: 'dynamodb',
+    };
   }
 
+  const rawLimit = Math.min(params.limit, TIMELINE_HTTP_MAX_LIMIT);
+  const page = await fetchTimelineHttpPage(context, deviceId, {
+    start: boundedQuery.queryStart,
+    end: boundedQuery.queryEnd,
+    limit: rawLimit,
+    requestedLimit: params.limit,
+  });
+  const rawEvents = page.events || [];
+  const events = rawEvents.slice(0, params.limit);
+  const moreAvailable = rawEvents.length > params.limit || rawEvents.length >= rawLimit;
+  return {
+    ...page,
+    count: events.length,
+    events,
+    truncated: page.truncated || rawEvents.length > params.limit,
+    nextPageEnd: nextPageEndForFilteredTimelinePage(rawEvents, events, moreAvailable, params.limit),
+  };
+}
+
+async function fetchTimelineHttpPage(context, deviceId, options) {
   const query = new URLSearchParams({
-    start: params.start,
-    end: params.end,
-    limit: String(Math.min(params.limit, TIMELINE_HTTP_MAX_LIMIT)),
+    start: options.start,
+    end: options.end,
+    limit: String(options.limit),
   });
   const url = `${context.queryApiBaseUrl}/${encodeURIComponent(deviceId)}/timeline?${query.toString()}`;
   let response;
@@ -2113,7 +2288,79 @@ async function fetchTimelinePage(context, deviceId, params) {
     fail(message);
   }
 
-  return annotateTimelineHttpPagePayload(payload, params.limit);
+  return annotateTimelineHttpPagePayload(payload, options.requestedLimit);
+}
+
+function nextPageEndForFilteredTimelinePage(rawEvents, returnedEvents, moreAvailable, limit) {
+  if (returnedEvents.length > 0 && (returnedEvents.length >= limit || moreAvailable)) {
+    const oldestReturned = [...returnedEvents].sort(compareWatchEvents)[0];
+    return oldestReturned ? previousIsoTimestamp(oldestReturned.eventTime) : null;
+  }
+  if (moreAvailable) {
+    const oldest = [...rawEvents].sort(compareWatchEvents)[0];
+    return oldest ? previousIsoTimestamp(oldest.eventTime) : null;
+  }
+  return null;
+}
+
+function queryFilteredTimelineRecords(context, deviceId, start, end, options) {
+  const readAwsJson = context.awsJson || awsJson;
+  const records = [];
+  let exclusiveStartKey = options.exclusiveStartKey;
+  const filteredLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
+  const pageLimit = Math.min(options.pageLimit || WATCH_DYNAMO_PAGE_LIMIT, WATCH_DYNAMO_PAGE_LIMIT);
+  // No raw-scan ceiling. A widened query deliberately admits out-of-window spill, and
+  // capping raw rows makes that spill hide the in-window rows behind it: 2000 same-second
+  // spill rows exhausted the old 2000-row ceiling before `timeline` reached any of the 6
+  // rows actually in the window, returning "No data found" for a window that had six.
+  // `serial` escaped it only because it pages across many calls. The loop still stops as
+  // soon as it has enough FILTERED records, or when the window is exhausted.
+  while (true) {
+    const remainingFiltered = Math.max(1, filteredLimit - records.length);
+    const args = [
+      'dynamodb', 'query',
+      '--table-name', context.logEventsTableName,
+      '--key-condition-expression', 'deviceId = :deviceId AND eventTime BETWEEN :start AND :end',
+      '--expression-attribute-values', JSON.stringify({
+        ':deviceId': { S: deviceId },
+        ':start': { S: start },
+        ':end': { S: end },
+      }),
+      '--no-scan-index-forward',
+      '--limit', String(Math.min(remainingFiltered, pageLimit)),
+    ];
+    if (exclusiveStartKey) args.push('--exclusive-start-key', JSON.stringify(exclusiveStartKey));
+
+    const page = readAwsJson(context.options, args, {
+      operation: 'dynamodb query timeline',
+      tableName: context.logEventsTableName,
+      deviceId,
+      pagination: true,
+    });
+    const pageRecords = (page.Items || []).map(unmarshall);
+    records.push(...(options.filterRecord ? pageRecords.filter(options.filterRecord) : pageRecords));
+    exclusiveStartKey = page.LastEvaluatedKey;
+
+    if (!exclusiveStartKey || records.length >= filteredLimit) break;
+  }
+
+  return {
+    records,
+    moreAvailable: Boolean(exclusiveStartKey),
+    lastEvaluatedKey: exclusiveStartKey || null,
+  };
+}
+
+function queryFilteredTimelineRecordsFromDynamo(context, deviceId, start, end, options) {
+  const result = queryFilteredTimelineRecords(context, deviceId, start, end, {
+    ...options,
+    pageLimit: options.pageLimit || WATCH_DYNAMO_PAGE_LIMIT,
+  });
+  return {
+    records: result.records,
+    moreAvailable: result.moreAvailable,
+    lastEvaluatedKey: result.lastEvaluatedKey,
+  };
 }
 
 function loadDeviceCurrentState(context, deviceId) {
@@ -2149,7 +2396,7 @@ function buildWatchEntries(events, currentState, state, options) {
 
     state.currentStateSnapshot = snapshotCurrentState(currentState);
     state.initialized = true;
-    entries.sort((left, right) => left.time.localeCompare(right.time) || left.category.localeCompare(right.category));
+    entries.sort((left, right) => comparePreciseInstants(left.time, right.time) || left.category.localeCompare(right.category));
     return entries;
   }
 
@@ -2164,7 +2411,7 @@ function buildWatchEntries(events, currentState, state, options) {
   }
   state.currentStateSnapshot = snapshotCurrentState(currentState);
 
-  entries.sort((left, right) => left.time.localeCompare(right.time) || left.category.localeCompare(right.category));
+  entries.sort((left, right) => comparePreciseInstants(left.time, right.time) || left.category.localeCompare(right.category));
   return entries;
 }
 
@@ -2183,13 +2430,13 @@ function markWatchEventSeen(state, event) {
 
 function compareEventToCursor(event, cursor) {
   if (!cursor) return 1;
-  const timeCompare = String(event.eventTime || '').localeCompare(cursor.eventTime);
+  const timeCompare = comparePreciseInstants(event.eventTime, cursor.eventTime);
   if (timeCompare !== 0) return timeCompare;
   return watchEventId(event).localeCompare(cursor.id);
 }
 
 function compareWatchEvents(left, right) {
-  return String(left.eventTime || '').localeCompare(String(right.eventTime || '')) || watchEventId(left).localeCompare(watchEventId(right));
+  return comparePreciseInstants(left.eventTime, right.eventTime) || watchEventId(left).localeCompare(watchEventId(right));
 }
 
 function watchEventId(event) {
@@ -2509,6 +2756,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  WATCH_DYNAMO_MAX_ROWS,
   OperatorError,
   TransientWatchError,
   buildWatchEntries,
