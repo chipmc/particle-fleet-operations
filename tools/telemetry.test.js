@@ -2614,7 +2614,7 @@ test('watch establishes an initial cursor without printing existing events', () 
 
   assert.deepEqual(entries, []);
   assert.equal(state.cursor.eventTime, '2026-07-14T08:00:02.000Z');
-  assert.equal(state.cursor.id, 'b');
+  assert.equal(state.cursor.id, '2026-07-14T08:00:02.000Z:b');
 });
 
 test('default startup prints no historical Timeline rows but emits initial runtime context', () => {
@@ -2626,7 +2626,7 @@ test('default startup prints no historical Timeline rows but emits initial runti
   assert.deepEqual(entries.map(entry => [entry.category, entry.summary]), [
     ['RUNTIME', 'device-status snapshot available'],
   ]);
-  assert.equal(state.cursor.id, 'serial');
+  assert.equal(state.cursor.id, '2026-07-14T08:00:01.000Z:serial');
 });
 
 test('watch returns new events only and suppresses duplicates', () => {
@@ -2643,7 +2643,10 @@ test('watch returns new events only and suppresses duplicates', () => {
 });
 
 test('watch handles identical timestamps with distinct event IDs', () => {
-  const state = { cursor: { eventTime: '2026-07-14T08:00:00.000Z', id: 'a' }, seenEventIds: new Set(['a']) };
+  const state = {
+    cursor: { eventTime: '2026-07-14T08:00:00.000Z', id: '2026-07-14T08:00:00.000Z:a' },
+    seenEventIds: new Set(['2026-07-14T08:00:00.000Z:a']),
+  };
   const events = collectNewTimelineEvents([
     event({ eventTime: '2026-07-14T08:00:00.000Z', eventId: 'a', s3Key: 'a' }),
     event({ eventTime: '2026-07-14T08:00:00.000Z', eventId: 'b', s3Key: 'b' }),
@@ -2686,6 +2689,82 @@ test('cursor prevents duplicates after initial history', () => {
   ], null, state, options);
 
   assert.deepEqual(entries, []);
+});
+
+test('watch keeps cross-poll rows that share eventId when eventTime differs and advances cursor', async () => {
+  const output = [];
+  const cursorStarts = [];
+  const controller = new AbortController();
+  let calls = 0;
+  let sleeps = 0;
+
+  await runWatchLoop({}, { deviceId: 'device123' }, watchOptions({ sinceMs: 60000, json: true }), {
+    signal: controller.signal,
+    now: () => new Date('2026-07-14T08:00:20.000Z'),
+    fetchTimeline: async (_context, _deviceId, state) => {
+      calls += 1;
+      cursorStarts.push(state.cursor ? state.cursor.eventTime : null);
+      if (calls === 1) {
+        return { events: [event({ eventTime: '2026-07-14T08:00:11.000Z', eventId: 'shared', s3Key: 's3/shared-11', eventName: 'serialLog', serialLogLine: 'first shared row' })] };
+      }
+      if (calls === 2) {
+        return { events: [event({ eventTime: '2026-07-14T08:00:12.000Z', eventId: 'shared', s3Key: 's3/shared-12', eventName: 'serialLog', serialLogLine: 'second shared row' })] };
+      }
+      return { events: [] };
+    },
+    loadCurrentState: async () => null,
+    write: line => output.push(line),
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps >= 3) controller.abort();
+    },
+  });
+
+  const records = parseNdjson(output.join('\n'));
+  assert.deepEqual(records.map(record => record.summary), ['first shared row', 'second shared row']);
+  assert.equal(cursorStarts[2], '2026-07-14T08:00:12.000Z');
+});
+
+test('watch keeps cross-poll rows that share s3Key when eventId is missing', () => {
+  const options = watchOptions({ sinceMs: 60000 });
+  const state = createWatchState(options, new Date('2026-07-14T08:00:20.000Z'));
+  const firstPoll = buildWatchEntries([
+    event({ eventTime: '2026-07-14T08:00:11.000Z', eventId: '', s3Key: 's3/shared', eventName: 'serialLog', serialLogLine: 'first shared key row' }),
+  ], null, state, options);
+  const secondPoll = buildWatchEntries([
+    event({ eventTime: '2026-07-14T08:00:12.000Z', eventId: '', s3Key: 's3/shared', eventName: 'serialLog', serialLogLine: 'second shared key row' }),
+  ], null, state, options);
+
+  assert.deepEqual(firstPoll.map(entry => entry.summary), ['first shared key row']);
+  assert.deepEqual(secondPoll.map(entry => entry.summary), ['second shared key row']);
+});
+
+test('watch keeps cross-poll rows with no eventId or s3Key when eventTime differs', () => {
+  const options = watchOptions({ sinceMs: 60000 });
+  const state = createWatchState(options, new Date('2026-07-14T08:00:20.000Z'));
+  const firstPoll = buildWatchEntries([
+    event({ eventTime: '2026-07-14T08:00:11.000Z', eventId: '', s3Key: '', eventName: 'serialLog', serialLogLine: 'first fallback row' }),
+  ], null, state, options);
+  const secondPoll = buildWatchEntries([
+    event({ eventTime: '2026-07-14T08:00:12.000Z', eventId: '', s3Key: '', eventName: 'serialLog', serialLogLine: 'second fallback row' }),
+  ], null, state, options);
+
+  assert.deepEqual(firstPoll.map(entry => entry.summary), ['first fallback row']);
+  assert.deepEqual(secondPoll.map(entry => entry.summary), ['second fallback row']);
+});
+
+test('watch dedups an identical boundary re-fetch across polls', () => {
+  const options = watchOptions({ sinceMs: 60000 });
+  const state = createWatchState(options, new Date('2026-07-14T08:00:20.000Z'));
+  const firstPoll = buildWatchEntries([
+    event({ eventTime: '2026-07-14T08:00:11.000Z', eventId: 'same', s3Key: 's3/same', eventName: 'serialLog', serialLogLine: 'same row' }),
+  ], null, state, options);
+  const secondPoll = buildWatchEntries([
+    event({ eventTime: '2026-07-14T08:00:11.000Z', eventId: 'same', s3Key: 's3/same', eventName: 'serialLog', serialLogLine: 'same row' }),
+  ], null, state, options);
+
+  assert.deepEqual(firstPoll.map(entry => entry.summary), ['same row']);
+  assert.deepEqual(secondPoll, []);
 });
 
 test('watch formats serialLog lines and truncates by default', () => {
@@ -3964,8 +4043,9 @@ test('serial --follow does not emit a summary record', async () => {
   assert.equal(records.some(record => record.record === 'summary'), false);
 });
 
-test('serial --follow advances past shared event IDs without duplicating rows', async () => {
+test('serial --follow keeps cross-poll rows that share eventId when eventTime differs and advances cursor', async () => {
   const output = [];
+  const cursorStarts = [];
   const controller = new AbortController();
   let calls = 0;
   let sleeps = 0;
@@ -3973,34 +4053,38 @@ test('serial --follow advances past shared event IDs without duplicating rows', 
   await runSerialLoop({}, { deviceId: 'device123' }, serialOptions({ sinceMs: 0, follow: true, json: true }), {
     signal: controller.signal,
     now: () => new Date('2026-07-14T08:00:10.000Z'),
-    fetchTimeline: async () => {
+    fetchTimeline: async (_context, _deviceId, state) => {
       calls += 1;
+      cursorStarts.push(state.cursor ? state.cursor.eventTime : null);
       if (calls === 1) return { events: [] };
       if (calls === 2) {
         return {
           events: [
             serialTimelineEvent(11, { eventId: 'shared', s3Key: 's3/shared-11', serialLogLine: 'first shared row' }),
+          ],
+        };
+      }
+      if (calls === 3) {
+        return {
+          events: [
             serialTimelineEvent(12, { eventId: 'shared', s3Key: 's3/shared-12', serialLogLine: 'second shared row' }),
           ],
         };
       }
       return {
-        events: [
-          serialTimelineEvent(12, { eventId: 'shared', s3Key: 's3/shared-12', serialLogLine: 'second shared row' }),
-          serialTimelineEvent(13, { eventId: 'next', s3Key: 's3/next-13', serialLogLine: 'next row' }),
-        ],
+        events: [],
       };
     },
     write: line => output.push(line),
     sleep: async () => {
       sleeps += 1;
-      if (sleeps >= 3) controller.abort();
+      if (sleeps >= 4) controller.abort();
     },
   });
 
   const records = parseNdjson(output.join('\n'));
-  assert.deepEqual(records.map(record => record.line), ['first shared row', 'second shared row', 'next row']);
-  assert.deepEqual(records.map(record => record.event.s3Key), ['s3/shared-11', 's3/shared-12', 's3/next-13']);
+  assert.deepEqual(records.map(record => record.line), ['first shared row', 'second shared row']);
+  assert.equal(cursorStarts[3], '2026-07-14T08:00:12.000Z');
 });
 
 test('serial --follow emits each mixed-format row once as the cursor advances', async () => {

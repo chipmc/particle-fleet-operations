@@ -1987,7 +1987,7 @@ function buildSerialEntries(events, state, options) {
   const seenInBatch = new Set();
 
   for (const event of newEvents) {
-    const rowIdentity = `${event.eventTime}:${watchEventId(event)}`;
+    const rowIdentity = watchEventRowIdentity(event);
     if (seenInBatch.has(rowIdentity)) continue;
     seenInBatch.add(rowIdentity);
     markWatchEventSeen(state, event);
@@ -2417,14 +2417,15 @@ function buildWatchEntries(events, currentState, state, options) {
 
 function collectNewTimelineEvents(events, state) {
   return [...events]
-    .filter(event => compareEventToCursor(event, state.cursor) > 0 && !state.seenEventIds.has(watchEventId(event)))
+    .filter(event => compareEventToCursor(event, state.cursor) > 0 && !state.seenEventIds.has(watchEventRowIdentity(event)))
     .sort(compareWatchEvents);
 }
 
 function markWatchEventSeen(state, event) {
-  state.seenEventIds.add(watchEventId(event));
+  const rowIdentity = watchEventRowIdentity(event);
+  state.seenEventIds.add(rowIdentity);
   if (compareEventToCursor(event, state.cursor) > 0) {
-    state.cursor = { eventTime: event.eventTime, id: watchEventId(event) };
+    state.cursor = { eventTime: event.eventTime, id: rowIdentity };
   }
 }
 
@@ -2432,7 +2433,7 @@ function compareEventToCursor(event, cursor) {
   if (!cursor) return 1;
   const timeCompare = comparePreciseInstants(event.eventTime, cursor.eventTime);
   if (timeCompare !== 0) return timeCompare;
-  return watchEventId(event).localeCompare(cursor.id);
+  return watchEventRowIdentity(event).localeCompare(cursor.id);
 }
 
 function compareWatchEvents(left, right) {
@@ -2440,7 +2441,11 @@ function compareWatchEvents(left, right) {
 }
 
 function watchEventId(event) {
-  return stringValue(event.eventId) || stringValue(event.s3Key) || `${event.eventTime}:${event.eventName}`;
+  return stringValue(event.eventId) || stringValue(event.s3Key) || String(event.eventName || '');
+}
+
+function watchEventRowIdentity(event) {
+  return `${String(event.eventTime || '')}:${watchEventId(event)}`;
 }
 
 function watchEntryFromEvent(event, options) {
