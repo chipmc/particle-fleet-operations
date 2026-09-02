@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git fetch *)",
+      "Bash(mkdir -p /Users/chipmc/Documents/Maker/AWS/particle-fleet-operations/docs/architecture *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
+    ],
+    "additionalDirectories": [
+      "/Users/chipmc/Downloads"
+    ]
+  }
+}
