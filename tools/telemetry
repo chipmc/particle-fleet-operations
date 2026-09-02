@@ -2155,7 +2155,13 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
   // accumulated total at 1000 drops history main recovers: a 1202-row window at
   // --limit 1000 returned 1000 rows with truncated:true against main's 1202 and
   // truncated:false. WO-2026-08-29-001.
-  const capApplies = !httpTransport && limit >= sourceCap;
+  // `>` not `>=`. At limit EXACTLY the cap, main keeps paging and returns the whole
+  // window; only above it does main stop on a short page at 2000. `>=` capped that
+  // equality case too, retaining the newest 2000 -- and serial applies --grep after
+  // the fetch, so matches older than that slice vanished: --limit 2000 --grep over
+  // 2500 rows where only the oldest 500 match returned 0 rows / truncated:true
+  // against main's 500 / truncated:false. Codex round 3, PR #20.
+  const capApplies = !httpTransport && limit > sourceCap;
   const maxCollectedEvents = capApplies ? sourceCap + 1 : Number.POSITIVE_INFINITY;
   // Step 0's raw-scan budget and the exclusive page cursor are DynamoDB-transport
   // work, verified on that transport only. Over HTTP the budget cuts history short
