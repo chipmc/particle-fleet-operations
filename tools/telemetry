@@ -2214,10 +2214,6 @@ async function fetchTimelinePage(context, deviceId, params) {
       boundedQuery.queryEnd,
       {
         limit: rawLimit,
-        // Forward the caller's remaining raw-scan budget. Without this the inner query
-        // falls back to WATCH_DYNAMO_MAX_ROWS per page, so the outer budget is applied
-        // once per page rather than across the whole scan -- roughly double the intended
-        // allowance. Matches 44e731f.
         filterRecord: record => isEventWithinExactWindow(record, exactStart, exactEnd),
         exclusiveStartKey: params.exclusiveStartKey,
       }
@@ -2233,7 +2229,6 @@ async function fetchTimelinePage(context, deviceId, params) {
       count: events.length,
       events,
       limit: params.limit,
-      rawCount: page.rawRecords.length,
       truncated: page.moreAvailable || page.records.length > params.limit,
       nextPageEnd: page.moreAvailable ? params.end : null,
       nextExclusiveStartKey: page.lastEvaluatedKey,
@@ -2255,7 +2250,6 @@ async function fetchTimelinePage(context, deviceId, params) {
     ...page,
     count: events.length,
     events,
-    rawCount: rawEvents.length,
     truncated: page.truncated || rawEvents.length > params.limit,
     nextPageEnd: nextPageEndForFilteredTimelinePage(rawEvents, events, moreAvailable, params.limit),
   };
@@ -2312,7 +2306,6 @@ function nextPageEndForFilteredTimelinePage(rawEvents, returnedEvents, moreAvail
 function queryFilteredTimelineRecords(context, deviceId, start, end, options) {
   const readAwsJson = context.awsJson || awsJson;
   const records = [];
-  const rawRecords = [];
   let exclusiveStartKey = options.exclusiveStartKey;
   const filteredLimit = options.limit || DEFAULT_TIMELINE_LIMIT;
   const pageLimit = Math.min(options.pageLimit || WATCH_DYNAMO_PAGE_LIMIT, WATCH_DYNAMO_PAGE_LIMIT);
@@ -2345,7 +2338,6 @@ function queryFilteredTimelineRecords(context, deviceId, start, end, options) {
       pagination: true,
     });
     const pageRecords = (page.Items || []).map(unmarshall);
-    rawRecords.push(...pageRecords);
     records.push(...(options.filterRecord ? pageRecords.filter(options.filterRecord) : pageRecords));
     exclusiveStartKey = page.LastEvaluatedKey;
 
@@ -2354,7 +2346,6 @@ function queryFilteredTimelineRecords(context, deviceId, start, end, options) {
 
   return {
     records,
-    rawRecords,
     moreAvailable: Boolean(exclusiveStartKey),
     lastEvaluatedKey: exclusiveStartKey || null,
   };
@@ -2367,7 +2358,6 @@ function queryFilteredTimelineRecordsFromDynamo(context, deviceId, start, end, o
   });
   return {
     records: result.records,
-    rawRecords: result.rawRecords,
     moreAvailable: result.moreAvailable,
     lastEvaluatedKey: result.lastEvaluatedKey,
   };

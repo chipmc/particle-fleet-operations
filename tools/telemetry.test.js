@@ -17,7 +17,6 @@ const {
 
 const {
   TransientWatchError,
-  WATCH_DYNAMO_MAX_ROWS,
   buildSerialEntries,
   buildFleetSummary,
   buildWatchEntries,
@@ -1073,7 +1072,7 @@ test('timeline Dynamo does not report truncation when result count exactly match
   assert.equal(timeline.truncated, false);
 });
 
-test('timeline Dynamo keeps a complete 1999-record window below the internal cap untruncated', async () => {
+test('timeline Dynamo keeps a complete 1999-record window untruncated', async () => {
   const records = serialTimelineEvents(1999);
   const timeline = await fetchTimeline({
     options: {},
@@ -3256,10 +3255,10 @@ test('serial HTTP paging still advances when the caller limit is above the 1000-
 
 // KNOWN OPEN -- do NOT 'fix' this by loosening the assertion.
 //
-// With the raw-scan budget restored (boundedTimelineRawScanBudget), this window returns
-// all six in-window rows but reports truncated:true, because the budget is exhausted
-// reading rows OUTSIDE the window after every in-window row has already been found.
-// That is a false-positive truncation on a COMPLETE result, which violates
+// Step 0's raw-scan budget was RETIRED on 2026-09-02, so the Dynamo half of this case is
+// no longer reachable; what remains open is the HTTP half. Over HTTP the 1000-row server
+// clamp still stops the scan mid-window, so this window reports truncated:true on what is
+// a COMPLETE result, which violates
 // WO-2026-08-27-001's contract that complete results report truncated:false
 // (docs/API.md still promises false for complete, non-clamped results). The only
 // sanctioned conservative case is the 1000-row HTTP clamp.
