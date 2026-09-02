@@ -1151,7 +1151,11 @@ test('timeline Dynamo reports truncation when the internal 2000-row cap blocks t
   assert.equal(timeline.truncated, true);
 });
 
-test('timeline Dynamo reports truncation when the internal 2000-row cap truncates a request above the caller limit', async () => {
+// The internal 2000-row raw ceiling was retired with Step 0: it hid in-window rows
+// behind widened spill (timeline returned "No data found" for a window holding six).
+// A 2500-row window under --limit 5000 is complete, so it returns every row untruncated
+// per docs/API.md:625.
+test('timeline Dynamo returns the complete window when it is under the caller limit', async () => {
   const records = serialTimelineEvents(2500);
   const timeline = await fetchTimeline({
     options: {},
@@ -1162,9 +1166,9 @@ test('timeline Dynamo reports truncation when the internal 2000-row cap truncate
     limit: 5000,
   });
 
-  assert.equal(timeline.count, 2000);
+  assert.equal(timeline.count, 2500);
   assert.equal(timeline.limit, 5000);
-  assert.equal(timeline.truncated, true);
+  assert.equal(timeline.truncated, false);
 });
 
 test('timeline HTTP requests limit plus one and injects truncation into the trimmed payload', async () => {
@@ -3306,7 +3310,11 @@ test('serial HTTP returns all in-window rows from a 5000-row dense bounded datas
   assert.deepEqual(warnings, []);
 });
 
-test('serial timeline fetch reports truncation for Dynamo windows above the 2000-row internal cap', async () => {
+// Step 0's 2000-row internal cap was retired from WO-2026-08-28-004: it was never a
+// fix, and it reported truncated:true on results that are complete. docs/API.md:625
+// requires a complete bounded result to keep truncated:false on the DynamoDB path.
+// A 2500-row window at --limit 3000 is complete, so it returns every row untruncated.
+test('serial timeline fetch returns the complete Dynamo window when it is under --limit', async () => {
   const options = serialOptions({
     sinceMs: 0,
     startIso: fixedIso(1),
@@ -3322,8 +3330,8 @@ test('serial timeline fetch reports truncation for Dynamo windows above the 2000
     awsJson: createPaginatedTimelineAwsJson(serialTimelineEvents(2500)),
   }, 'device123', state, new Date(fixedIso(2500)), options);
 
-  assert.equal(timeline.events.length, 2000);
-  assert.equal(timeline.truncated, true);
+  assert.equal(timeline.events.length, 2500);
+  assert.equal(timeline.truncated, false);
 });
 
 test('serial timeline fetch reports truncation for HTTP windows clamped at the 1000-event server cap', async () => {
@@ -3682,7 +3690,10 @@ test('serial grep with many fully recovered pages and no matches does not report
   assert.deepEqual(warnings, []);
 });
 
-test('serial grep still reports truncation when an elevated-limit Dynamo window is capped before recovery', async () => {
+// Formerly asserted truncated:true because Step 0's cap stopped the scan early. With
+// the cap retired the whole window is scanned, so a no-match grep is a COMPLETE result
+// and must report truncated:false with no WARN (docs/API.md:625).
+test('serial grep over a fully scanned Dynamo window reports a complete no-match result', async () => {
   const warnings = [];
   const output = [];
   const options = serialOptions({
@@ -3705,14 +3716,14 @@ test('serial grep still reports truncation when an elevated-limit Dynamo window 
     warn: message => warnings.push(message),
   });
 
-  assert.equal(result.truncated, true);
+  assert.equal(result.truncated, false);
   assert.deepEqual(parseNdjson(output.join('\n')), [{
     record: 'summary',
-    truncated: true,
+    truncated: false,
     count: 0,
     limit: 3000,
   }]);
-  assert.deepEqual(warnings, ['WARN: results truncated at 3000 events (--limit), narrow your window or raise --limit.']);
+  assert.deepEqual(warnings, []);
 });
 
 test('serial exact-limit complete window at 2 events does not truncate or emit duplicate event IDs', async () => {
@@ -3898,18 +3909,19 @@ for (const count of [26, 200]) {
   });
 }
 
-test('serial mixed-format regression truncates a 2500-row window at limit 3000 after the 2000-row cap', async () => {
+// Cap retired: 2500 mixed-encoding rows under a 3000 limit is a complete window.
+test('serial mixed-format regression keeps a complete 2500-row window untruncated at limit 3000', async () => {
   const { result, records, warnings } = await runSerialJsonWindow(mixedFormatSerialTimelineEvents(2500), { limit: 3000 });
 
-  assert.equal(result.truncated, true);
-  assert.equal(records.slice(0, -1).length, 2000);
+  assert.equal(result.truncated, false);
+  assert.equal(records.slice(0, -1).length, 2500);
   assert.deepEqual(records.at(-1), {
     record: 'summary',
-    truncated: true,
-    count: 2000,
+    truncated: false,
+    count: 2500,
     limit: 3000,
   });
-  assert.deepEqual(warnings, ['WARN: results truncated at 3000 events (--limit), narrow your window or raise --limit.']);
+  assert.deepEqual(warnings, []);
 });
 
 test('serial mixed-format regression keeps a complete 2000-row window untruncated at limit 3000', async () => {
@@ -4553,7 +4565,11 @@ test('fleet summary verbose text row includes SCHEMA VER for schemaVersion 2 dev
   assert.match(text, /SCHEMA VER/);
   assert.match(text, /2/);
 });
-test('serial mixed-format paging caps widened Dynamo raw work and reports truncation when the cap is hit', async () => {
+// Was Step 0's budget test. The budget is retired, so the assertion that matters is the
+// Defect 2 one this fixture was always really about: every in-window row survives a
+// widened query that admits 1994 newer spill rows and 3000 older ones. The result is
+// complete, so truncated:false.
+test('serial mixed-format paging returns every in-window row through a widened Dynamo query', async () => {
   const calls = [];
   const limit = 25;
   const records = [
@@ -4575,11 +4591,8 @@ test('serial mixed-format paging caps widened Dynamo raw work and reports trunca
     until: '2026-07-14T08:00:40.105000+00:00',
     limit,
   }, calls);
-  const maxExpectedQueries = Math.ceil((WATCH_DYNAMO_MAX_ROWS + Math.min(limit, WATCH_DYNAMO_MAX_ROWS)) / limit);
-
-  assert.equal(timeline.truncated, true);
+  assert.equal(timeline.truncated, false);
   assert.deepEqual(timeline.events.map(item => item.eventId), ['in-6', 'in-5', 'in-4', 'in-3', 'in-2', 'in-1']);
-  assert.ok(calls.length <= maxExpectedQueries, `expected capped Dynamo query work, saw ${calls.length} queries`);
 });
 
 test('R1: serial --limit 1 over a same-second same-format window emits the oldest row and reports truncation', async () => {
