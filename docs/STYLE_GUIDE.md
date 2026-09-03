@@ -10,6 +10,17 @@ This document exists to prevent the same convention from being silently rediscov
 silently violated — by a new agent, a new review round, or a future you. When a rule below
 traces back to a real incident, the incident is named so nobody has to take it on faith.
 
+## Citing work orders
+
+A work order in **this** repository's history is cited bare: `WO-2026-08-28-004`. A work
+order in **another** repository's history is prefixed with that repository's short code and
+a slash: `GCC/WO-2026-08-29-001` for `Generalized-Core-Counter`.
+
+Both repositories number their work orders per-day and independently, so identical
+identifiers across repositories are expected rather than erroneous — `WO-2026-08-29-001`
+denotes this repo's HTTP transport work order in §3 and an unrelated firmware work order in
+§5 — and the prefix is what keeps the two distinguishable at a glance.
+
 ## 1. Formatting
 
 - **Indentation: 2 spaces**, no tabs. (A 4-space search pattern against this file's actual
@@ -155,6 +166,25 @@ budget, HTTP response size) must:
   implementation's behaviour rather than the contract. Measuring the same cells against
   `main` is what surfaced the defects at the close of WO-2026-08-28-004; expected-value
   checks alone had passed.
+- **Nothing may certify its own output.** A claim needs independent reproduction, not a
+  re-read of the artifact that produced it. This applies to a diagnostic that reports values
+  read back out of the subsystem under investigation, to a build system asked whether its
+  own build is current, and to an agent asserting that its change works because its own test
+  passes. Where the reporter and the suspect share a failure mode, agreement between them
+  proves nothing. Record the value once, independently, before the suspect operation, so the
+  two can be cross-checked. This project has been bitten by every variant: a doubled test
+  bound that certified the code that widened it, a deleted budget/test/export triple that
+  removed its own evidence, and a mock whose semantics fabricated two regressions that were
+  never real.
+- **When successive rounds each find a defect in a *different* category, the category set
+  itself is untested — adding another round in the category just found will not converge.**
+  The correct next step is an explicit enumeration of failure modes against current
+  coverage — not called / wrong value in / wrong value out / wrong branch / wrong config /
+  silent failure / wrong timing — rather than more ad hoc tests in the latest category. Ask
+  what category is not being tested, not what else to test in this one. Five rounds against
+  a 60-line change (Generalized-Core-Counter, GCC/WO-2026-08-29-001) and five merge-gate passes
+  against WO-2026-08-28-004 both showed this shape: coverage extended reactively to whatever
+  the previous round had just found.
 - **Status labels ("closed," "fixed," "consolidated," "complete") must state precisely what
   was verified, not the intent behind the work.** "Defect 2: closed" turned out to mean
   "closed for the `--start`/`--until` window path only" once the `watch` cursor path was
@@ -164,18 +194,71 @@ budget, HTTP response size) must:
 
 ## 6. Firmware repo (Generalized-Core-Counter, C++)
 
-Not yet drafted. Should adapt Google's
-[C++ Style Guide](https://google.github.io/styleguide/cppguide.html) plus project-specific
-conventions already established informally in this project's history, e.g.:
+These conventions are authored from this repo but apply to the firmware repo
+(`Generalized-Core-Counter`), per the maintenance rule below: a convention that surfaces
+belongs in writing wherever it applies. **That repo uses a different toolchain than this
+one** — Particle Device OS and the `particle` CLI, versus this repo's Node/TypeScript/Lambda
+stack. Do not carry a firmware path or command into work on this repo.
 
-- Reset-survival claims must be verified against the linker map / explicit `retained`
-  declarations, never inferred from symptom fit.
-- Field-meaning documentation is required wherever two similarly-named fields from
-  different subsystems could be confused (the `vbus=`/`usbReg=` and `mode=`/`tier=`
-  pattern).
-- Build-flag state (what was actually compiled in, not just what's in source) should be
-  surfaced at runtime wherever a conditional compile has previously caused a silent
-  behavior gap.
+Entries here are the **firmware-specific** form of each rule. Where an incident also
+produced a general principle, that principle lives in §5 and is not restated here — §6 is
+the toolchain detail, §5 is the rule.
+
+Still to be drafted: a general C++ house style, which should adapt Google's
+[C++ Style Guide](https://google.github.io/styleguide/cppguide.html).
+
+- **Verifying that a compile-time flag is genuinely absent from a build requires forcing a
+  real rebuild of the affected object — never trust the existing build artifact
+  (Generalized-Core-Counter, GCC/WO-2026-08-31-003, week of 2026-08-29).** Any restore
+  operation that preserves or backdates mtime can leave a stale object the build system has
+  no way to know is stale, and it will then answer confidently and wrongly about whether the
+  flag took effect. This is not specific to `mv` from a `.bak` — `cp -p`, `git stash pop`,
+  `rsync -t`, archive extraction and an editor's "revert file" all have the same property.
+  **Restore a build-config file by rewriting it in place** (an edit, or `cat > file`), which
+  advances mtime and forces the rebuild; never by a timestamp-preserving restore. Record the
+  build's size output at both flag values — a size matching the *other* setting is the
+  signature of a stale link. *Firmware-specific illustration (Particle/Device OS toolchain
+  only, does not apply to this repo):* the compiled objects live under
+  `~/.particle/toolchains/deviceOS/<version>/build/target/user/platform-<id>-m/<app>/`, not
+  the project-local `target/`, which holds link output only — so clearing `target/` does not
+  force a rebuild. This produced a real false reading: a build reported the flag=1 text size
+  while its source read `0`, and `nm` found a bench-only symbol in a binary that should not
+  have contained it. **Why it matters:** this is the property keeping a deliberately
+  clock-corrupting bench hook out of default builds. A verification method that a stale
+  timestamp can fool will assert that property and be wrong — in either direction. Showing a
+  feature present when it is absent costs an investigation; the reverse ships the hook.
+- **Diagnostic output about a suspected subsystem is not corroboration of that subsystem
+  (Generalized-Core-Counter, GCC/WO-2026-08-31-004, week of 2026-08-29).** A diagnostic event
+  that reads its own reported values back out of the thing under investigation — retained
+  memory, a suspect peripheral — cannot rule that subsystem in or out, because a fault there
+  could corrupt the very values the diagnostic reports. The report and the suspect share a
+  failure mode, so agreement between them proves nothing. Where feasible, **record the value
+  once, independently, before the suspect operation**, so the two can be cross-checked
+  rather than resting on a single self-reported source. (General rule: §5, "Nothing may
+  certify its own output.")
+
+- **A reset-survival claim must be verified against the linker map or an explicit `retained`
+  declaration — never inferred from how well it explains a symptom — and "survives a reset"
+  must not be conflated with "re-initializes on a flash" (Generalized-Core-Counter,
+  GCC/WO-2026-08-31-003, week of 2026-08-29).** These are two separate properties with two
+  separate proofs, and code needing the second while only verifying the first will fail
+  silently. **Named trap:** a `retained` variable's `= false` initializer does *not*
+  reliably run when new firmware is flashed. *Firmware-specific illustration
+  (Particle/Device OS toolchain only):* Device OS copies initial values into backup RAM only
+  when the signature check fails (`wiring/src/user.cpp`, `backup_ram_was_valid_` →
+  `system_initialize_user_backup_ram()`), so a flash with power maintained preserves the old
+  value. A one-shot latch built on a bare `retained bool` may therefore never arm, and the
+  failure is invisible — the device simply does nothing. Pair the flag with a build token
+  compared against a compile-time constant, or consult `__backup_ram_was_valid()`. Prove
+  placement with `objdump -t` (the symbol should land in `.backup`), not by reading the
+  declaration.
+- **Document field meaning wherever two similarly-named fields from different subsystems
+  could be confused (Generalized-Core-Counter, `docs/FIELD_MEANINGS_REFERENCE.md`).** Log lines that pack
+  several subsystems into one string invite silent misreading during incident analysis,
+  when the cost of a wrong reading is highest — the `vbus=`/`usbReg=` and `mode=`/`tier=`
+  pairs are the established examples. A reader must be able to determine which subsystem
+  owns a field without reading the format string. Where a name cannot be made
+  self-explanatory, the emitting code carries a comment naming the units and source.
 
 ## 7. Local build artifacts & tooling filenames
 
