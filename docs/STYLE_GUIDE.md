@@ -253,7 +253,7 @@ Still to be drafted: a general C++ house style, which should adapt Google's
   placement with `objdump -t` (the symbol should land in `.backup`), not by reading the
   declaration.
 - **Document field meaning wherever two similarly-named fields from different subsystems
-  could be confused (Generalized-Core-Counter, week of 2026-08-29).** Log lines that pack
+  could be confused (Generalized-Core-Counter, `docs/FIELD_MEANINGS_REFERENCE.md`).** Log lines that pack
   several subsystems into one string invite silent misreading during incident analysis,
   when the cost of a wrong reading is highest — the `vbus=`/`usbReg=` and `mode=`/`tier=`
   pairs are the established examples. A reader must be able to determine which subsystem
