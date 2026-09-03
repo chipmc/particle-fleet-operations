@@ -282,7 +282,6 @@ respect to be evidence at all.
 Current Project Focus
 
 Current priorities:
-Current Project Focus
 
 1. Stabilize Particle device-name enrichment.
 2. Verify current-state projection correctness.
