@@ -10,6 +10,17 @@ This document exists to prevent the same convention from being silently rediscov
 silently violated — by a new agent, a new review round, or a future you. When a rule below
 traces back to a real incident, the incident is named so nobody has to take it on faith.
 
+## Citing work orders
+
+A work order in **this** repository's history is cited bare: `WO-2026-08-28-004`. A work
+order in **another** repository's history is prefixed with that repository's short code and
+a slash: `GCC/WO-2026-08-29-001` for `Generalized-Core-Counter`.
+
+Both repositories number their work orders per-day and independently, so identical
+identifiers across repositories are expected rather than erroneous — `WO-2026-08-29-001`
+denotes this repo's HTTP transport work order in §3 and an unrelated firmware work order in
+§5 — and the prefix is what keeps the two distinguishable at a glance.
+
 ## 1. Formatting
 
 - **Indentation: 2 spaces**, no tabs. (A 4-space search pattern against this file's actual
@@ -171,7 +182,7 @@ budget, HTTP response size) must:
   coverage — not called / wrong value in / wrong value out / wrong branch / wrong config /
   silent failure / wrong timing — rather than more ad hoc tests in the latest category. Ask
   what category is not being tested, not what else to test in this one. Five rounds against
-  a 60-line change (Generalized-Core-Counter, WO-2026-08-29-001) and five merge-gate passes
+  a 60-line change (Generalized-Core-Counter, GCC/WO-2026-08-29-001) and five merge-gate passes
   against WO-2026-08-28-004 both showed this shape: coverage extended reactively to whatever
   the previous round had just found.
 - **Status labels ("closed," "fixed," "consolidated," "complete") must state precisely what
@@ -198,7 +209,7 @@ Still to be drafted: a general C++ house style, which should adapt Google's
 
 - **Verifying that a compile-time flag is genuinely absent from a build requires forcing a
   real rebuild of the affected object — never trust the existing build artifact
-  (Generalized-Core-Counter, WO-2026-08-31-003, week of 2026-08-29).** Any restore
+  (Generalized-Core-Counter, GCC/WO-2026-08-31-003, week of 2026-08-29).** Any restore
   operation that preserves or backdates mtime can leave a stale object the build system has
   no way to know is stale, and it will then answer confidently and wrongly about whether the
   flag took effect. This is not specific to `mv` from a `.bak` — `cp -p`, `git stash pop`,
@@ -217,7 +228,7 @@ Still to be drafted: a general C++ house style, which should adapt Google's
   timestamp can fool will assert that property and be wrong — in either direction. Showing a
   feature present when it is absent costs an investigation; the reverse ships the hook.
 - **Diagnostic output about a suspected subsystem is not corroboration of that subsystem
-  (Generalized-Core-Counter, WO-2026-08-31-004, week of 2026-08-29).** A diagnostic event
+  (Generalized-Core-Counter, GCC/WO-2026-08-31-004, week of 2026-08-29).** A diagnostic event
   that reads its own reported values back out of the thing under investigation — retained
   memory, a suspect peripheral — cannot rule that subsystem in or out, because a fault there
   could corrupt the very values the diagnostic reports. The report and the suspect share a
@@ -229,7 +240,7 @@ Still to be drafted: a general C++ house style, which should adapt Google's
 - **A reset-survival claim must be verified against the linker map or an explicit `retained`
   declaration — never inferred from how well it explains a symptom — and "survives a reset"
   must not be conflated with "re-initializes on a flash" (Generalized-Core-Counter,
-  WO-2026-08-31-003, week of 2026-08-29).** These are two separate properties with two
+  GCC/WO-2026-08-31-003, week of 2026-08-29).** These are two separate properties with two
   separate proofs, and code needing the second while only verifying the first will fail
   silently. **Named trap:** a `retained` variable's `= false` initializer does *not*
   reliably run when new firmware is flashed. *Firmware-specific illustration
