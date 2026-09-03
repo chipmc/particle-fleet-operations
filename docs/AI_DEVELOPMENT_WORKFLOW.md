@@ -158,9 +158,29 @@ Phase 7 — Cleanup / Documentation
 
 Claude updates README, architecture docs, runbooks, and removes temporary diagnostics.
 
+Also update docs/STYLE_GUIDE.md whenever a round surfaced a convention that was not
+written down. The guide's own maintenance rule is that "we had to rediscover this" is the
+trigger to add a line, not just to fix the immediate instance. A work order that produced
+a new rule is not finished until the rule is in the guide.
+
 ⸻
 
 Engineering Principles
+
+Style & Usage Guide
+
+docs/STYLE_GUIDE.md is binding on every change to this repository, by any agent or by
+Chip. Read it before writing code, and again before opening a PR. Its rules are not
+stylistic preferences; almost every one is a defect that already happened here, written
+down so it does not have to be rediscovered. Sections 3, 4 and 5 in particular encode
+failure modes that a green test suite did not catch.
+
+A change that violates it is not merely untidy. Treat a violation the way you would treat
+a failing test: fix it, or state explicitly in the PR why the rule does not apply here.
+
+When the guide and docs/API.md disagree, docs/API.md is authoritative and the guide is the
+file to correct. When the guide and this document disagree on process, say so rather than
+picking one silently.
 
 When tradeoffs exist:
 
@@ -251,12 +271,17 @@ against that service before its results are used as evidence. A mock that modell
 DynamoDB ExclusiveStartKey as a positional offset rather than a key produced two false
 blocking defect reports across two review rounds before the discrepancy was noticed.
 
+The full set of testing rules this project has accumulated — including this one, the
+requirement that a new test be shown to fail for the correct reason, and the rule against
+loosening an assertion to accommodate new code — is in docs/STYLE_GUIDE.md section 5.
+Its section 3 carries the DynamoDB and timestamp-encoding conventions that a mock has to
+respect to be evidence at all.
+
 ⸻
 
 Current Project Focus
 
 Current priorities:
-Current Project Focus
 
 1. Stabilize Particle device-name enrichment.
 2. Verify current-state projection correctness.
