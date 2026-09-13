@@ -88,6 +88,24 @@ data loss.
   Any DynamoDB mock must sort by **string comparison**, not parsed instant, and be
   cross-checked against the live table — a mock that sorts "correctly" by parsed instant
   cannot reproduce this defect class at all.
+- **A firmware field whose meaning changed across builds must be decoded by log-format
+  fingerprint, not by `fw_version`, and the fingerprint must be a property of the same
+  payload.** `bc` (`lastWatchdogBreadcrumb`) names different code sites before and after
+  `GCC/75ad0a8`, and both generations are live in product 42131 simultaneously, so a
+  Morrisville court unit and a bench Boron emit an identical `bc=18` meaning different things.
+  The usable discriminator is that the same commit also added `osReason` to the watchdog
+  payload: `osReason` present iff the renumbered scheme. `fw_version` is a release label, not
+  evidence of the running build, and this fleet has already been burned trusting it
+  (`GCC/WO-2026-08-31-004`). Decoder and maps live in `tools/breadcrumb-decode.js`.
+  **Named trap:** a renumbering that resolves a collision *in the source* does not resolve it
+  *for a reader* — the colliding values keep arriving from devices still on the old build, and
+  nothing in the payload announces its scheme. "The collision was fixed" means fixed for new
+  firmware; check separately what the reader sees.
+- **When a value genuinely cannot be narrowed, report the ambiguity rather than picking the
+  likelier site.** Pre-`75ad0a8`, `bc` 18/19/20 are each written from two sites with different
+  meanings *within the same build*, so no era tag can disambiguate them; 21 is written from one
+  site and can. A decoder that silently returned the sleep-path reading for all four would be
+  right three times out of four and silently wrong the rest, which is worse than saying so.
 
 ## 4. Truncation / completeness contracts
 

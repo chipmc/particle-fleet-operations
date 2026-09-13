@@ -1,5 +1,7 @@
 'use strict';
 
+const { formatBreadcrumb } = require('./breadcrumb-decode');
+
 const PRESENTATION_KINDS = new Set([
   'SERIAL',
   'COLLECTOR',
@@ -143,10 +145,19 @@ function summarizeEvent(event, kind, facts) {
   if (kind === 'SERIAL') return serialLine(event) || 'Serial log event';
   if (kind === 'COLLECTOR') return collectorSummary(event, facts.eventType);
   if (kind === 'LIFECYCLE') return 'Device status event';
-  if (kind === 'WATCHDOG') return evidenceLine(event) || friendlyType(facts.eventType, facts.eventName, 'Watchdog event');
+  if (kind === 'WATCHDOG') return watchdogSummary(event, facts);
   if (kind === 'TELEMETRY') return telemetrySummary(event, facts.eventType, facts.eventName);
   if (kind === 'ERROR') return evidenceLine(event) || friendlyType(facts.eventType, facts.eventName, 'Error event');
   return friendlyType(facts.eventType, facts.eventName, 'Event');
+}
+
+function watchdogSummary(event, facts) {
+  const base = evidenceLine(event) ||
+    friendlyType(facts.eventType, facts.eventName, 'Watchdog event');
+  // The breadcrumb number alone is ambiguous across firmware generations; formatBreadcrumb()
+  // resolves the numbering scheme from the payload's own shape. Absent `bc`, this is inert.
+  const breadcrumb = formatBreadcrumb(event);
+  return breadcrumb ? `${base} - ${breadcrumb}` : base;
 }
 
 function collectorSummary(event, eventType) {
