@@ -2181,7 +2181,8 @@ async function fetchWatchTimeline(context, deviceId, state, now, limit = WATCH_T
     }
 
     const oldest = pageEvents.length > 0 ? [...pageEvents].sort(compareWatchEvents)[0] : null;
-    if (oldest && compareEventToCursor(oldest, state.cursor) <= 0) break;
+    const rawScanClearOfCursorSecond = watchRawScanPastCursorSecond(page.nextExclusiveStartKey, state.cursor);
+    if (oldest && compareEventToCursor(oldest, state.cursor) <= 0 && rawScanClearOfCursorSecond) break;
     pageEnd = page.nextPageEnd || pageEnd;
     pageExclusiveStartKey = page.nextExclusiveStartKey || null;
     widenPageEnd = false;
@@ -2433,6 +2434,29 @@ function compareEventToCursor(event, cursor) {
   const timeCompare = comparePreciseInstants(event.eventTime, cursor.eventTime);
   if (timeCompare !== 0) return timeCompare;
   return watchEventId(event).localeCompare(cursor.id);
+}
+
+// The raw DynamoDB scan (tools/telemetry:2329, --no-scan-index-forward) walks the sort key
+// in *string* order, and its --limit is enforced server-side against that same string order.
+// So a page's instant-oldest row (compareEventToCursor, an instant comparison) is not proof
+// no un-fetched row is chronologically newer than the cursor: a serialLog row (.NNNNNN+00:00)
+// sharing the cursor's exact millisecond as a pdiag/webhook row (.NNNZ) sorts lexicographically
+// *behind* it regardless of its own sub-millisecond digits (WO-2026-09-03-001), so it can be
+// excluded from a --limit-bounded page even though it is chronologically at or after the cursor.
+// Cross-format inversion is possible only within a single shared millisecond (WO-2026-08-28-004
+// investigation note 2 established the same interleaving is confined to a single second; the
+// millisecond bound is tighter but a subset of that already-reviewed invariant). So it is safe
+// to trust the instant-based stop condition only once the raw scan's own unread position
+// (nextExclusiveStartKey) has moved to a whole second strictly earlier than the cursor's second
+// -- reusing floorIsoTimestampToLowSortSecond/comparePreciseInstants rather than a new string
+// comparison, per the constraint that the stop test must stay an instant comparison.
+function watchRawScanPastCursorSecond(nextExclusiveStartKey, cursor) {
+  if (!cursor || !nextExclusiveStartKey) return true;
+  const rawEventTime = unmarshall(nextExclusiveStartKey).eventTime;
+  return comparePreciseInstants(
+    floorIsoTimestampToLowSortSecond(rawEventTime),
+    floorIsoTimestampToLowSortSecond(cursor.eventTime)
+  ) < 0;
 }
 
 function compareWatchEvents(left, right) {

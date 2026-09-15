@@ -3088,6 +3088,144 @@ test('serial mixed-format paging continues when a short filtered page still has 
   assert.deepEqual(timeline.events.map(item => item.eventId), ['in-2', 'in-1']);
 });
 
+// --- WO-2026-09-03-001: serial/watch cursor path drops cross-format rows ---
+// This is a distinct code path from the bounded --start/--until window WO-2026-08-28-004
+// fixed: the polling cursor stop condition (fetchWatchTimeline, tools/telemetry:2184).
+// compareEventToCursor already compares parsed instants; the defect is one level earlier —
+// DynamoDB's server-side --limit enforces string-key order, so a page can be handed back
+// whose instant-oldest row isn't the true oldest row outstanding. A chronologically newer
+// row in the *same millisecond* as the cursor, but a different eventTime encoding, sorts
+// lexicographically behind the cursor and can be excluded from a --limit-bounded raw page
+// entirely. The stop condition then treats that page as proof nothing newer remains, even
+// though the raw scan's own moreAvailable/nextExclusiveStartKey signal says otherwise.
+test('serial/watch cursor stop condition does not drop a same-millisecond row that sorts behind the cursor (WO-2026-09-03-001)', async () => {
+  const records = [
+    serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:38.000Z', eventId: 'pad-before-1' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:39.250Z', eventId: 'pad-before-2' }),
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.100Z', eventId: 'pad-before-3' }),
+    serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.499800+00:00', eventId: 'before-cursor-same-second' }),
+    serialTimelineEvent(5, { eventTime: '2026-07-14T08:00:40.500Z', eventId: 'cursor-row' }),
+    serialTimelineEvent(6, { eventTime: '2026-07-14T08:00:40.500500+00:00', eventId: 'after-cursor-offset' }),
+    serialTimelineEvent(7, { eventTime: '2026-07-14T08:00:40.600Z', eventId: 'after-2' }),
+    serialTimelineEvent(8, { eventTime: '2026-07-14T08:00:40.700000+00:00', eventId: 'after-3' }),
+    serialTimelineEvent(9, { eventTime: '2026-07-14T08:00:41.000Z', eventId: 'after-4' }),
+    serialTimelineEvent(10, { eventTime: '2026-07-14T08:00:41.500000+00:00', eventId: 'after-5' }),
+  ];
+
+  const options = serialOptions({ sinceMs: 0, follow: true, limit: 1 });
+  const state = createSerialState(options, new Date('2026-07-14T08:00:42.000Z'));
+  state.includeInitialTimeline = true;
+  state.initialized = true;
+  state.cursor = { eventTime: '2026-07-14T08:00:40.500Z', id: 'cursor-row' };
+
+  const timeline = await fetchSerialTimeline({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(records),
+  }, 'device123', state, '2026-07-14T08:00:42.000Z', options);
+
+  const ids = timeline.events.map(item => item.eventId);
+  assert.ok(
+    ids.includes('after-cursor-offset'),
+    `expected the chronologically-newer same-millisecond row to be fetched, got: ${JSON.stringify(ids)}`
+  );
+});
+
+// Reviewer-set fixture per WO-2026-09-03-001: a 200-row cursor-adjacent window with the
+// cursor sitting at the pdiag/webhook-format half of the one deliberate same-millisecond
+// inversion pair, exercised at --limit 1, 2, 25 and the WATCH_TIMELINE_LIMIT default (200).
+// Values below were measured directly against this fixture, not asserted from expectation:
+// 101 rows (seconds 100-199 inclusive, plus the inversion row) at every limit, with query
+// counts of exactly ceil(101/limit) -- 101, 51, 5, 1 -- confirming the fix adds no query
+// amplification beyond the one extra row it is required to fetch, at every tested limit.
+test('serial/watch cursor fetch catches the inversion row at --limit 1, 2, 25, and 200 with ceil(101/limit) queries', async () => {
+  const records = [];
+  for (let second = 1; second <= 199; second += 1) {
+    records.push(serialTimelineEvent(second, { eventTime: fixedZuluIso(second, 0), eventId: `sec-${second}` }));
+  }
+  records.push(serialTimelineEvent(1000, { eventTime: fixedOffsetIso(100, 500), eventId: 'after-cursor-offset' }));
+
+  const expectations = { 1: 101, 2: 51, 25: 5, 200: 1 };
+  for (const [limit, expectedQueries] of Object.entries(expectations)) {
+    const calls = [];
+    const options = serialOptions({ sinceMs: 0, follow: true, limit: Number(limit) });
+    const state = createSerialState(options, new Date(fixedZuluIso(199, 0)));
+    state.includeInitialTimeline = true;
+    state.initialized = true;
+    state.cursor = { eventTime: fixedZuluIso(100, 0), id: 'sec-100' };
+
+    const timeline = await fetchSerialTimeline({
+      options: {},
+      logEventsTableName: 'events-table',
+      awsJson: createPaginatedTimelineAwsJson(records, calls),
+    }, 'device123', state, fixedZuluIso(199, 0), options);
+
+    assert.equal(timeline.events.length, 101, `limit=${limit}: expected 101 rows`);
+    assert.ok(
+      timeline.events.some(item => item.eventId === 'after-cursor-offset'),
+      `limit=${limit}: expected the inversion row to be present`
+    );
+    assert.equal(calls.length, expectedQueries, `limit=${limit}: expected ${expectedQueries} queries, got ${calls.length}`);
+  }
+});
+
+// Reviewer-set fixture per WO-2026-09-03-001: a 5-poll --follow sequence at --limit 1 (the
+// pathological case per WO-2026-08-28-004's own Defect-1 table), mixing a poll where a
+// same-millisecond inversion row arrives, plain-row-arrival polls, and steady-state polls
+// with nothing new -- to measure real per-poll query cost, not assume it. Per-poll query
+// counts below were measured against this fixture: [3, 2, 2, 4, 1]. Measured against the
+// pre-fix revision on the same fixture (STYLE_GUIDE.md Sec.5's "compare against the previous
+// revision" rule): pre-fix poll counts are [3, 1, 1, 3, 1] -- cheaper only because the poll
+// that should catch the inversion row silently drops it instead (rows stay at 5, not 6, and
+// the row never appears in any later poll either -- final total is 7 rows, not 8). The fix's
+// measured added cost here is +1 query on the poll that actually contains an inversion, and
+// +1 query on each subsequent poll while the cursor remains inside that row's second (this
+// second component comes from the pre-existing, unmodified widen-start behavior re-examining
+// the cursor's same-second sibling every poll, not from the new stop-condition gate itself;
+// it resolves as soon as `now` advances past the cursor's second in a later poll).
+test('serial --follow per-poll query cost at --limit 1 across a 5-poll mixed sequence (measured, not asserted)', async () => {
+  const records = [
+    serialTimelineEvent(1, { eventTime: fixedZuluIso(10, 0), eventId: 'seed-1' }),
+    serialTimelineEvent(2, { eventTime: fixedZuluIso(11, 0), eventId: 'seed-2' }),
+    serialTimelineEvent(3, { eventTime: fixedZuluIso(12, 0), eventId: 'seed-3' }),
+  ];
+  const calls = [];
+  const output = [];
+  const perPollQueries = [];
+  let queriesBefore = 0;
+  let pollIndex = 0;
+
+  const options = serialOptions({ sinceMs: 5000, follow: true, limit: 1, json: true });
+  const signal = { aborted: false };
+  await runSerialLoop({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson(records, calls),
+  }, { deviceId: 'device123' }, options, {
+    write: line => output.push(line),
+    warn: () => {},
+    now: () => new Date(fixedZuluIso(12 + pollIndex, 0)),
+    sleep: async () => {
+      perPollQueries.push(calls.length - queriesBefore);
+      queriesBefore = calls.length;
+      pollIndex += 1;
+      if (pollIndex === 1) {
+        records.push(serialTimelineEvent(4, { eventTime: fixedOffsetIso(12, 500), eventId: 'poll2-inversion-row' }));
+      } else if (pollIndex === 3) {
+        records.push(serialTimelineEvent(5, { eventTime: fixedZuluIso(13, 0), eventId: 'poll4-plain-a' }));
+        records.push(serialTimelineEvent(6, { eventTime: fixedZuluIso(14, 0), eventId: 'poll4-plain-b' }));
+      }
+      if (pollIndex >= 5) signal.aborted = true;
+    },
+    signal,
+  });
+
+  const emittedIds = parseNdjson(output.join('\n')).map(record => record.event.eventId);
+  assert.deepEqual(perPollQueries, [3, 2, 2, 4, 1]);
+  assert.ok(emittedIds.includes('poll2-inversion-row'), `expected the inversion row to reach output, got: ${JSON.stringify(emittedIds)}`);
+  assert.deepEqual(emittedIds, ['seed-1', 'seed-2', 'seed-3', 'poll2-inversion-row', 'poll4-plain-a', 'poll4-plain-b']);
+});
+
 test('serial mixed-format paging still advances when the widened raw page hits 2000 rows below the caller limit', async () => {
   let calls = 0;
   const options = serialOptions({
@@ -4438,6 +4576,89 @@ test('timeline Dynamo returns the cross-format in-window collision row', () => {
   assert.equal(timeline.start, '2026-07-14T08:00:40.397Z');
   assert.equal(timeline.end, '2026-07-14T08:00:40.900Z');
   assert.deepEqual(timeline.events.map(item => item.eventId), ['after-offset', 'collision-offset', 'collision-z']);
+});
+
+// --- WO-2026-08-28-004 Implementation Status matrix, reconstructed and committed ---
+// The original {timeline, serial} x {Dynamo, HTTP} matrix that closed WO-2026-08-28-004 was
+// never committed (see that WO's Implementation Status and WO-2026-09-03-001's verification
+// requirement 3). Most of its cells already have committed, passing coverage elsewhere in
+// this file -- cited below rather than duplicated. The two tests in this block are cells that
+// were NOT already covered anywhere in this file as of WO-2026-09-03-001, so they are new,
+// not a re-run of an existing assertion:
+//   - Defect 1's exact query-count table (this file already has an approximate ceil(N/limit)
+//     +/-1 check at "serial mixed-format query count stays within ceil(N / limit)"; this adds
+//     the exact counts WO-2026-08-28-004's table published for a clean single-format window).
+//   - The `timeline` command's dense-same-second-window cell (Dynamo). `serial` has this
+//     coverage ("serial mixed-format paging still advances when the widened raw page hits
+//     2000 rows...", "...exactly the 2000-row Dynamo cap"); `timeline` (queryTimelineFromDynamo)
+//     did not.
+// Already-committed cells for this matrix, not duplicated here:
+//   - cross-format collision, timeline (Dynamo): the test immediately above this comment.
+//   - cross-format collision, serial (Dynamo): "serial mixed-format start boundary includes
+//     and excludes the collision row at the exact instant".
+//   - offset validation (14 values): "CLI rejects invalid ISO timezone offsets for --start",
+//     "valid ISO timezone offsets remain accepted".
+//   - on-second boundary, both :start flooring forms: "second-boundary instant, both :start
+//     flooring forms".
+//   - HTTP transport cells: committed as explicitly annotated skips (see the 7 skipped tests
+//     in this file citing WO-2026-08-29-001), per this WO's Protected Areas -- not touched.
+// Note on scope: WO-2026-08-28-004's Implementation Status table did not enumerate a literal
+// 34-row list, so an exact 1:1 accounting against "34" is not independently derivable from
+// what is documented; this block closes the specific gaps identified above rather than
+// asserting a re-derived count.
+test('Defect 1 (paging boundary) exact query-count table over a 200-row single-format window, per WO-2026-08-28-004', async () => {
+  const records = Array.from({ length: 200 }, (_, index) => serialTimelineEvent(index + 1, {
+    eventTime: fixedIso(index + 1),
+    eventId: `row-${index + 1}`,
+  }));
+  const expectations = { 1: 200, 2: 100, 25: 8 };
+
+  for (const [limit, expectedQueries] of Object.entries(expectations)) {
+    const calls = [];
+    const timeline = await fetchSerialWindow(records, {
+      startIso: records[0].eventTime,
+      until: records.at(-1).eventTime,
+      limit: Number(limit),
+    }, calls);
+
+    assert.equal(timeline.events.length, 200, `limit=${limit}: expected all 200 rows`);
+    assert.equal(timeline.truncated, false, `limit=${limit}: expected truncated:false`);
+    assert.equal(calls.length, expectedQueries, `limit=${limit}: expected ${expectedQueries} queries, got ${calls.length}`);
+  }
+});
+
+test('timeline Dynamo dense same-second window returns all 6 in-window rows behind a 2000-row widened spill, per WO-2026-08-28-004', () => {
+  const realRows = [
+    serialTimelineEvent(1, { eventTime: '2026-07-14T08:00:40.600Z', eventId: 'in-1' }),
+    serialTimelineEvent(2, { eventTime: '2026-07-14T08:00:40.620000+00:00', eventId: 'in-2' }),
+    serialTimelineEvent(3, { eventTime: '2026-07-14T08:00:40.640Z', eventId: 'in-3' }),
+    serialTimelineEvent(4, { eventTime: '2026-07-14T08:00:40.660000+00:00', eventId: 'in-4' }),
+    serialTimelineEvent(5, { eventTime: '2026-07-14T08:00:40.680Z', eventId: 'in-5' }),
+    serialTimelineEvent(6, { eventTime: '2026-07-14T08:00:40.700000+00:00', eventId: 'in-6' }),
+  ];
+  // Same-second spill strictly outside [.600, .700], admitted only by the widened query.
+  const spillRows = Array.from({ length: 2000 }, (_, index) => {
+    const eventTime = index < 299
+      ? `2026-07-14T08:00:40.${String(701 + index).padStart(3, '0')}Z`
+      : `2026-07-14T08:00:40.${String(700001 + (index - 299)).padStart(6, '0')}+00:00`;
+    return serialTimelineEvent(index + 7, { eventTime, eventId: `spill-${index + 1}` });
+  });
+
+  const timeline = queryTimelineFromDynamo({
+    options: {},
+    logEventsTableName: 'events-table',
+    awsJson: createPaginatedTimelineAwsJson([...realRows, ...spillRows]),
+  }, 'device123', {
+    ...parseOptions(['--start', '2026-07-14T08:00:40.600Z', '--until', '2026-07-14T08:00:40.700000+00:00', 'device123']),
+    limit: 25,
+  });
+
+  assert.equal(timeline.count, 6);
+  assert.equal(timeline.truncated, false);
+  assert.deepEqual(
+    new Set(timeline.events.map(item => item.eventId)),
+    new Set(['in-1', 'in-2', 'in-3', 'in-4', 'in-5', 'in-6'])
+  );
 });
 
 test('serial --start/--until Dynamo path (via fetchTimelinePage) widens :start/:end defensively', async () => {
