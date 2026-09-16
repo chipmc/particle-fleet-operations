@@ -2425,8 +2425,9 @@ function collectNewTimelineEvents(events, state) {
 function markWatchEventSeen(state, event) {
   const rowIdentity = watchEventRowIdentity(event);
   state.seenEventIds.add(rowIdentity);
+  const eventIdentity = watchEventId(event);
   if (compareEventToCursor(event, state.cursor) > 0) {
-    state.cursor = { eventTime: event.eventTime, id: rowIdentity };
+    state.cursor = { eventTime: event.eventTime, id: eventIdentity };
   }
 }
 
@@ -2434,7 +2435,7 @@ function compareEventToCursor(event, cursor) {
   if (!cursor) return 1;
   const timeCompare = comparePreciseInstants(event.eventTime, cursor.eventTime);
   if (timeCompare !== 0) return timeCompare;
-  return watchEventRowIdentity(event).localeCompare(cursor.id);
+  return watchEventId(event).localeCompare(cursor.id);
 }
 
 // The raw DynamoDB scan (tools/telemetry:2329, --no-scan-index-forward) walks the sort key

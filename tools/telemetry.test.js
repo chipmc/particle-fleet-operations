@@ -2614,7 +2614,7 @@ test('watch establishes an initial cursor without printing existing events', () 
 
   assert.deepEqual(entries, []);
   assert.equal(state.cursor.eventTime, '2026-07-14T08:00:02.000Z');
-  assert.equal(state.cursor.id, '2026-07-14T08:00:02.000Z:b');
+  assert.equal(state.cursor.id, 'b');
 });
 
 test('default startup prints no historical Timeline rows but emits initial runtime context', () => {
@@ -2626,7 +2626,7 @@ test('default startup prints no historical Timeline rows but emits initial runti
   assert.deepEqual(entries.map(entry => [entry.category, entry.summary]), [
     ['RUNTIME', 'device-status snapshot available'],
   ]);
-  assert.equal(state.cursor.id, '2026-07-14T08:00:01.000Z:serial');
+  assert.equal(state.cursor.id, 'serial');
 });
 
 test('watch returns new events only and suppresses duplicates', () => {
@@ -2644,12 +2644,25 @@ test('watch returns new events only and suppresses duplicates', () => {
 
 test('watch handles identical timestamps with distinct event IDs', () => {
   const state = {
-    cursor: { eventTime: '2026-07-14T08:00:00.000Z', id: '2026-07-14T08:00:00.000Z:a' },
+    cursor: { eventTime: '2026-07-14T08:00:00.000Z', id: 'a' },
     seenEventIds: new Set(['2026-07-14T08:00:00.000Z:a']),
   };
   const events = collectNewTimelineEvents([
     event({ eventTime: '2026-07-14T08:00:00.000Z', eventId: 'a', s3Key: 'a' }),
     event({ eventTime: '2026-07-14T08:00:00.000Z', eventId: 'b', s3Key: 'b' }),
+  ], state);
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].eventId, 'b');
+});
+
+test('watch cursor tie-break accepts same-instant mixed-encoding rows with distinct IDs', () => {
+  const state = {
+    cursor: { eventTime: '2026-07-14T08:00:00.000Z', id: 'a' },
+    seenEventIds: new Set(['2026-07-14T08:00:00.000Z:a']),
+  };
+  const events = collectNewTimelineEvents([
+    event({ eventTime: '2026-07-14T08:00:00.000000+00:00', eventId: 'b', s3Key: 'b' }),
   ], state);
 
   assert.equal(events.length, 1);
