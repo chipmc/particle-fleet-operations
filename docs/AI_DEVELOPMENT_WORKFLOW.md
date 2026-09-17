@@ -139,6 +139,17 @@ Every proposed change should be classified as:
 - security-sensitive
 - infrastructure-sensitive
 
+Escalation back to Phase 3
+
+If two consecutive review rounds on the same implementation each surface a new defect in
+the same mechanism — not a different part of the change, the same one, just an adjacent
+gap the prior fix didn't close — stop patching narrowly and return to Phase 3 for a
+holistic redesign of that mechanism, rather than continuing incremental fixes. This
+happened across the archival job's S3-lock-plus-failure-reporting mechanism: successive
+rounds each closed one gap and surfaced the next before it was named explicitly. The
+narrow-patch loop is itself the signal — it means the mechanism's design is the problem,
+not its latest bug.
+
 Security Gate — Required Before Deployment
 - no plaintext secrets
 - no unexpected IAM broadening
