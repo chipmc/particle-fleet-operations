@@ -17,6 +17,7 @@
     ]
   },
   "context": {
+    "archiveOperatorPrincipalArn": "arn:aws:iam::564771499971:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_98b6de69dbde12dc",
     "@aws-cdk-containers/ecs-service-extensions:enableDefaultLogDriver": true,
     "@aws-cdk/aws-apigateway:authorizerChangeDeploymentLogicalId": true,
     "@aws-cdk/aws-apigateway:disableCloudWatchRole": true,

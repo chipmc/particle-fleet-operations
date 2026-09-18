@@ -314,6 +314,15 @@ can assume `ArchiveLockBreakGlassRole` — this is the first human-assumable
 role in the stack, and `cdk synth`/`cdk deploy` fail closed if that context
 value is not set.
 
+**Operator principal**: `archiveOperatorPrincipalArn` (set in `cdk.json`)
+currently points to this account's SSO AdministratorAccess role
+(`AWSReservedSSO_AdministratorAccess_...`). This is acceptable as a
+single-operator account — anyone who can assume it already has full admin,
+so the break-glass role's narrow scoping mainly guards against accidental
+misuse, not against needing broad access to invoke recovery at all. Revisit
+this if a second operator without full admin access is ever added — at that
+point, point this at a dedicated, narrowly-scoped role instead.
+
 #### 8. Declare Success
 
 **Criteria:**
