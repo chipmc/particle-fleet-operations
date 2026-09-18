@@ -19,7 +19,6 @@ export interface Anomaly {
  * Applies heuristic rules to identify device health issues:
  * - Low battery conditions
  * - High cellular connection times
- * - Increasing reset counts
  * - Active alerts
  * - Firmware version changes
  * - Rapid battery drain

@@ -6,8 +6,9 @@
  * historical telemetry.
  */
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-import { DeviceCurrentState, DeviceHealthStatus, NormalizedEventFields, ParsedEvent, ParticleWebhook } from '../types';
+import { CurrentStateAnomaly, DeviceCurrentState, DeviceHealthStatus, NormalizedEventFields, ParsedEvent, ParticleWebhook } from '../types';
 import { ParticleDeviceNameResolution } from '../integrations/particle-api';
+export declare const OFFLINE_THRESHOLD_HOURS = 3;
 declare const ddb: DynamoDBDocumentClient;
 export declare function updateDeviceCurrentState(tableName: string, deviceId: string, eventTime: string, eventName: string, body: ParticleWebhook, parsed: ParsedEvent, normalized?: NormalizedEventFields, options?: UpdateDeviceCurrentStateOptions): Promise<void>;
 export interface UpdateDeviceCurrentStateOptions {
@@ -41,5 +42,7 @@ interface BuildStateInput {
 }
 declare function buildCurrentState(input: BuildStateInput): DeviceCurrentState;
 declare function determineHealthStatus(state: Partial<DeviceCurrentState>, resetIncreased: boolean): DeviceHealthStatus;
-export { ddb, buildCurrentState, determineHealthStatus };
+declare function buildAnomalies(state: Partial<DeviceCurrentState>): CurrentStateAnomaly[];
+export declare function isOfflineCandidate(eventTime: string, thresholdHours: number, now: string): boolean;
+export { ddb, buildAnomalies, buildCurrentState, determineHealthStatus };
 //# sourceMappingURL=current-state.d.ts.map

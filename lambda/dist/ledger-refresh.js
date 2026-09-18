@@ -53,6 +53,7 @@ async function refreshDeviceStatusLedger(input) {
 async function executeDeviceStatusLedgerRefresh(input) {
     const startedAtMs = Date.now();
     const elapsedMs = () => Math.max(0, Date.now() - startedAtMs);
+    let syncFailureDetail;
     try {
         const productId = await resolveProductId(input.body, input.deviceId, input.fetchedAt);
         if (!productId) {
@@ -75,35 +76,44 @@ async function executeDeviceStatusLedgerRefresh(input) {
                 httpStatus: ledgerResult.error.httpStatus,
                 errorKind: ledgerResult.error.kind,
             });
-            return 'not_found_or_failed';
+            syncFailureDetail = {
+                errorKind: ledgerResult.error.kind,
+                httpStatus: ledgerResult.error.httpStatus,
+            };
         }
-        const ledgerUpdatedAt = ledgerResult.instance.updated_at;
-        if (!ledgerUpdatedAt) {
-            return 'missing_updated_at';
+        else {
+            const ledgerUpdatedAt = ledgerResult.instance.updated_at;
+            if (!ledgerUpdatedAt) {
+                return 'missing_updated_at';
+            }
+            if (input.previous?.deviceStatusLedgerUpdatedAt && input.previous.deviceStatusLedgerUpdatedAt >= ledgerUpdatedAt) {
+                logLedgerRefresh({ deviceId: input.deviceId, productId, ledgerUpdatedAt, result: 'unchanged', elapsedMs: elapsedMs() });
+                return 'stale';
+            }
+            const updateResult = await (0, current_state_1.updateDeviceStatusLedgerSnapshot)(input.tableName, input.projectId, input.deviceId, {
+                updatedAt: ledgerUpdatedAt,
+                fetchedAt,
+                sizeBytes: ledgerResult.instance.size_bytes,
+                data: ledgerResult.data,
+            });
+            logLedgerRefresh({
+                deviceId: input.deviceId,
+                productId,
+                ledgerUpdatedAt,
+                result: updateResult === 'updated' ? 'updated' : 'unchanged',
+                elapsedMs: elapsedMs(),
+            });
+            return updateResult;
         }
-        if (input.previous?.deviceStatusLedgerUpdatedAt && input.previous.deviceStatusLedgerUpdatedAt >= ledgerUpdatedAt) {
-            logLedgerRefresh({ deviceId: input.deviceId, productId, ledgerUpdatedAt, result: 'unchanged', elapsedMs: elapsedMs() });
-            return 'stale';
-        }
-        const updateResult = await (0, current_state_1.updateDeviceStatusLedgerSnapshot)(input.tableName, input.projectId, input.deviceId, {
-            updatedAt: ledgerUpdatedAt,
-            fetchedAt,
-            sizeBytes: ledgerResult.instance.size_bytes,
-            data: ledgerResult.data,
-        });
-        logLedgerRefresh({
-            deviceId: input.deviceId,
-            productId,
-            ledgerUpdatedAt,
-            result: updateResult === 'updated' ? 'updated' : 'unchanged',
-            elapsedMs: elapsedMs(),
-        });
-        return updateResult;
     }
     catch (err) {
         logLedgerRefresh({ deviceId: input.deviceId, result: 'failed', elapsedMs: elapsedMs(), errorKind: 'exception' });
-        return 'not_found_or_failed';
+        syncFailureDetail = { errorKind: 'exception' };
     }
+    if (syncFailureDetail) {
+        await input.onSyncFailed?.(syncFailureDetail);
+    }
+    return 'not_found_or_failed';
 }
 async function projectConfigurationLedgers(input, productDefaultsResult, deviceSettingsResult, fetchedAt) {
     if (productDefaultsResult.ok && productDefaultsResult.instance.updated_at) {

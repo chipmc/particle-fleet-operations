@@ -178,6 +178,142 @@ npm run timeline -- --deviceId KNOWN_DEVICE_ID --hours 1
 
 See [tools.md](./tools.md) for detailed timeline tool usage.
 
+## Monthly DynamoDB Archive
+
+EventBridge Scheduler starts the Standard Step Functions archive workflow at
+02:00 UTC on the first day of each month. It scans only
+`ParticleLogEventsTable`, selects rows whose parsed `eventTime` instant is more
+than 60 days old, writes gzip JSONL shards under
+`dynamodb-index-archive/v1/`, reads them back, verifies every item digest, and
+rereads source rows for race detection.
+
+Phase 1 is copy-and-verify only:
+
+- `ARCHIVE_DELETE_ENABLED=false` is fixed in CDK.
+- The archive role has no `dynamodb:DeleteItem` permission.
+- `DeviceCurrentState` and `DeviceEventHistory` are not scanned or changed.
+- No Athena, restore, or archive-aware query path exists yet.
+
+The job and any historical-key rewrite share a single DynamoDB lock item,
+`LOCK#monthly-archive` / `METADATA` in the `ArchiveCoordination` table
+(`lambda/src/archive-coordination.ts`), rather than an S3 object. Acquiring it
+atomically increments a fencing token; every subsequent action (`PROCESS_PAGE`,
+`FINALIZE`) asserts that token is still current before doing any work, so a
+crashed-and-retried execution can never race a still-running one. Releasing the
+lock clears ownership fields with a conditional `UpdateItem` — it never deletes
+the item, so the fencing token itself is never lost or reset.
+
+See `docs/architecture.md` for the canonical statement of this lock/fencing
+contract, including that `WO-2026-08-28-003`'s not-yet-built backfill must
+acquire this same lock and honor its current fencing token before any
+delete-and-reinsert rewrite of archived/archiving rows. Do not bypass the lock
+manually; if it is genuinely stuck, use the break-glass procedure below.
+
+### Deployment And Dry Run
+
+1. Review `cdk diff`. Expected additions include the archive Lambda, the
+  `ArchiveCoordination` DynamoDB table, Standard workflow, scheduler, SNS
+  topic/subscription, alarms, a reconciliation dead-letter queue, the
+  break-glass `ArchiveLockBreakGlassRole`, S3 lifecycle, and least-privilege
+  IAM policies. No existing DynamoDB table should be replaced, and the archive
+  Lambda's own role should carry no `dynamodb:DeleteItem` grant — that
+  permission exists only on `ArchiveLockBreakGlassRole`, scoped to the lock
+  partition key. Deploying requires the `archiveOperatorPrincipalArn` CDK
+  context value; synth fails closed without it.
+2. Deploy and confirm the subscription email sent to `chip@seeinsights.com`.
+  SNS does not deliver run reports until that subscription is confirmed.
+3. Start one manual workflow execution from the Step Functions console or CLI.
+4. Verify the final report at
+  `dynamodb-index-archive/reports/YYYY/MM/{run_id}.json` has
+  `deletionEnabled: false` and `counts.deleted: 0`.
+5. Verify shard manifests report matching copied/verified counts and inspect
+  the `ParticleFleetOperations/Archive` CloudWatch metrics.
+6. Query representative source keys from DynamoDB and confirm they still
+  exist. Any deletion is a release blocker in this phase.
+
+The SNS topic receives every final run summary. `PARTIAL` and `FAILED` reports
+include retained rows or failed shards, and the CloudWatch alarm notifies the
+same topic if no completion is recorded during days 1-7 of the month. Every
+failure path — the in-workflow Catch *and* the external EventBridge cleanup
+rule for failures that bypass Catch entirely (timeout, abort, Step Functions
+history exhaustion) — now calls the same unified, idempotent
+`RECONCILE_FAILURE` operation (`reconcileFailure` in
+`archive-coordination.ts`). It freezes failure evidence once, writes the report
+to S3 exactly once (`IfNoneMatch`, first-write-wins under a claim token),
+**commits that report, then releases the lock, and only then attempts the SNS
+notification** — in that order — so an SNS failure never blocks or unwinds an
+already-committed report or already-released lock. A released lock is
+evidence the report was written; it is not evidence the notification went out.
+Notification-send itself is claim-token guarded to prevent two concurrent
+callers from both publishing, but it is not exactly-once end-to-end: if a
+claim holder crashes mid-publish, a second caller can reclaim and publish
+again after the claim's short lease expires, producing at most one duplicate
+notification (see Finding 3 in `docs/architecture.md`) — treat a duplicate
+notification as expected, not as a separate failure to investigate. A failed-run report is written to
+`dynamodb-index-archive/v1/reports/YYYY/MM/<sha256(executionArn)>.failed.json`;
+the report body itself still carries both the human-readable `runId` and the
+full `executionArn`, so the hashed filename never loses that context. If
+`reconcileFailure` itself keeps failing (e.g. the coordination table is
+unreachable), the EventBridge target's dead-letter queue captures the event
+and a CloudWatch alarm on that queue's depth pages the same SNS topic.
+
+S3 expires DynamoDB index snapshots after 730 days, including noncurrent object
+versions. Retention for existing `particle-events/` raw objects is unchanged
+and outside this work order. Reassess the index-archive policy after one year
+of production usage before deciding whether to extend it.
+
+### Break-Glass Recovery
+
+The archive lock has a 24-hour lease, so a crashed or stuck execution
+self-heals within a day without operator action in almost every case. Use
+manual recovery — `tools/archive-lock-release` — only when both are true:
+
+1. The lease has genuinely expired or is about to, **and**
+2. You have confirmed, via the Step Functions console or
+  `aws stepfunctions describe-execution`, that no execution actually owns the
+  lock anymore (it is `SUCCEEDED`, `FAILED`, `TIMED_OUT`, or `ABORTED`).
+
+Required steps, in order — do not skip or reorder these:
+
+1. **Open or reference an incident/ticket first.** The tool requires
+  `--ticket <id>` and refuses to run without one.
+2. **Run with `--dry-run` first** and read the printed `aws dynamodb
+  delete-item` command before running it for real. The tool never reads the
+  lock before deleting it — the DynamoDB `ConditionExpression` (exact owner
+  execution ARN and fencing token) is the sole authority for whether the
+  delete is safe, so getting `--owner-execution-arn` and `--fencing-token`
+  right matters.
+3. **Run it for real**, then **record the tool's full output and the ticket
+  ID in the operations log.** This is required, not optional — it is how a
+  manual override of an automated safety mechanism stays auditable.
+
+The tool itself never lists or reads the lock item, and its IAM role
+(`ArchiveLockBreakGlassRole`) grants nothing beyond `dynamodb:DeleteItem`
+scoped to the `LOCK#monthly-archive` partition key and
+`states:DescribeExecution` — it cannot touch a `RUN#...` item, cannot list or
+describe stacks, and cannot delete anything in any other table. Pass
+`--table <name>` explicitly when running under this role: the default
+auto-detection path (reading the coordination table name from the
+CloudFormation stack's outputs) calls `cloudformation:DescribeStacks`, which
+this role deliberately does not grant, so auto-detection will fail with
+`AccessDenied` under the intended identity. (The tool reports this clearly
+and tells you to pass `--table` — it is not a silent failure — but knowing
+the table name ahead of time avoids the round-trip.)
+
+`dynamodb:DeleteItem` on this table is a CloudTrail **data event**, not a
+management event — unlike most IAM-authenticated API calls, it is only
+captured if a trail or event data store has data-event logging explicitly
+enabled for this table (or for DynamoDB generally). This stack does not
+configure that. Before relying on CloudTrail as the audit trail for a
+break-glass delete, confirm such a selector actually exists and covers this
+table; if it doesn't, the ticket logging above is the *only* audit trail this
+action has, not a supplement to one.
+
+Only a principal matching the `archiveOperatorPrincipalArn` CDK context value
+can assume `ArchiveLockBreakGlassRole` — this is the first human-assumable
+role in the stack, and `cdk synth`/`cdk deploy` fail closed if that context
+value is not set.
+
 #### 8. Declare Success
 
 **Criteria:**

@@ -1,0 +1,331 @@
+#!/usr/bin/env node
+'use strict';
+
+// Break-glass recovery tool for the monthly archive's DynamoDB lock
+// (lambda/src/archive-coordination.ts). Deliberately does not GetItem/pre-read the lock
+// before deleting it -- even as a read-only courtesy display -- because reading then
+// deciding is exactly the TOCTOU shape the fencing-token redesign eliminates everywhere
+// else. The operator supplies --owner-execution-arn and --fencing-token explicitly, and
+// the DynamoDB ConditionExpression on the delete is the sole source of truth for whether
+// the delete is safe.
+//
+// Requires the IAM identity running this to have assumed the ArchiveLockBreakGlassRole
+// (infra/lib/infra-stack.ts), which grants exactly dynamodb:DeleteItem scoped via
+// dynamodb:LeadingKeys to the LOCK#monthly-archive partition key, plus
+// states:DescribeExecution -- nothing else.
+
+const { spawnSync } = require('child_process');
+
+const DEFAULT_STACK_NAME = process.env.ARCHIVE_LOCK_RELEASE_STACK_NAME || 'InfraStack';
+const LOCK_PK = 'LOCK#monthly-archive';
+const LOCK_SK = 'METADATA';
+
+const EXIT_GENERIC_ERROR = 1;
+const EXIT_EXECUTION_RUNNING = 2;
+const EXIT_CONDITION_FAILED = 3;
+
+class OperatorError extends Error {
+  constructor(message, exitCode = EXIT_GENERIC_ERROR) {
+    super(message);
+    this.exitCode = exitCode;
+  }
+}
+
+function fail(message, exitCode = EXIT_GENERIC_ERROR) {
+  throw new OperatorError(message, exitCode);
+}
+
+function main() {
+  const args = process.argv.slice(2);
+
+  if (args.includes('--help') || args.includes('-h') || args.length === 0) {
+    printUsage();
+    return;
+  }
+
+  const options = parseArgs(args);
+
+  const executionStatus = describeExecutionStatus(options);
+  if (executionStatus === 'RUNNING') {
+    fail(
+      `Refusing to release the lock: execution ${options.ownerExecutionArn} is still RUNNING. ` +
+      'Only release a lock after confirming the owning execution is terminal.',
+      EXIT_EXECUTION_RUNNING
+    );
+  }
+
+  const tableName = options.tableName || resolveTableNameFromStack(options);
+  const deleteArgs = buildDeleteItemArgs(options, tableName);
+
+  if (options.dryRun) {
+    console.log('Dry run -- the following command was NOT executed:');
+    console.log(renderShellCommand(deleteArgs));
+    return;
+  }
+
+  const result = spawnSync('aws', deleteArgs, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+
+  if (result.error && result.error.code === 'ENOENT') {
+    fail('AWS CLI was not found. Install/configure awscli before using this tool.');
+  }
+  if (result.error) {
+    fail(`AWS CLI subprocess failed: ${result.error.message || String(result.error)}`);
+  }
+
+  if (result.status !== 0) {
+    const stderr = (result.stderr || '').trim();
+    if (/ConditionalCheckFailedException/.test(stderr)) {
+      fail(
+        `Lock was not released: no LOCK#monthly-archive item currently matches owner ` +
+        `${options.ownerExecutionArn} with fencing token ${options.fencingToken} (already ` +
+        `released, reacquired by another execution, or never held). Ticket ${options.ticket} ` +
+        'was NOT applied.',
+        EXIT_CONDITION_FAILED
+      );
+    }
+    fail(`AWS CLI delete-item failed: ${stderr || 'no stderr output'}`);
+  }
+
+  let response;
+  try {
+    response = JSON.parse(result.stdout || '{}');
+  } catch {
+    fail(`AWS CLI returned invalid JSON for delete-item: ${result.stdout}`);
+  }
+
+  console.log(
+    `Released archive lock ${LOCK_PK} previously owned by ${options.ownerExecutionArn} ` +
+    `(fencingToken=${options.fencingToken}). Ticket: ${options.ticket}.`
+  );
+  console.log(JSON.stringify({
+    released: true,
+    ticket: options.ticket,
+    ownerExecutionArn: options.ownerExecutionArn,
+    fencingToken: options.fencingToken,
+    tableName,
+    releasedAt: new Date().toISOString(),
+    previousItem: response.Attributes ? unmarshall(response.Attributes) : undefined,
+  }, null, 2));
+}
+
+function parseArgs(args) {
+  const options = {
+    ownerExecutionArn: null,
+    fencingToken: null,
+    ticket: null,
+    tableName: null,
+    stackName: DEFAULT_STACK_NAME,
+    profile: process.env.AWS_PROFILE || null,
+    region: process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || null,
+    dryRun: false,
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--owner-execution-arn') {
+      options.ownerExecutionArn = requireValue(args, ++index, arg);
+    } else if (arg === '--fencing-token') {
+      options.fencingToken = parseFencingToken(requireValue(args, ++index, arg));
+    } else if (arg === '--ticket') {
+      options.ticket = requireValue(args, ++index, arg);
+    } else if (arg === '--table') {
+      options.tableName = requireValue(args, ++index, arg);
+    } else if (arg === '--stack') {
+      options.stackName = requireValue(args, ++index, arg);
+    } else if (arg === '--profile') {
+      options.profile = requireValue(args, ++index, arg);
+    } else if (arg === '--region') {
+      options.region = requireValue(args, ++index, arg);
+    } else if (arg === '--dry-run') {
+      options.dryRun = true;
+    } else {
+      fail(`Unknown argument: ${arg}`);
+    }
+  }
+
+  if (!options.ownerExecutionArn) fail('--owner-execution-arn is required.');
+  if (options.fencingToken === null) fail('--fencing-token is required.');
+  if (!options.ticket) fail('--ticket is required. Record the incident/ticket ID this recovery is tied to.');
+
+  return options;
+}
+
+function requireValue(args, index, flag) {
+  const value = args[index];
+  if (value === undefined || value.startsWith('--')) fail(`${flag} requires a value.`);
+  return value;
+}
+
+function parseFencingToken(value) {
+  if (!/^\d+$/.test(value)) fail('--fencing-token must be a non-negative integer.');
+  return Number(value);
+}
+
+function describeExecutionStatus(options) {
+  const awsArgs = ['stepfunctions', 'describe-execution', '--execution-arn', options.ownerExecutionArn, '--output', 'json'];
+  if (options.profile) awsArgs.push('--profile', options.profile);
+  if (options.region) awsArgs.push('--region', options.region);
+
+  const result = spawnSync('aws', awsArgs, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  if (result.error && result.error.code === 'ENOENT') {
+    fail('AWS CLI was not found. Install/configure awscli before using this tool.');
+  }
+  if (result.error) {
+    fail(`AWS CLI subprocess failed: ${result.error.message || String(result.error)}`);
+  }
+  if (result.status !== 0) {
+    fail(`Could not confirm execution status: ${(result.stderr || '').trim() || 'describe-execution failed'}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout || '{}');
+  } catch {
+    fail(`AWS CLI returned invalid JSON for describe-execution: ${result.stdout}`);
+  }
+  if (!parsed.status) fail('describe-execution response did not include a status.');
+  return parsed.status;
+}
+
+function resolveTableNameFromStack(options) {
+  const awsArgs = ['cloudformation', 'describe-stacks', '--stack-name', options.stackName, '--output', 'json'];
+  if (options.profile) awsArgs.push('--profile', options.profile);
+  if (options.region) awsArgs.push('--region', options.region);
+
+  const result = spawnSync('aws', awsArgs, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  if (result.error && result.error.code === 'ENOENT') {
+    fail('AWS CLI was not found. Install/configure awscli before using this tool.');
+  }
+  if (result.error) {
+    fail(`AWS CLI subprocess failed: ${result.error.message || String(result.error)}`);
+  }
+  if (result.status !== 0) {
+    fail(
+      `Could not resolve --table automatically: ${(result.stderr || '').trim() || 'describe-stacks failed'}. ` +
+      'Pass --table <name> explicitly instead.'
+    );
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout || '{}');
+  } catch {
+    fail(`AWS CLI returned invalid JSON for describe-stacks: ${result.stdout}`);
+  }
+  const stackDescription = parsed.Stacks && parsed.Stacks[0];
+  if (!stackDescription) fail(`CloudFormation stack not found: ${options.stackName}`);
+  const outputs = Object.fromEntries((stackDescription.Outputs || []).map(output => [output.OutputKey, output.OutputValue]));
+  if (!outputs.ArchiveCoordinationTableName) {
+    fail(`Stack output ArchiveCoordinationTableName was not found on stack ${options.stackName}. Pass --table <name> explicitly instead.`);
+  }
+  return outputs.ArchiveCoordinationTableName;
+}
+
+function buildDeleteItemArgs(options, tableName) {
+  const args = [
+    'dynamodb', 'delete-item',
+    '--table-name', tableName,
+    '--key', JSON.stringify({ PK: { S: LOCK_PK }, SK: { S: LOCK_SK } }),
+    '--condition-expression', 'ownerExecutionArn = :arn AND fencingToken = :token',
+    '--expression-attribute-values', JSON.stringify({
+      ':arn': { S: options.ownerExecutionArn },
+      ':token': { N: String(options.fencingToken) },
+    }),
+    '--return-values', 'ALL_OLD',
+    '--output', 'json',
+  ];
+  if (options.profile) args.push('--profile', options.profile);
+  if (options.region) args.push('--region', options.region);
+  return args;
+}
+
+function renderShellCommand(argv) {
+  return ['aws', ...argv.map(quoteForDisplay)].join(' ');
+}
+
+function quoteForDisplay(value) {
+  if (/^[A-Za-z0-9_.\-/:]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function unmarshall(attributeMap) {
+  return Object.fromEntries(Object.entries(attributeMap).map(([key, value]) => [key, unmarshallValue(value)]));
+}
+
+function unmarshallValue(value) {
+  if (value.S !== undefined) return value.S;
+  if (value.N !== undefined) return Number(value.N);
+  if (value.BOOL !== undefined) return value.BOOL;
+  if (value.NULL !== undefined) return null;
+  if (value.M !== undefined) return unmarshall(value.M);
+  return undefined;
+}
+
+function printUsage() {
+  console.log(`Usage: archive-lock-release --owner-execution-arn <arn> --fencing-token <n> --ticket <id> [options]
+
+Break-glass recovery: manually release the monthly archive's DynamoDB lock
+(LOCK#monthly-archive) after confirming the owning Step Functions execution is
+terminal. Requires the ArchiveLockBreakGlassRole (or an identity with equivalent,
+narrowly-scoped access) -- see "Break-glass recovery" in docs/operations.md.
+
+Does not read the lock before deleting it: the DynamoDB ConditionExpression on the
+delete (ownerExecutionArn = :arn AND fencingToken = :token) is the sole authority
+for whether the delete is safe. If the condition does not match, nothing is deleted.
+
+Required:
+  --owner-execution-arn <arn>  Execution ARN believed to own the lock. Checked via
+                                Step Functions DescribeExecution before any delete is
+                                attempted; refused if the execution is still RUNNING.
+  --fencing-token <n>          Fencing token the lock must currently hold.
+  --ticket <id>                Incident/ticket ID for this recovery. Printed back in
+                                the success output -- copy it into the operations log.
+
+Options:
+  --table <name>                Coordination table name. Recommended: pass this
+                                 explicitly. If omitted, resolved via
+                                 cloudformation:DescribeStacks -- but the prescribed
+                                 ArchiveLockBreakGlassRole does NOT grant that action
+                                 (by design, to stay narrowly scoped), so auto-detection
+                                 will fail under the intended identity.
+  --stack <name>                CloudFormation stack name (default: InfraStack, or
+                                 $ARCHIVE_LOCK_RELEASE_STACK_NAME). Only used for --table
+                                 auto-detection.
+  --profile <name>              AWS CLI profile.
+  --region <name>                AWS region.
+  --dry-run                     Print the exact "aws dynamodb delete-item" command
+                                 without executing it.
+  --help                        Show this help.
+
+Exit codes:
+  0  Released (or dry-run printed the command).
+  ${EXIT_GENERIC_ERROR}  Generic error (bad arguments, AWS CLI/config problem, etc).
+  ${EXIT_EXECUTION_RUNNING}  Refused: the given execution is still RUNNING.
+  ${EXIT_CONDITION_FAILED}  Refused: owner/fencing token did not match (or already released).`);
+}
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (err) {
+    if (err instanceof OperatorError) {
+      console.error(err.message);
+      process.exit(err.exitCode);
+    }
+    console.error(err && err.stack ? err.stack : String(err));
+    process.exit(EXIT_GENERIC_ERROR);
+  }
+}
+
+module.exports = {
+  OperatorError,
+  EXIT_GENERIC_ERROR,
+  EXIT_EXECUTION_RUNNING,
+  EXIT_CONDITION_FAILED,
+  LOCK_PK,
+  LOCK_SK,
+  parseArgs,
+  buildDeleteItemArgs,
+  renderShellCommand,
+  unmarshall,
+};

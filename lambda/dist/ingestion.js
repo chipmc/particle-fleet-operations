@@ -12,6 +12,7 @@ exports.handleIngestion = handleIngestion;
 const s3_1 = require("./storage/s3");
 const dynamo_1 = require("./storage/dynamo");
 const current_state_1 = require("./storage/current-state");
+const event_history_1 = require("./storage/event-history");
 const particle_api_1 = require("./integrations/particle-api");
 const ledger_refresh_1 = require("./ledger-refresh");
 const parse_1 = require("./utils/parse");
@@ -68,6 +69,7 @@ async function handleIngestion(event) {
     const eventName = (0, parse_1.extractEventName)(body);
     const deviceId = (0, parse_1.extractDeviceId)(body);
     const publishedAt = (0, parse_1.extractTimestamp)(body);
+    const evaluatedAt = new Date().toISOString();
     const parsedData = (0, parse_1.safeParseData)(body.data);
     const parsed = (0, parse_1.buildParsedEvent)(body, event.requestContext?.http?.userAgent, event.requestContext?.http?.sourceIp);
     // ============================================================================
@@ -92,10 +94,12 @@ async function handleIngestion(event) {
     // Index event in DynamoDB (fast retrieval)
     await (0, dynamo_1.indexEvent)(process.env.LOG_EVENTS_TABLE_NAME, deviceId, publishedAt, eventName, parsed.receivedAt, s3Key, body, parsedData, normalized);
     const currentStateTableName = process.env.DEVICE_CURRENT_STATE_TABLE_NAME;
+    const projectId = normalized?.projectId || body.projectId || 'generalized-core-counter';
+    let previousCurrentState = null;
+    let ledgerSyncFailure;
     if (currentStateTableName) {
         try {
-            const projectId = normalized?.projectId || body.projectId || 'generalized-core-counter';
-            const previousCurrentState = await (0, current_state_1.getDeviceCurrentState)(currentStateTableName, projectId, deviceId);
+            previousCurrentState = await (0, current_state_1.getDeviceCurrentState)(currentStateTableName, projectId, deviceId);
             const deviceNameResolution = previousCurrentState?.deviceName
                 ? null
                 : await (0, particle_api_1.resolveParticleDeviceName)(deviceId);
@@ -109,6 +113,7 @@ async function handleIngestion(event) {
                 deviceId,
                 body,
                 previous: previousCurrentState,
+                onSyncFailed: (detail) => { ledgerSyncFailure = detail; },
             });
             console.log('Phase3A DeviceCurrentState update succeeded', JSON.stringify({
                 tableName: currentStateTableName,
@@ -121,7 +126,7 @@ async function handleIngestion(event) {
         catch (err) {
             console.warn('Phase3A DeviceCurrentState update failed; preserving ingestion', JSON.stringify({
                 tableName: currentStateTableName,
-                projectId: normalized?.projectId || body.projectId || 'generalized-core-counter',
+                projectId,
                 deviceId,
                 eventName,
                 eventTime: publishedAt,
@@ -134,6 +139,29 @@ async function handleIngestion(event) {
             eventName,
             eventTime: publishedAt,
         }));
+    }
+    const eventHistoryTableName = process.env.EVENT_HISTORY_TABLE_NAME;
+    if (eventHistoryTableName) {
+        try {
+            await (0, event_history_1.writeIngestionEventHistory)({
+                tableName: eventHistoryTableName,
+                deviceId,
+                publishedAt,
+                evaluatedAt,
+                rawPayload: body,
+                normalized,
+                previousState: previousCurrentState,
+                ledgerSyncFailure,
+            });
+        }
+        catch (err) {
+            console.warn('Phase4 EventHistory write failed; preserving ingestion', JSON.stringify({
+                tableName: eventHistoryTableName,
+                deviceId,
+                eventName,
+                eventTime: publishedAt,
+            }), err);
+        }
     }
     // ============================================================================
     // Logging and Response (Exact Current Behavior)
