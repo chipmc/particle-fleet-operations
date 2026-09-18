@@ -23,6 +23,12 @@ jest.mock('../archive-coordination', () => ({
   assertLockHeld: jest.fn(),
   releaseLock: jest.fn(),
   reconcileFailure: jest.fn(),
+  // Only `updateItem` is faked -- archive-control.ts calls it directly (for the RUN item's
+  // terminal-status write); everything else on `dependencies` is unused by this file
+  // (acquireLock/assertLockHeld/releaseLock/reconcileFailure, which would otherwise use it,
+  // are themselves mocked above). Faking it here, rather than letting the real
+  // DynamoDBDocumentClient run, keeps this file's tests from attempting a real AWS call.
+  dependencies: { updateItem: jest.fn() },
 }));
 
 const mockProcessArchivePage = processArchivePage as jest.MockedFunction<typeof processArchivePage>;
@@ -30,6 +36,7 @@ const mockAcquireLock = coordination.acquireLock as jest.MockedFunction<typeof c
 const mockAssertLockHeld = coordination.assertLockHeld as jest.MockedFunction<typeof coordination.assertLockHeld>;
 const mockReleaseLock = coordination.releaseLock as jest.MockedFunction<typeof coordination.releaseLock>;
 const mockReconcileFailure = coordination.reconcileFailure as jest.MockedFunction<typeof coordination.reconcileFailure>;
+const mockCoordinationUpdateItem = coordination.dependencies.updateItem as jest.MockedFunction<typeof coordination.dependencies.updateItem>;
 const mockS3Send = jest.spyOn(S3Client.prototype, 'send');
 const mockDynamoSend = jest.spyOn(DynamoDBClient.prototype, 'send');
 const mockCloudWatchSend = jest.spyOn(CloudWatchClient.prototype, 'send');
@@ -88,6 +95,7 @@ describe('archive control handler', () => {
       return {} as never;
     });
     mockCloudWatchSend.mockResolvedValue({} as never);
+    mockCoordinationUpdateItem.mockResolvedValue(undefined);
   });
 
   test('START confirms the source table schema, calls acquireLock, and returns the fencing token', async () => {
@@ -146,9 +154,10 @@ describe('archive control handler', () => {
     expect(report).toMatchObject({ complete: true, verified: 1 });
   });
 
-  test('FINALIZE calls assertLockHeld then releaseLock with the exact fencing token', async () => {
+  test('FINALIZE calls assertLockHeld then releaseLock with the exact fencing token, and writes a terminal status back to the RUN item', async () => {
     mockAssertLockHeld.mockResolvedValue(undefined);
     mockReleaseLock.mockResolvedValue({ released: true });
+    const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
 
     const result = await handler({
       action: 'FINALIZE', runId: '2026-09-01T00-00-00Z', cutoff: '2026-07-04T00:00:00.000Z',
@@ -166,6 +175,34 @@ describe('archive control handler', () => {
     expect(metricCall.input.MetricData).toEqual(expect.arrayContaining([
       expect.objectContaining({ MetricName: 'RunCompleted', Value: 1 }),
     ]));
+    // The RUN item's own `status` must actually be written to SUCCEEDED, not just the
+    // S3 report/SNS message -- prior to this fix nothing ever touched the RUN item again
+    // after acquireLock created it as STARTED, even on a clean success.
+    expect(mockCoordinationUpdateItem).toHaveBeenCalledWith(expect.objectContaining({
+      TableName: COORDINATION_TABLE,
+      Key: coordination.runItemKey(EXECUTION_ARN),
+      ExpressionAttributeValues: expect.objectContaining({ ':status': 'SUCCEEDED' }),
+    }));
+    // The releaseLock-visibility fix must be a no-op on this already-proven-correct
+    // success path: released:true here, so nothing should be logged.
+    expect(consoleError).not.toHaveBeenCalled();
+  });
+
+  test('FINALIZE logs explicitly when releaseLock reports released:false, without changing the reported outcome', async () => {
+    mockAssertLockHeld.mockResolvedValue(undefined);
+    mockReleaseLock.mockResolvedValue({ released: false, reason: 'lock-not-held' });
+    const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = await handler({
+      action: 'FINALIZE', runId: '2026-09-01T00-00-00Z', cutoff: '2026-07-04T00:00:00.000Z',
+      executionArn: EXECUTION_ARN, fencingToken: 9,
+    });
+
+    // Silently swallowed before this fix: the run is still reported the same way (this
+    // fix only adds visibility, it must not change what a caller/Step Functions sees).
+    expect(result.status).toBe('SUCCEEDED');
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('archive_run_lock_not_released'));
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('lock-not-held'));
   });
 
   test('FINALIZE does not release the lock if assertLockHeld rejects', async () => {
@@ -176,6 +213,7 @@ describe('archive control handler', () => {
       executionArn: EXECUTION_ARN, fencingToken: 9,
     })).rejects.toThrow('fencing mismatch');
     expect(mockReleaseLock).not.toHaveBeenCalled();
+    expect(mockCoordinationUpdateItem).not.toHaveBeenCalled();
   });
 
   test('RECONCILE_FAILURE from the in-workflow Catch path normalizes the ASL {Error,Cause} payload into a real Error with cause', async () => {
