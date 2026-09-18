@@ -6,9 +6,15 @@ AWS CDK infrastructure for Particle Log Monitoring
 
 Deploys:
 - API Gateway HTTP API
-- Lambda function (TypeScript, modular)
-- S3 bucket for raw event storage
+- Ingestion/query Lambda and monthly archive Lambda
+- Standard Step Functions monthly archive workflow
+- EventBridge Scheduler, SNS notifications, and missed-run alarm
+- S3 bucket for raw events and verified index snapshots
 - DynamoDB table for indexed event retrieval
+
+The archive workflow is copy-and-verify only. CDK sets
+`ARCHIVE_DELETE_ENABLED=false`, and the archive role has no DynamoDB delete
+permission.
 
 ## Lambda Source
 

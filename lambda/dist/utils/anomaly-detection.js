@@ -15,7 +15,6 @@ exports.sortAnomalies = sortAnomalies;
  * Applies heuristic rules to identify device health issues:
  * - Low battery conditions
  * - High cellular connection times
- * - Increasing reset counts
  * - Active alerts
  * - Firmware version changes
  * - Rapid battery drain
@@ -30,7 +29,6 @@ function detectAnomalies(events) {
     }
     // Track metrics across events
     const batteryReadings = [];
-    const resetCounts = [];
     const firmwareVersions = [];
     // Scan events for anomalies
     for (const event of events) {
@@ -77,10 +75,6 @@ function detectAnomalies(events) {
                 });
             }
         }
-        // Reset count anomalies
-        if (event.resetCount !== undefined && event.resetCount !== null) {
-            resetCounts.push({ time: event.eventTime, value: event.resetCount });
-        }
         // Alert anomalies
         if (event.alertCount !== undefined && event.alertCount !== null && event.alertCount > 0) {
             anomalies.push({
@@ -94,23 +88,6 @@ function detectAnomalies(events) {
         // Firmware version tracking
         if (event.fwVersion && typeof event.fwVersion === 'string') {
             firmwareVersions.push({ time: event.eventTime, value: event.fwVersion });
-        }
-    }
-    // Detect reset count increases
-    if (resetCounts.length > 1) {
-        for (let i = 1; i < resetCounts.length; i++) {
-            const prev = resetCounts[i - 1];
-            const curr = resetCounts[i];
-            const increase = curr.value - prev.value;
-            if (increase > 0) {
-                anomalies.push({
-                    severity: increase > 3 ? 'high' : 'medium',
-                    type: 'reset_count_increase',
-                    eventTime: curr.time,
-                    message: `Reset count increased by ${increase} (from ${prev.value} to ${curr.value})`,
-                    value: increase,
-                });
-            }
         }
     }
     // Detect firmware version changes

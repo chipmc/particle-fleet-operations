@@ -7,7 +7,7 @@
  * historical telemetry.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ddb = void 0;
+exports.ddb = exports.OFFLINE_THRESHOLD_HOURS = void 0;
 exports.updateDeviceCurrentState = updateDeviceCurrentState;
 exports.getDeviceCurrentState = getDeviceCurrentState;
 exports.updateDeviceStatusLedgerSnapshot = updateDeviceStatusLedgerSnapshot;
@@ -15,12 +15,15 @@ exports.updateProductDefaultsLedgerSnapshot = updateProductDefaultsLedgerSnapsho
 exports.updateDeviceSettingsLedgerSnapshot = updateDeviceSettingsLedgerSnapshot;
 exports.projectMissingDeviceSettingsLedger = projectMissingDeviceSettingsLedger;
 exports.queryDeviceCurrentStates = queryDeviceCurrentStates;
+exports.isOfflineCandidate = isOfflineCandidate;
+exports.buildAnomalies = buildAnomalies;
 exports.buildCurrentState = buildCurrentState;
 exports.determineHealthStatus = determineHealthStatus;
 const client_dynamodb_1 = require("@aws-sdk/client-dynamodb");
 const lib_dynamodb_1 = require("@aws-sdk/lib-dynamodb");
 const DEFAULT_PROJECT_ID = 'generalized-core-counter';
-const DEFAULT_OFFLINE_THRESHOLD_HOURS = 3;
+exports.OFFLINE_THRESHOLD_HOURS = 3;
+const DEVICE_STATUS_SCHEMA_VERSION_V2 = 2;
 const client = new client_dynamodb_1.DynamoDBClient({});
 const ddb = lib_dynamodb_1.DynamoDBDocumentClient.from(client);
 exports.ddb = ddb;
@@ -86,11 +89,25 @@ async function updateProjectedLedgerSnapshot(tableName, projectId, deviceId, led
         values[':sizeBytes'] = snapshot.sizeBytes;
         assignments.push('#ledgerSizeBytes = :sizeBytes');
     }
+    if (ledger === 'deviceStatus') {
+        const resetCountProjection = extractDeviceStatusResetCountProjection(snapshot.data);
+        if (resetCountProjection.firmware !== undefined) {
+            names['#firmwareProjection'] = 'firmware';
+            values[':firmwareProjection'] = resetCountProjection.firmware;
+            assignments.push('#firmwareProjection = :firmwareProjection');
+        }
+        if (resetCountProjection.startup !== undefined) {
+            names['#startupProjection'] = 'startup';
+            values[':startupProjection'] = resetCountProjection.startup;
+            assignments.push('#startupProjection = :startupProjection');
+        }
+    }
+    const setExpression = `SET ${assignments.join(', ')}`;
     try {
         await ddb.send(new lib_dynamodb_1.UpdateCommand({
             TableName: tableName,
             Key: { projectId, deviceId },
-            UpdateExpression: `SET ${assignments.join(', ')}`,
+            UpdateExpression: setExpression,
             ConditionExpression: 'attribute_not_exists(#ledgerUpdatedAt) OR #ledgerUpdatedAt < :incomingUpdatedAt',
             ExpressionAttributeNames: names,
             ExpressionAttributeValues: values,
@@ -140,11 +157,8 @@ async function queryDeviceCurrentStates(tableName, projectId, limit = 100) {
 }
 function buildCurrentState(input) {
     const effective = mergePreviousMetrics(input.previous, input.normalized);
-    const resetIncreased = input.previous?.resetCount !== undefined &&
-        effective.resetCount !== undefined &&
-        effective.resetCount > input.previous.resetCount;
-    const healthStatus = determineStateHealthStatus(effective, resetIncreased, input.previous, input.normalized);
-    const anomalies = buildAnomalies(effective, resetIncreased);
+    const healthStatus = determineStateHealthStatus(effective, input.previous, input.normalized);
+    const anomalies = buildAnomalies(effective);
     const recentSerialErrorCount = input.normalized?.severity === 'ERROR'
         ? (input.previous?.recentSerialErrorCount || 0) + 1
         : input.previous?.recentSerialErrorCount || 0;
@@ -166,6 +180,8 @@ function buildCurrentState(input) {
         lastPlane: input.normalized?.plane || input.previous?.lastPlane,
         lastSourceType: input.normalized?.sourceType || input.body.sourceType || input.previous?.lastSourceType,
         fwVersion: input.normalized?.fwVersion || input.body.fw_version || input.previous?.fwVersion,
+        firmware: input.previous?.firmware,
+        startup: input.previous?.startup,
         battery: effective.battery,
         connectTime: effective.connectTime,
         resetCount: effective.resetCount,
@@ -188,7 +204,7 @@ function buildCurrentState(input) {
         healthStatus,
         anomalyCount: anomalies.length,
         anomalies,
-        offlineCandidate: isOfflineCandidate(input.eventTime, DEFAULT_OFFLINE_THRESHOLD_HOURS, input.updatedAt),
+        offlineCandidate: isOfflineCandidate(input.eventTime, exports.OFFLINE_THRESHOLD_HOURS, input.updatedAt),
         updatedAt: input.updatedAt,
     });
 }
@@ -210,7 +226,7 @@ function mergePreviousMetrics(previous, normalized) {
 function hasNormalizedField(normalized, field) {
     return normalized ? Object.prototype.hasOwnProperty.call(normalized, field) : false;
 }
-function determineStateHealthStatus(state, resetIncreased, previous, normalized) {
+function determineStateHealthStatus(state, previous, normalized) {
     if (normalized?.plane === 'serial') {
         if (state.severity === 'ERROR' || state.watchdogDetected)
             return 'critical';
@@ -218,7 +234,8 @@ function determineStateHealthStatus(state, resetIncreased, previous, normalized)
             return 'warning';
         return previous?.healthStatus || 'unknown';
     }
-    return determineHealthStatus(state, resetIncreased);
+    const resetCountIncreaseIgnored = false;
+    return determineHealthStatus(state, resetCountIncreaseIgnored);
 }
 function determineHealthStatus(state, resetIncreased) {
     if ((state.battery !== undefined && state.battery < 20) ||
@@ -235,12 +252,11 @@ function determineHealthStatus(state, resetIncreased) {
     }
     const hasHealthSignal = state.battery !== undefined ||
         state.connectTime !== undefined ||
-        state.resetCount !== undefined ||
         state.alertCount !== undefined ||
         state.severity !== undefined;
     return hasHealthSignal ? 'healthy' : 'unknown';
 }
-function buildAnomalies(state, resetIncreased) {
+function buildAnomalies(state) {
     const anomalies = [];
     if (state.battery !== undefined && state.battery < 20) {
         anomalies.push({ severity: 'high', type: 'critical_battery', message: 'Battery below 20%' });
@@ -272,9 +288,6 @@ function buildAnomalies(state, resetIncreased) {
     if (state.resetDetected) {
         anomalies.push({ severity: 'medium', type: 'serial_reset', message: 'Serial log indicates reset, reboot, or panic activity' });
     }
-    if (resetIncreased) {
-        anomalies.push({ severity: 'medium', type: 'reset_count_increase', message: 'Reset count increased since previous state' });
-    }
     return anomalies.slice(0, 10);
 }
 function isOfflineCandidate(eventTime, thresholdHours, now) {
@@ -300,5 +313,45 @@ function buildUpdateExpression(state) {
 }
 function omitUndefined(value) {
     return Object.fromEntries(Object.entries(value).filter(([, entryValue]) => entryValue !== undefined));
+}
+function extractDeviceStatusResetCountProjection(data) {
+    if (parseSchemaVersion(data.schemaVersion) !== DEVICE_STATUS_SCHEMA_VERSION_V2) {
+        return {};
+    }
+    const firmwareResetCount = extractResetCountValue(data, 'firmware', 'resetCount');
+    const startupResetCount = extractResetCountValue(data, 'startup', 'resetCount');
+    const projection = {};
+    if (firmwareResetCount !== undefined) {
+        projection.firmware = { resetCount: firmwareResetCount };
+    }
+    if (startupResetCount !== undefined) {
+        projection.startup = { resetCount: startupResetCount };
+    }
+    return projection;
+}
+function parseSchemaVersion(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value;
+    }
+    if (typeof value === 'string' && value.trim().length > 0) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : undefined;
+    }
+    return undefined;
+}
+function extractResetCountValue(data, key, nestedKey) {
+    const parent = data[key];
+    if (!parent || typeof parent !== 'object') {
+        return undefined;
+    }
+    const value = parent[nestedKey];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value;
+    }
+    if (typeof value === 'string' && value.trim().length > 0) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : undefined;
+    }
+    return undefined;
 }
 //# sourceMappingURL=current-state.js.map

@@ -296,6 +296,12 @@ export interface DeviceCurrentState {
     lastPlane?: EventPlane;
     lastSourceType?: string;
     fwVersion?: string;
+    firmware?: {
+        resetCount: number;
+    };
+    startup?: {
+        resetCount: number;
+    };
     battery?: number;
     connectTime?: number;
     resetCount?: number;
