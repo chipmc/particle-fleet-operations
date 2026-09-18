@@ -151,6 +151,23 @@ archiving rows coordinate through one DynamoDB table, `ArchiveCoordination`
   has no tie case). The token is never reset: releasing the lock clears
   `ownerExecutionArn`/`leaseExpiry` with `UpdateItem`, it never deletes the
   item, so a stale writer can never "start over" at a low token value.
+
+  **This item persists forever, by design, and is never deleted by any
+  application code path** — the only thing in this whole system that can
+  delete it is the separate, out-of-band `tools/archive-lock-release`
+  break-glass CLI (see "Break-Glass Recovery" in `docs/operations.md`), and
+  only against a currently-held lock. Concretely, after every successful
+  run, `LOCK#monthly-archive` will read as `ownerExecutionArn: ""`,
+  `leaseExpiry: 0`, and a `fencingToken` equal to the number of
+  acquisitions that have ever happened — **this is the correct, released
+  state, not a stuck or leftover lock.** An earlier design considered here
+  (and rejected in review) deleted the lock item on release instead; that
+  reopened an ABA vulnerability, since a stale reader could mistake a
+  later, recreated item for the same one it last observed. If you're
+  looking at a live item in this shape and wondering whether something
+  went wrong: it didn't — check the corresponding `RUN#<sha256(executionArn)>`
+  item's `status` field (written on both success and failure) for the
+  actual run outcome instead.
 - `RUN#<sha256(executionArn)>` / `METADATA` — one run's status, failure
   evidence (frozen on first write, never recomputed from a later caller's
   live input), report-write claim state, and notification-send claim state.

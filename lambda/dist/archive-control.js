@@ -110,7 +110,26 @@ async function finalizeRun(runId, cutoff, executionArn, fencingToken) {
             { MetricName: 'RowsRetained', Value: totals.retained, Unit: 'Count' },
         ],
     }));
-    await (0, archive_coordination_1.releaseLock)(archive_coordination_1.dependencies, coordinationTableName, executionArn, fencingToken);
+    // The RUN item's `status` was only ever set once, to STARTED, by acquireLock -- this
+    // success path never wrote it back, so a RUN item stayed STARTED forever even after a
+    // clean FINALIZE (found during post-deploy validation by inspecting live table state).
+    await archive_coordination_1.dependencies.updateItem({
+        TableName: coordinationTableName,
+        Key: (0, archive_coordination_1.runItemKey)(executionArn),
+        UpdateExpression: 'SET #status = :status, updatedAt = :now',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':status': status, ':now': new Date().toISOString() },
+    });
+    const releaseResult = await (0, archive_coordination_1.releaseLock)(archive_coordination_1.dependencies, coordinationTableName, executionArn, fencingToken);
+    if (!releaseResult.released) {
+        // Not thrown: the archive run itself already succeeded and its report is already
+        // committed -- a failed lock release doesn't change that outcome, it just means the
+        // coordination table needs attention (most likely this fencing token was already
+        // superseded; the lock's 24h lease and break-glass recovery already cover that).
+        // Previously this was discarded entirely, so the only way to notice it was to inspect
+        // live table state by hand.
+        console.error(JSON.stringify({ event: 'archive_run_lock_not_released', runId, executionArn, fencingToken, reason: releaseResult.reason }));
+    }
     console.info(JSON.stringify({ event: 'archive_run_complete', status, reportKey, ...totals }));
     return {
         status,
