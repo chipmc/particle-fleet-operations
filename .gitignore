@@ -5,3 +5,4 @@ cdk.out/
 .DS_Store
 .aws-sam/
 .claude/
+lambda/dist/

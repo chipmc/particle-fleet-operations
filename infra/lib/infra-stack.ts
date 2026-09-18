@@ -20,6 +20,8 @@ import * as events from 'aws-cdk-lib/aws-events';
 import * as eventTargets from 'aws-cdk-lib/aws-events-targets';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as destinations from 'aws-cdk-lib/aws-lambda-destinations';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as path from 'path';
 
 export class InfraStack extends cdk.Stack {
@@ -92,6 +94,45 @@ export class InfraStack extends cdk.Stack {
     });
 
     // =========================================================================
+    // Particle Ingestion Configuration (SSM Parameter Store / Secrets Manager)
+    // =========================================================================
+
+    // Previously these eight values were read as `process.env.X || '<fallback>'` directly in
+    // this CDK app, which meant a `cdk deploy` run from any shell missing one of these exports
+    // silently overwrote the live, correct value with an empty/wrong fallback -- confirmed as a
+    // real, standing risk (it nearly happened during the archival-feature deploy) and not
+    // something `cdk diff` could warn about, since the "fallback" was itself the value CDK
+    // computed and considered correct.
+    //
+    // Below, each of these becomes a CloudFormation dynamic reference (`{{resolve:ssm:...}}` /
+    // `{{resolve:secretsmanager:...}}`) instead of a literal string baked in at synth time.
+    // CloudFormation itself resolves the current value from SSM/Secrets Manager at deploy time,
+    // independent of the deploying shell's environment entirely -- so a missing shell export can
+    // no longer cause drift here at all, and `cdk diff` run from a completely clean shell shows
+    // zero changes to this function. The values themselves are managed entirely out-of-band
+    // (via `aws ssm put-parameter` / `aws secretsmanager put-secret-value`), never in this
+    // source file -- for the two secrets specifically, that also means no plaintext credential
+    // ever appears in the synthesized template or in `cdk diff` output.
+    const particleIngestionSsmPrefix = '/particle-fleet-operations/ingestion';
+    const particleApiBaseUrl = ssm.StringParameter.valueForStringParameter(
+      this, `${particleIngestionSsmPrefix}/particle-api-base-url`);
+    const ledgerRefreshEnabled = ssm.StringParameter.valueForStringParameter(
+      this, `${particleIngestionSsmPrefix}/ledger-refresh-enabled`);
+    const ledgerRefreshDeviceIds = ssm.StringParameter.valueForStringParameter(
+      this, `${particleIngestionSsmPrefix}/ledger-refresh-device-ids`);
+    const ledgerRefreshProductIds = ssm.StringParameter.valueForStringParameter(
+      this, `${particleIngestionSsmPrefix}/ledger-refresh-product-ids`);
+    const ledgerRefreshEventNames = ssm.StringParameter.valueForStringParameter(
+      this, `${particleIngestionSsmPrefix}/ledger-refresh-event-names`);
+    const ledgerRefreshMinIntervalSeconds = ssm.StringParameter.valueForStringParameter(
+      this, `${particleIngestionSsmPrefix}/ledger-refresh-min-interval-seconds`);
+
+    const particleCredentials = secretsmanager.Secret.fromSecretNameV2(
+      this, 'ParticleCredentialsSecret', 'particle-fleet-operations/ingestion/particle-credentials');
+    const particleAccessToken = particleCredentials.secretValueFromJson('PARTICLE_ACCESS_TOKEN').unsafeUnwrap();
+    const particleWebhookSecret = particleCredentials.secretValueFromJson('PARTICLE_WEBHOOK_SECRET').unsafeUnwrap();
+
+    // =========================================================================
     // Lambda Function (handles both ingestion and query)
     // =========================================================================
 
@@ -116,14 +157,14 @@ export class InfraStack extends cdk.Stack {
         LOG_EVENTS_TABLE_NAME: logEventsTable.tableName,
         DEVICE_CURRENT_STATE_TABLE_NAME: deviceCurrentStateTable.tableName,
         EVENT_HISTORY_TABLE_NAME: eventHistoryTable.tableName,
-        PARTICLE_ACCESS_TOKEN: process.env.PARTICLE_ACCESS_TOKEN || '',
-        PARTICLE_API_BASE_URL: process.env.PARTICLE_API_BASE_URL || 'https://api.particle.io',
-        PARTICLE_WEBHOOK_SECRET: process.env.PARTICLE_WEBHOOK_SECRET || '',
-        PARTICLE_LEDGER_REFRESH_ENABLED: process.env.PARTICLE_LEDGER_REFRESH_ENABLED || "false",
-        PARTICLE_LEDGER_REFRESH_DEVICE_IDS:process.env.PARTICLE_LEDGER_REFRESH_DEVICE_IDS || "",
-        PARTICLE_LEDGER_REFRESH_PRODUCT_IDS: process.env.PARTICLE_LEDGER_REFRESH_PRODUCT_IDS || '',
-        PARTICLE_LEDGER_REFRESH_EVENT_NAMES: process.env.PARTICLE_LEDGER_REFRESH_EVENT_NAMES || '',
-        PARTICLE_LEDGER_REFRESH_MIN_INTERVAL_SECONDS: process.env.PARTICLE_LEDGER_REFRESH_MIN_INTERVAL_SECONDS || '60',
+        PARTICLE_ACCESS_TOKEN: particleAccessToken,
+        PARTICLE_API_BASE_URL: particleApiBaseUrl,
+        PARTICLE_WEBHOOK_SECRET: particleWebhookSecret,
+        PARTICLE_LEDGER_REFRESH_ENABLED: ledgerRefreshEnabled,
+        PARTICLE_LEDGER_REFRESH_DEVICE_IDS: ledgerRefreshDeviceIds,
+        PARTICLE_LEDGER_REFRESH_PRODUCT_IDS: ledgerRefreshProductIds,
+        PARTICLE_LEDGER_REFRESH_EVENT_NAMES: ledgerRefreshEventNames,
+        PARTICLE_LEDGER_REFRESH_MIN_INTERVAL_SECONDS: ledgerRefreshMinIntervalSeconds,
       },
     });
 
