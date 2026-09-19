@@ -80,3 +80,14 @@ separate work order; not yet dispatched as of this document's creation.
   external probe before being traced back to the Pi's own `/etc/serial-forwarder.env`, which
   had not been part of the original rotation checklist. This document was created as the
   direct remediation for that gap.
+
+  This specific exposure vector — a `cdk diff` printing a secret's plaintext value — is now
+  structurally closed for both `PARTICLE_ACCESS_TOKEN` and `PARTICLE_WEBHOOK_SECRET`. Before
+  PR #35, `infra-stack.ts` set these as literal strings computed at synth time, so a `cdk diff`
+  run before that change was deployed showed the actual value in its "before" state, exactly
+  as happened here. Since PR #35, both are CloudFormation dynamic references resolved from
+  Secrets Manager at deploy time; `cdk diff` only ever shows the Secrets Manager ARN pointer
+  for these two values, never the underlying secret, no matter when it's run. This doesn't
+  make secret handling foolproof — see "Planned: per-consumer credentials" above for the
+  remaining shared-secret blast-radius problem — but this one exposure path specifically
+  cannot recur for these two credentials.
