@@ -514,6 +514,31 @@ export class InfraStack extends cdk.Stack {
       apiName: 'particle-log-ingestion-api',
     });
 
+    // Added during the 2026-09-18 webhook-secret-compromise incident: the Lambda's own
+    // application logs never capture source IP or headers (a failed auth check returns
+    // before the body is even parsed, so there isn't even a deviceId to go on), and this
+    // API previously had no access logging at all -- leaving no way to identify what was
+    // still sending the old secret once it was clear more than one caller was involved.
+    const httpApiAccessLogGroup = new logs.LogGroup(this, 'HttpApiAccessLogs', {
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+    httpApiAccessLogGroup.grantWrite(new iam.ServicePrincipal('apigateway.amazonaws.com'));
+    const cfnDefaultStage = httpApi.defaultStage!.node.defaultChild as apigwv2.CfnStage;
+    cfnDefaultStage.accessLogSettings = {
+      destinationArn: httpApiAccessLogGroup.logGroupArn,
+      format: JSON.stringify({
+        requestId: '$context.requestId',
+        requestTime: '$context.requestTime',
+        sourceIp: '$context.identity.sourceIp',
+        httpMethod: '$context.httpMethod',
+        routeKey: '$context.routeKey',
+        status: '$context.status',
+        userAgent: '$context.identity.userAgent',
+        integrationError: '$context.integrationErrorMessage',
+      }),
+    };
+
     // Phase 1 + 2A: Ingestion endpoint (POST /particle/log)
     httpApi.addRoutes({
       path: '/particle/log',
