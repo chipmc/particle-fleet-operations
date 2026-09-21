@@ -17,6 +17,35 @@ export interface InboundEvent {
       sourceIp?: string;
     };
   };
+  /**
+   * Set only when the request arrived via the ingestion REST API custom domain
+   * (ingest.seeinsights.com), where API Gateway itself already validated the API key
+   * before invoking this Lambda at all. Absent for the legacy HTTP API route, which has
+   * no API keys and authenticates via the shared secret alone. See consumer-auth.ts.
+   */
+  apiKeyId?: string;
+}
+
+/**
+ * API Gateway REST API (v1) proxy integration event structure -- the shape used by the
+ * ingestion custom domain's REST API, distinct from both InboundEvent (legacy/test) and
+ * QueryEvent (HTTP API v2, used by every other route). Only the fields handler.ts's
+ * adapter actually reads are declared here.
+ * https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-lambda-proxy-integrations.html
+ */
+export interface RestApiProxyEvent {
+  httpMethod: string;
+  path: string;
+  headers: Record<string, string | undefined> | null;
+  body: string | null;
+  requestContext: {
+    apiId: string;
+    identity: {
+      apiKeyId?: string | null;
+      sourceIp?: string | null;
+      userAgent?: string | null;
+    };
+  };
 }
 
 /**

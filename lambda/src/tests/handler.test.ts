@@ -31,7 +31,7 @@ describe('Lambda Handler', () => {
     jest.clearAllMocks();
     process.env = {
       ...originalEnv,
-      PARTICLE_WEBHOOK_SECRET: 'test-secret-123',
+      QUERY_API_SHARED_SECRET: 'test-secret-123',
       RAW_LOGS_BUCKET_NAME: 'test-bucket',
       LOG_EVENTS_TABLE_NAME: 'test-table',
     };
@@ -574,6 +574,43 @@ describe('Lambda Handler', () => {
         expect(JSON.parse(response.body)).toMatchObject({
           error: 'method_not_allowed',
         });
+      });
+    });
+
+    describe('REST API v1 event adaptation (ingestion custom domain)', () => {
+      // consumer-auth.ts is intentionally not mocked here -- these events carry no
+      // apiKeyId, so handleIngestion's dispatch (tested in ingestion-consumer-auth.test.ts)
+      // routes them to the legacy shared-secret check, letting this file verify purely
+      // that the REST v1 -> InboundEvent field extraction itself is correct (method,
+      // path, headers, body), independent of which auth path a real request would take.
+      function restApiV1Event(overrides: Record<string, unknown> = {}) {
+        return {
+          httpMethod: 'POST',
+          path: '/particle/log',
+          headers: { 'x-particle-webhook-secret': 'test-secret-123' },
+          body: JSON.stringify({ event: 'status', coreid: 'device123', published_at: '2026-09-21T00:00:00.000Z' }),
+          requestContext: {
+            apiId: 'restapi123',
+            identity: { sourceIp: '203.0.113.9', userAgent: 'rest-agent' },
+          },
+          ...overrides,
+        };
+      }
+
+      it('extracts method/path/headers/body correctly and authenticates via the legacy check when no apiKeyId is present', async () => {
+        const response = await handler(restApiV1Event());
+        expect(response.statusCode).toBe(200);
+        expect(mockStoreRawEvent).toHaveBeenCalled();
+      });
+
+      it('a wrong secret on a REST v1 event without an apiKeyId is rejected the same as the legacy path', async () => {
+        const response = await handler(restApiV1Event({ headers: { 'x-particle-webhook-secret': 'wrong' } }));
+        expect(response.statusCode).toBe(401);
+      });
+
+      it('a non-POST REST v1 event is rejected as an unsupported method, same as any other event shape', async () => {
+        const response = await handler(restApiV1Event({ httpMethod: 'DELETE' }));
+        expect(response.statusCode).toBe(405);
       });
     });
   });

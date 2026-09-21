@@ -26,7 +26,7 @@ describe('ingestion device-status Ledger refresh', () => {
     jest.clearAllMocks();
     process.env = {
       ...originalEnv,
-      PARTICLE_WEBHOOK_SECRET: 'test-secret-123',
+      QUERY_API_SHARED_SECRET: 'test-secret-123',
       RAW_LOGS_BUCKET_NAME: 'raw-table',
       LOG_EVENTS_TABLE_NAME: 'history-table',
       DEVICE_CURRENT_STATE_TABLE_NAME: 'current-state-table',

@@ -8,6 +8,7 @@
  */
 
 import { InboundEvent, LambdaResponse, ParticleWebhook } from './types';
+import { validateConsumerRequest, buildApiKeyConsumerLookup } from './consumer-auth';
 import { storeRawEvent } from './storage/s3';
 import { indexEvent } from './storage/dynamo';
 import { getDeviceCurrentState, updateDeviceCurrentState } from './storage/current-state';
@@ -43,17 +44,44 @@ export async function handleIngestion(event: InboundEvent): Promise<LambdaRespon
   // Authentication (Exact Current Behavior)
   // ============================================================================
   
-  const expectedSecret = process.env.PARTICLE_WEBHOOK_SECRET;
   const providedSecret =
     event.headers?.['x-particle-webhook-secret'] ||
     event.headers?.['X-Particle-Webhook-Secret'];
+  const sourceIp = event.requestContext?.http?.sourceIp;
 
-  if (!expectedSecret || providedSecret !== expectedSecret) {
-    console.warn('Unauthorized webhook attempt');
-    return {
-      statusCode: 401,
-      body: JSON.stringify({ ok: false, error: 'unauthorized' }),
-    };
+  if (event.apiKeyId) {
+    // Arrived via the ingestion REST API custom domain (ingest.seeinsights.com), where
+    // API Gateway has already validated the API key itself before invoking this Lambda
+    // at all -- event.apiKeyId being present is exactly that signal. Per-consumer
+    // validation: see consumer-auth.ts.
+    const result = await validateConsumerRequest(providedSecret, event.apiKeyId, buildApiKeyConsumerLookup(process.env));
+    if (result.outcome === 'success') {
+      console.info(JSON.stringify({ event: 'ingestion_auth', authResult: 'success', consumerId: result.consumerId, apiKeyId: event.apiKeyId, sourceIp, route: 'POST /particle/log' }));
+    } else {
+      // Never logs the provided secret value, headers, or hashes -- reason is one of a
+      // fixed set of enumerated strings, sufficient to debug without exposing anything.
+      console.warn(JSON.stringify({ event: 'ingestion_auth', authResult: 'failure', reason: result.reason, apiKeyId: event.apiKeyId, apiKeyConsumerId: result.apiKeyConsumerId, sourceIp, route: 'POST /particle/log' }));
+      return {
+        statusCode: result.reason === 'credential_config_unavailable' ? 503 : 401,
+        body: JSON.stringify({ ok: false, error: result.reason === 'credential_config_unavailable' ? 'unavailable' : 'unauthorized' }),
+      };
+    }
+  } else {
+    // Legacy shared-secret path, kept functional until every consumer has migrated to a
+    // per-consumer credential on the new custom domain and the legacy HTTP API route is
+    // explicitly retired -- see docs/security/webhook-secret-rotation-runbook.md.
+    // QUERY_API_SHARED_SECRET is the same underlying value PARTICLE_WEBHOOK_SECRET used
+    // to be (renamed, not rotated, as part of the per-consumer-credentials migration) --
+    // it still gates this legacy path today, and will gate only query.ts once this path
+    // is removed.
+    const expectedSecret = process.env.QUERY_API_SHARED_SECRET;
+    if (!expectedSecret || providedSecret !== expectedSecret) {
+      console.warn('Unauthorized webhook attempt');
+      return {
+        statusCode: 401,
+        body: JSON.stringify({ ok: false, error: 'unauthorized' }),
+      };
+    }
   }
 
   // ============================================================================

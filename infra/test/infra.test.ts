@@ -203,3 +203,85 @@ test('the failure Catch path no longer has a standalone SnsPublish task', () => 
 	expect(definition).not.toContain('"action":"FAIL"');
 	expect(definition).not.toContain('"action":"RELEASE_LOCK"');
 });
+
+test('ingestion REST API is regional, has one POST method requiring an API key, and access logging', () => {
+	const synthesized = template();
+	synthesized.hasResourceProperties('AWS::ApiGateway::RestApi', {
+		Name: 'particle-ingestion-api',
+		EndpointConfiguration: { Types: ['REGIONAL'] },
+	});
+	synthesized.hasResourceProperties('AWS::ApiGateway::Method', {
+		HttpMethod: 'POST',
+		ApiKeyRequired: true,
+	});
+	synthesized.hasResourceProperties('AWS::ApiGateway::Stage', {
+		StageName: 'prod',
+		AccessLogSetting: Match.objectLike({
+			DestinationArn: Match.anyValue(),
+			Format: Match.stringLikeRegexp('requestId'),
+		}),
+	});
+	synthesized.hasResourceProperties('AWS::Logs::LogGroup', {
+		RetentionInDays: 30,
+	});
+});
+
+test('custom domain has exactly one base path mapping, to the ingestion REST API', () => {
+	const synthesized = template();
+	synthesized.resourceCountIs('AWS::ApiGateway::BasePathMapping', 1);
+	synthesized.hasResourceProperties('AWS::ApiGateway::BasePathMapping', {
+		DomainName: Match.anyValue(),
+		RestApiId: { Ref: Match.stringLikeRegexp('^IngestionRestApi') },
+	});
+});
+
+test('registry-driven per-consumer resources: one API key and usage plan per registered consumer, throttled per its own numbers', () => {
+	const synthesized = template();
+	synthesized.resourceCountIs('AWS::ApiGateway::ApiKey', 2);
+	synthesized.hasResourceProperties('AWS::ApiGateway::ApiKey', {
+		Name: 'particle-ingestion-particle-cloud-webhook',
+		Enabled: true,
+	});
+	synthesized.hasResourceProperties('AWS::ApiGateway::ApiKey', {
+		Name: 'particle-ingestion-serial-forwarder',
+		Enabled: true,
+	});
+	synthesized.hasResourceProperties('AWS::ApiGateway::UsagePlan', {
+		UsagePlanName: 'particle-ingestion-particle-cloud-webhook',
+		Throttle: { RateLimit: 100, BurstLimit: 500 },
+	});
+	synthesized.hasResourceProperties('AWS::ApiGateway::UsagePlan', {
+		UsagePlanName: 'particle-ingestion-serial-forwarder',
+		Throttle: { RateLimit: 10, BurstLimit: 50 },
+	});
+	synthesized.resourceCountIs('AWS::ApiGateway::UsagePlanKey', 2);
+});
+
+test('ingestion function IAM policy grants per-consumer secretsmanager:GetSecretValue scoped to each consumer secret ARN, never a wildcard', () => {
+	const synthesized = template();
+	const policies = synthesized.findResources('AWS::IAM::Policy');
+	const ingestionPolicies = Object.values(policies).filter(resource =>
+		JSON.stringify(resource).includes('ParticleLogIngestionFunction'));
+	const serialized = JSON.stringify(ingestionPolicies);
+	// Both consumer secrets show up as GetSecretValue targets ...
+	expect(serialized).toContain('secretsmanager:GetSecretValue');
+	expect(serialized).toContain('particle-cloud-webhook/webhook-secret');
+	expect(serialized).toContain('serial-forwarder/webhook-secret');
+	// ... but never as a prefix/wildcard grant across the whole consumers/ namespace -- a
+	// deliberate, scoped-per-secret reversal of PR #35's "zero secretsmanager:* on this
+	// role" property, not an accidental broadening back to it.
+	expect(serialized).not.toContain('ingestion/consumers/*');
+});
+
+test('ingestion function gets one INGESTION_API_KEY_ID_<CONSUMER> env var per registered consumer, matching the registry naming convention', () => {
+	const synthesized = template();
+	synthesized.hasResourceProperties('AWS::Lambda::Function', {
+		Environment: {
+			Variables: Match.objectLike({
+				INGESTION_API_KEY_ID_PARTICLE_CLOUD_WEBHOOK: Match.anyValue(),
+				INGESTION_API_KEY_ID_SERIAL_FORWARDER: Match.anyValue(),
+				QUERY_API_SHARED_SECRET: Match.anyValue(),
+			}),
+		},
+	});
+});

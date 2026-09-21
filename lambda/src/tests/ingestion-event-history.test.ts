@@ -59,7 +59,7 @@ describe('handleIngestion — EventHistory Phase 4', () => {
     jest.clearAllMocks();
     process.env = {
       ...originalEnv,
-      PARTICLE_WEBHOOK_SECRET: SECRET,
+      QUERY_API_SHARED_SECRET: SECRET,
       RAW_LOGS_BUCKET_NAME: 'raw-bucket',
       LOG_EVENTS_TABLE_NAME: 'log-events-table',
       DEVICE_CURRENT_STATE_TABLE_NAME: 'current-state-table',
