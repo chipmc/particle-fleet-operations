@@ -22,6 +22,8 @@ import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as destinations from 'aws-cdk-lib/aws-lambda-destinations';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as path from 'path';
 
 export class InfraStack extends cdk.Stack {
@@ -622,6 +624,34 @@ export class InfraStack extends cdk.Stack {
         'FleetOfflineIntegration',
         ingestionFunction
       ),
+    });
+
+    // =========================================================================
+    // Ingestion Custom Domain (Phase 4 migration, staged)
+    // =========================================================================
+
+    // Deliberately just the DomainName resource and its output -- no base path mapping,
+    // no REST API, no per-consumer resources yet. This is the first, isolated step of the
+    // per-consumer-credentials migration (see docs/security/webhook-secret-rotation-runbook.md
+    // and the Phase 3/4 review history): it exists solely to produce a real
+    // RegionalDomainName value so the CNAME can be added in Hover and DNS/TLS verified
+    // before anything else in the migration proceeds. Everything downstream (the REST API,
+    // the base path mapping, per-consumer secrets/API keys/usage plans) is a separate,
+    // later, explicitly-authorized step.
+    const ingestionCustomDomainCertificate = acm.Certificate.fromCertificateArn(
+      this,
+      'IngestionCustomDomainCertificate',
+      'arn:aws:acm:us-east-1:564771499971:certificate/8475bfaa-b596-4a4c-9b7d-5762646829c3'
+    );
+    const ingestionCustomDomain = new apigateway.DomainName(this, 'IngestionCustomDomain', {
+      domainName: 'ingest.seeinsights.com',
+      certificate: ingestionCustomDomainCertificate,
+      endpointType: apigateway.EndpointType.REGIONAL,
+      securityPolicy: apigateway.SecurityPolicy.TLS_1_2,
+    });
+    new cdk.CfnOutput(this, 'IngestionCustomDomainRegionalDomainName', {
+      value: ingestionCustomDomain.domainNameAliasDomainName,
+      description: 'CNAME target for ingest.seeinsights.com in Hover (regional API Gateway custom domain, not yet mapped to any API)',
     });
 
     // =========================================================================
