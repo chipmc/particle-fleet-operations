@@ -630,7 +630,7 @@ export class InfraStack extends cdk.Stack {
       ),
     });
 
-    // =========================================================================
+    // =========================================================================<<<<<<< HEAD
     // Ingestion Custom Domain + Per-Consumer Credentials (Phase 4 migration, staged)
     // =========================================================================
 
@@ -638,7 +638,7 @@ export class InfraStack extends cdk.Stack {
     // functional throughout everything below -- no consumer has been told to switch yet,
     // and the legacy route is not removed until a separate, explicit go/no-go approval
     // per docs/security/webhook-secret-rotation-runbook.md. Nothing here changes that route.
-    const ingestionCustomDomainCertificate = acm.Certificate.fromCertificateArn(
+   const ingestionCustomDomainCertificate = acm.Certificate.fromCertificateArn(
       this,
       'IngestionCustomDomainCertificate',
       'arn:aws:acm:us-east-1:564771499971:certificate/8475bfaa-b596-4a4c-9b7d-5762646829c3'
