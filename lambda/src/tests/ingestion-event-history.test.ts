@@ -15,6 +15,7 @@ import { getDeviceCurrentState, updateDeviceCurrentState } from '../storage/curr
 import { writeIngestionEventHistory } from '../storage/event-history';
 import { resolveParticleDeviceName } from '../integrations/particle-api';
 import { refreshDeviceStatusLedger } from '../ledger-refresh';
+import { validateConsumerRequest } from '../consumer-auth';
 import { InboundEvent } from '../types';
 
 jest.mock('../storage/s3');
@@ -23,6 +24,10 @@ jest.mock('../storage/current-state');
 jest.mock('../storage/event-history');
 jest.mock('../integrations/particle-api');
 jest.mock('../ledger-refresh');
+// Auth is incidental to what this file tests (EventHistory writes) -- mocked to a fixed
+// success so these tests don't depend on consumer-auth.ts's real logic or real Secrets
+// Manager calls. See consumer-auth.test.ts / ingestion-consumer-auth.test.ts for that.
+jest.mock('../consumer-auth');
 
 const mockStoreRawEvent = storeRawEvent as jest.MockedFunction<typeof storeRawEvent>;
 const mockIndexEvent = indexEvent as jest.MockedFunction<typeof indexEvent>;
@@ -31,6 +36,7 @@ const mockUpdateCurrentState = updateDeviceCurrentState as jest.MockedFunction<t
 const mockWriteIngestionEventHistory = writeIngestionEventHistory as jest.MockedFunction<typeof writeIngestionEventHistory>;
 const mockResolveDeviceName = resolveParticleDeviceName as jest.MockedFunction<typeof resolveParticleDeviceName>;
 const mockRefreshLedger = refreshDeviceStatusLedger as jest.MockedFunction<typeof refreshDeviceStatusLedger>;
+const mockValidateConsumerRequest = validateConsumerRequest as jest.MockedFunction<typeof validateConsumerRequest>;
 
 const DEVICE_ID = 'device123';
 const EVENT_TIME = '2026-07-28T10:00:00.000Z';
@@ -44,11 +50,12 @@ const minimalBody = JSON.stringify({
   published_at: EVENT_TIME,
 });
 
-/** Inbound event with auth header */
+/** Inbound event with auth header and apiKeyId, matching real REST API traffic shape */
 function makeEvent(body: string = minimalBody): InboundEvent {
   return {
     body,
     headers: { 'x-particle-webhook-secret': SECRET },
+    apiKeyId: 'test-api-key-id',
   };
 }
 
@@ -72,6 +79,7 @@ describe('handleIngestion — EventHistory Phase 4', () => {
     mockResolveDeviceName.mockResolvedValue(null);
     mockRefreshLedger.mockResolvedValue('disabled');
     mockWriteIngestionEventHistory.mockResolvedValue();
+    mockValidateConsumerRequest.mockResolvedValue({ outcome: 'success', consumerId: 'test-consumer' });
   });
 
   afterEach(() => {

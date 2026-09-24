@@ -6,11 +6,11 @@ import { getDeviceCurrentState, updateDeviceCurrentState } from '../storage/curr
 import { resolveParticleDeviceName } from '../integrations/particle-api';
 import { InboundEvent } from '../types';
 
-// This file covers only the auth *dispatch* added to handleIngestion (does apiKeyId
-// route to consumer-auth.ts, or fall through to the legacy shared-secret check) --
-// consumer-auth.ts's own validation logic (constant-time comparison, caching, the
-// duplicate-secret and pair-mismatch cases) is unit-tested directly in
-// consumer-auth.test.ts, not re-verified here.
+// This file covers only how handleIngestion calls consumer-auth.ts and maps its outcomes
+// to HTTP responses -- consumer-auth.ts's own validation logic (constant-time comparison,
+// caching, the duplicate-secret and pair-mismatch cases) is unit-tested directly in
+// consumer-auth.test.ts, not re-verified here. The legacy shared-secret HTTP API route
+// this used to also dispatch to is retired; see docs/security/webhook-secret-rotation-runbook.md.
 jest.mock('../consumer-auth');
 jest.mock('../storage/s3');
 jest.mock('../storage/dynamo');
@@ -35,12 +35,12 @@ function restApiEvent(overrides: Partial<InboundEvent> = {}): InboundEvent {
   };
 }
 
-describe('handleIngestion auth dispatch (legacy vs. per-consumer)', () => {
+describe('handleIngestion auth dispatch to consumer-auth.ts', () => {
   const originalEnv = process.env;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    process.env = { ...originalEnv, QUERY_API_SHARED_SECRET: 'legacy-shared-secret' };
+    process.env = { ...originalEnv };
     mockBuildApiKeyConsumerLookup.mockReturnValue(() => undefined);
     mockStoreRawEvent.mockResolvedValue();
     mockIndexEvent.mockResolvedValue();
@@ -53,7 +53,7 @@ describe('handleIngestion auth dispatch (legacy vs. per-consumer)', () => {
     process.env = originalEnv;
   });
 
-  test('an event with apiKeyId uses consumer-auth.ts, not the legacy shared secret', async () => {
+  test('handleIngestion calls validateConsumerRequest with the provided secret, apiKeyId, and a lookup function', async () => {
     mockValidateConsumerRequest.mockResolvedValue({ outcome: 'success', consumerId: 'particle-cloud-webhook' });
 
     const response = await handleIngestion(restApiEvent());
@@ -87,25 +87,5 @@ describe('handleIngestion auth dispatch (legacy vs. per-consumer)', () => {
     const response = await handleIngestion(restApiEvent());
 
     expect(response.statusCode).toBe(503);
-  });
-
-  test('an event with no apiKeyId (the legacy HTTP API route) never calls consumer-auth.ts at all', async () => {
-    const response = await handleIngestion({
-      body: JSON.stringify({ event: 'status', coreid: 'device123', published_at: '2026-09-21T00:00:00.000Z' }),
-      headers: { 'x-particle-webhook-secret': 'legacy-shared-secret' },
-    });
-
-    expect(mockValidateConsumerRequest).not.toHaveBeenCalled();
-    expect(response.statusCode).toBe(200);
-  });
-
-  test('the legacy path still rejects a wrong shared secret with 401, unaffected by consumer-auth.ts existing', async () => {
-    const response = await handleIngestion({
-      body: JSON.stringify({ event: 'status', coreid: 'device123', published_at: '2026-09-21T00:00:00.000Z' }),
-      headers: { 'x-particle-webhook-secret': 'wrong-secret' },
-    });
-
-    expect(mockValidateConsumerRequest).not.toHaveBeenCalled();
-    expect(response.statusCode).toBe(401);
   });
 });

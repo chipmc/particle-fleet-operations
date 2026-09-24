@@ -555,16 +555,6 @@ export class InfraStack extends cdk.Stack {
       }),
     };
 
-    // Phase 1 + 2A: Ingestion endpoint (POST /particle/log)
-    httpApi.addRoutes({
-      path: '/particle/log',
-      methods: [apigwv2.HttpMethod.POST],
-      integration: new integrations.HttpLambdaIntegration(
-        'ParticleLogIngestionIntegration',
-        ingestionFunction
-      ),
-    });
-
     // Phase 2B: Query API endpoints (GET /device/{deviceId}/...)
     // All query endpoints share the same Lambda handler with internal routing
 

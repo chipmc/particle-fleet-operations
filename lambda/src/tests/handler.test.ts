@@ -12,17 +12,26 @@ import { handler } from '../handler';
 import { storeRawEvent } from '../storage/s3';
 import { indexEvent } from '../storage/dynamo';
 import { deviceHasEvents, queryDeviceEvents } from '../storage/dynamo-read';
+import { validateConsumerRequest, buildApiKeyConsumerLookup } from '../consumer-auth';
 import { InboundEvent, QueryEvent } from '../types';
 
 // Mock AWS SDK clients
 jest.mock('../storage/s3');
 jest.mock('../storage/dynamo');
 jest.mock('../storage/dynamo-read');
+// Every request now authenticates through consumer-auth.ts (the legacy shared-secret
+// route is retired) -- mocked here so this file can test handler-level routing/response
+// behavior without making real Secrets Manager calls. consumer-auth.ts's own logic is
+// unit-tested in consumer-auth.test.ts; the dispatch from handleIngestion into it is
+// tested in ingestion-consumer-auth.test.ts.
+jest.mock('../consumer-auth');
 
 const mockStoreRawEvent = storeRawEvent as jest.MockedFunction<typeof storeRawEvent>;
 const mockIndexEvent = indexEvent as jest.MockedFunction<typeof indexEvent>;
 const mockDeviceHasEvents = deviceHasEvents as jest.MockedFunction<typeof deviceHasEvents>;
 const mockQueryDeviceEvents = queryDeviceEvents as jest.MockedFunction<typeof queryDeviceEvents>;
+const mockValidateConsumerRequest = validateConsumerRequest as jest.MockedFunction<typeof validateConsumerRequest>;
+const mockBuildApiKeyConsumerLookup = buildApiKeyConsumerLookup as jest.MockedFunction<typeof buildApiKeyConsumerLookup>;
 
 describe('Lambda Handler', () => {
   const originalEnv = process.env;
@@ -35,6 +44,8 @@ describe('Lambda Handler', () => {
       RAW_LOGS_BUCKET_NAME: 'test-bucket',
       LOG_EVENTS_TABLE_NAME: 'test-table',
     };
+    mockValidateConsumerRequest.mockResolvedValue({ outcome: 'success', consumerId: 'test-consumer' });
+    mockBuildApiKeyConsumerLookup.mockReturnValue(() => 'test-consumer');
   });
 
   afterEach(() => {
@@ -43,6 +54,7 @@ describe('Lambda Handler', () => {
 
   describe('Authentication', () => {
     it('should return 401 when webhook secret is missing', async () => {
+      mockValidateConsumerRequest.mockResolvedValueOnce({ outcome: 'failure', reason: 'missing_secret' });
       const event: InboundEvent = {
         body: '{}',
         headers: {},
@@ -60,6 +72,7 @@ describe('Lambda Handler', () => {
     });
 
     it('should return 401 when webhook secret is invalid', async () => {
+      mockValidateConsumerRequest.mockResolvedValueOnce({ outcome: 'failure', reason: 'invalid_secret' });
       const event: InboundEvent = {
         body: '{}',
         headers: {
@@ -398,6 +411,7 @@ describe('Lambda Handler', () => {
       });
 
       it('should require webhook secret on POST', async () => {
+        mockValidateConsumerRequest.mockResolvedValueOnce({ outcome: 'failure', reason: 'missing_secret' });
         const event = createHttpApiV2Event(
           'POST',
           '/particle/log',
@@ -578,11 +592,11 @@ describe('Lambda Handler', () => {
     });
 
     describe('REST API v1 event adaptation (ingestion custom domain)', () => {
-      // consumer-auth.ts is intentionally not mocked here -- these events carry no
-      // apiKeyId, so handleIngestion's dispatch (tested in ingestion-consumer-auth.test.ts)
-      // routes them to the legacy shared-secret check, letting this file verify purely
-      // that the REST v1 -> InboundEvent field extraction itself is correct (method,
-      // path, headers, body), independent of which auth path a real request would take.
+      // consumer-auth.ts is mocked (module-level, above) to isolate what this file is
+      // actually responsible for verifying: that the REST v1 -> InboundEvent field
+      // extraction itself is correct (method, path, headers, body, apiKeyId). Its own
+      // validation logic is unit-tested in consumer-auth.test.ts; the dispatch from
+      // handleIngestion into it is tested in ingestion-consumer-auth.test.ts.
       function restApiV1Event(overrides: Record<string, unknown> = {}) {
         return {
           httpMethod: 'POST',
@@ -591,21 +605,19 @@ describe('Lambda Handler', () => {
           body: JSON.stringify({ event: 'status', coreid: 'device123', published_at: '2026-09-21T00:00:00.000Z' }),
           requestContext: {
             apiId: 'restapi123',
-            identity: { sourceIp: '203.0.113.9', userAgent: 'rest-agent' },
+            identity: { apiKeyId: 'test-api-key-id', sourceIp: '203.0.113.9', userAgent: 'rest-agent' },
           },
           ...overrides,
         };
       }
 
-      it('extracts method/path/headers/body correctly and authenticates via the legacy check when no apiKeyId is present', async () => {
+      it('extracts method/path/headers/body/apiKeyId correctly and reaches ingestion', async () => {
         const response = await handler(restApiV1Event());
         expect(response.statusCode).toBe(200);
         expect(mockStoreRawEvent).toHaveBeenCalled();
-      });
-
-      it('a wrong secret on a REST v1 event without an apiKeyId is rejected the same as the legacy path', async () => {
-        const response = await handler(restApiV1Event({ headers: { 'x-particle-webhook-secret': 'wrong' } }));
-        expect(response.statusCode).toBe(401);
+        expect(mockValidateConsumerRequest).toHaveBeenCalledWith(
+          'test-secret-123', 'test-api-key-id', expect.any(Function)
+        );
       });
 
       it('a non-POST REST v1 event is rejected as an unsupported method, same as any other event shape', async () => {

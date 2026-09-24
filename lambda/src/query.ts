@@ -42,8 +42,8 @@ export async function handleQuery(event: QueryEvent): Promise<LambdaResponse> {
   // ============================================================================
   // 
   // Renamed from PARTICLE_WEBHOOK_SECRET as part of the per-consumer-credentials
-  // migration: this is now this value's actual, sole purpose once the legacy ingestion
-  // path is retired -- see docs/security/webhook-secret-rotation-runbook.md. Same
+  // migration: this is now this value's sole purpose, the legacy ingestion path having
+  // been retired -- see docs/security/webhook-secret-rotation-runbook.md. Same
   // underlying value, not rotated by this rename.
   //
   // TODO: Implement separate read-only authentication:
