@@ -70,6 +70,13 @@ Secrets Manager layout, and every consumer's config) and should go through a Pha
 architecture review before implementation — not be treated as a quick patch. Tracked as a
 separate work order; not yet dispatched as of this document's creation.
 
+**Status as of 2026-09-23:** implemented. All six Particle Cloud webhooks and the Pi
+serial-log forwarder are migrated to `ingest.seeinsights.com` with per-consumer credentials;
+the legacy shared-secret HTTP API route is still deployed but retired from active use,
+pending a 24-hour clean-traffic observation window before removal. If it's ever removed and
+needs to come back, see "Legacy HTTP API Route Restoration" in `docs/operations.md`'s
+Rollback Procedures section.
+
 ## Incident history
 
 - **2026-09-18:** `PARTICLE_WEBHOOK_SECRET` and `PARTICLE_ACCESS_TOKEN` were exposed via a
