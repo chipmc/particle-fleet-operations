@@ -8,6 +8,7 @@
  */
 
 import { InboundEvent, LambdaResponse, ParticleWebhook } from './types';
+import { validateConsumerRequest, buildApiKeyConsumerLookup } from './consumer-auth';
 import { storeRawEvent } from './storage/s3';
 import { indexEvent } from './storage/dynamo';
 import { getDeviceCurrentState, updateDeviceCurrentState } from './storage/current-state';
@@ -43,16 +44,26 @@ export async function handleIngestion(event: InboundEvent): Promise<LambdaRespon
   // Authentication (Exact Current Behavior)
   // ============================================================================
   
-  const expectedSecret = process.env.PARTICLE_WEBHOOK_SECRET;
   const providedSecret =
     event.headers?.['x-particle-webhook-secret'] ||
     event.headers?.['X-Particle-Webhook-Secret'];
+  const sourceIp = event.requestContext?.http?.sourceIp;
 
-  if (!expectedSecret || providedSecret !== expectedSecret) {
-    console.warn('Unauthorized webhook attempt');
+  // Every request reaches this Lambda via the ingestion REST API custom domain
+  // (ingest.seeinsights.com) now that the legacy shared-secret HTTP API route is retired
+  // (see docs/security/webhook-secret-rotation-runbook.md) -- API Gateway has already
+  // validated the API key itself before invoking this Lambda at all, so event.apiKeyId is
+  // always present here. Per-consumer validation: see consumer-auth.ts.
+  const result = await validateConsumerRequest(providedSecret, event.apiKeyId, buildApiKeyConsumerLookup(process.env));
+  if (result.outcome === 'success') {
+    console.info(JSON.stringify({ event: 'ingestion_auth', authResult: 'success', consumerId: result.consumerId, apiKeyId: event.apiKeyId, sourceIp, route: 'POST /particle/log' }));
+  } else {
+    // Never logs the provided secret value, headers, or hashes -- reason is one of a
+    // fixed set of enumerated strings, sufficient to debug without exposing anything.
+    console.warn(JSON.stringify({ event: 'ingestion_auth', authResult: 'failure', reason: result.reason, apiKeyId: event.apiKeyId, apiKeyConsumerId: result.apiKeyConsumerId, sourceIp, route: 'POST /particle/log' }));
     return {
-      statusCode: 401,
-      body: JSON.stringify({ ok: false, error: 'unauthorized' }),
+      statusCode: result.reason === 'credential_config_unavailable' ? 503 : 401,
+      body: JSON.stringify({ ok: false, error: result.reason === 'credential_config_unavailable' ? 'unavailable' : 'unauthorized' }),
     };
   }
 

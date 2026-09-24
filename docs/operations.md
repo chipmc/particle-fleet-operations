@@ -382,6 +382,127 @@ AWS_PROFILE=particle-admin aws lambda update-alias \
   --function-version PREVIOUS_VERSION
 ```
 
+### Legacy HTTP API Route Restoration
+
+This is specific to retiring `POST /particle/log` on the legacy HTTP API
+(`ParticleLogIngestionApi` / `httpApi` in `infra/lib/infra-stack.ts`) as the final step of
+the per-consumer credentials migration (see
+`docs/security/webhook-secret-rotation-runbook.md`, "Planned: per-consumer credentials").
+The generic options above (stack rollback, redeploy a previous Lambda version) don't apply
+here — retiring the route is a deliberate code change, not a failed deployment, so bringing
+it back means reverting that specific change, not "undoing a bad deploy."
+
+**Important: this restores only the `POST /particle/log` route, not the whole HTTP API.**
+`httpApi` also serves the six `GET /device/{deviceId}/...` query endpoints
+(`infra/lib/infra-stack.ts:568` onward) — those are untouched by retirement and must stay
+untouched by any rollback. Do not delete or recreate `httpApi` itself.
+
+#### Trigger conditions
+
+Restore the legacy route if, after retirement:
+- **A consumer is discovered still depending on it** — e.g., a device, script, or webhook
+  not in the known six-webhook-plus-Pi-forwarder list from this migration, missed during
+  the pre-retirement observation window, whose traffic only becomes visible once it starts
+  failing (404/no route) instead of silently succeeding.
+- **An unexplained failure spike appears on the REST API** (`ingest.seeinsights.com`) after
+  retirement that doesn't match any known cause — e.g., a client that can't support the
+  dual-header (API key + webhook secret) model the REST API requires, where the legacy
+  route's single-header model was accidentally load-bearing for a reason not caught during
+  migration.
+- **An urgent, unrelated need to reduce the REST API's blast radius** — e.g., a systemic
+  API Gateway or REST-path-specific problem where having *any* working ingestion path
+  matters more than which one.
+
+A quiet retirement with no traffic anomalies afterward is not a trigger — don't restore it
+preemptively "just in case."
+
+#### Restoring it: exact steps
+
+1. **Identify the retirement commit(s).** As of this writing, retirement has not yet
+   happened, so there's no fixed commit hash to name here. When retirement happens, its
+   commit message must say explicitly that it retires the legacy route (e.g., starting
+   with `Retire legacy HTTP API POST /particle/log route`) specifically so this step stays
+   mechanical:
+   ```bash
+   git log --oneline --grep='[Rr]etire legacy.*particle/log'
+   ```
+   If that turns up nothing, retirement wasn't done in one clearly-labeled commit — check
+   `git log --oneline -- infra/lib/infra-stack.ts lambda/src/ingestion.ts` around the date
+   this went to production and identify it by content instead (removal of the
+   `httpApi.addRoutes({ path: '/particle/log', methods: [POST] })` block currently at
+   `infra/lib/infra-stack.ts:558-566`, and of the legacy `else` branch currently at
+   `lambda/src/ingestion.ts:69-85`).
+
+2. **Check whether a plain revert is clean.** Before reverting, check whether anything else
+   has touched the same two files since retirement:
+   ```bash
+   git log --oneline <retirement-commit>..HEAD -- infra/lib/infra-stack.ts lambda/src/ingestion.ts
+   ```
+   - **Empty output:** a plain `git revert <retirement-commit>` (or `git revert
+     <commit1> <commit2>` if it was split across commits, oldest first) should apply
+     cleanly.
+   - **Non-empty output:** something else has changed these files since. Do not blindly
+     revert — read what changed, then manually reintroduce the route
+     (`infra/lib/infra-stack.ts:558-566`'s shape) and the legacy auth branch
+     (`lambda/src/ingestion.ts:69-85`'s shape) into the *current* versions of these files
+     by hand, so the restoration doesn't clobber unrelated work done after retirement.
+
+3. **Build, test, diff, deploy** — same discipline as any other production infra change in
+   this repo, not a shortcut because it's "just a revert":
+   ```bash
+   cd lambda && npm run build && npm test
+   cd ../infra && npm run build && npm test
+   npx cdk diff   # review in full before deploying -- confirm ONLY the /particle/log
+                   # POST route and the legacy auth branch are being added back, nothing else
+   npx cdk deploy
+   ```
+
+4. **Watch for the dynamic-reference gotcha encountered during migration**, even though
+   this specific direction is a different case. During migration, CloudFormation failed to
+   resolve a *newly-added* Secrets Manager JSON-key reference on a Lambda update
+   (`Could not find a value associated with JSONKey in SecretString`) because the *old* key
+   had been deleted from the secret while a prior deployed reference to it still existed.
+   Restoring the route re-adds `ingestionFunction`'s reference to `QUERY_API_SHARED_SECRET`
+   (an env var it stops reading once retired) — the key itself is never deleted from the
+   secret (`query.ts` keeps needing it independently), so this exact failure mode likely
+   doesn't reproduce. It hasn't been tested in this direction, though, so budget time for
+   the possibility during the restore deploy. If it recurs, the same class of workaround
+   applies: temporarily ensure whatever key the Lambda is being pointed at has been stable
+   in the secret across the update (see the `PARTICLE_WEBHOOK_SECRET`-placeholder workaround
+   used during the original migration for the exact mechanics).
+
+#### What credential state it comes back in
+
+**Same shared-secret auth as before — no code changes to the auth logic itself are
+needed.** `QUERY_API_SHARED_SECRET` (the renamed `PARTICLE_WEBHOOK_SECRET`) stays live in
+Secrets Manager for `query.ts`'s own use regardless of whether the legacy ingestion route
+exists, so restoring `ingestion.ts`'s legacy `else` branch means it starts reading a secret
+that's already there and already current — not a stale or rotated-away value. No secret
+rotation or manual credential sync is required as part of restoring the route itself.
+
+One thing this does **not** restore automatically: per-consumer visibility. The legacy
+path has no concept of "which consumer" — it's a single shared-secret equality check, the
+exact property this whole migration replaced. Restoring it reintroduces that blind spot for
+whatever traffic uses it.
+
+#### Who to notify and what to check afterward
+
+- **If restored as a pure safety net** (trigger was an abundance of caution, nothing
+  actually failed) — no consumer notification needed. Nothing should be pointed at the
+  legacy URL; it exists only as a fallback. Confirm this stays true: check REST API and
+  legacy HTTP API access logs after redeployment to verify traffic patterns are unchanged
+  (still all on the REST API, nothing new on the legacy route).
+- **If restored because a specific consumer was found still depending on it** — identify
+  that consumer from the access logs that revealed it (source IP, `userAgent`, or which
+  device/webhook stopped working), then:
+  1. Notify whoever owns that integration (Particle Console webhook owner, or the Pi
+     forwarder's operator — currently both are Chip) that a consumer was missed.
+  2. Decide whether to leave it on the legacy route for now (since it's back) or do a
+     proper migration for it (registry entry in `config/ingestion-consumers.json`, new
+     Secrets Manager secret, new API key, same steps as every other consumer's migration).
+  3. Re-run the full go/no-go checklist from `docs/security/webhook-secret-rotation-runbook.md`
+     before attempting retirement again.
+
 ---
 
 ## Monitoring

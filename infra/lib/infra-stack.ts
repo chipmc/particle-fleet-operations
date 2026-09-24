@@ -24,6 +24,7 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
+import { loadIngestionConsumerRegistry, DEFAULT_INGESTION_CONSUMER_REGISTRY_PATH } from './ingestion-consumers';
 import * as path from 'path';
 
 export class InfraStack extends cdk.Stack {
@@ -129,10 +130,23 @@ export class InfraStack extends cdk.Stack {
     const ledgerRefreshMinIntervalSeconds = ssm.StringParameter.valueForStringParameter(
       this, `${particleIngestionSsmPrefix}/ledger-refresh-min-interval-seconds`);
 
-    const particleCredentials = secretsmanager.Secret.fromSecretNameV2(
-      this, 'ParticleCredentialsSecret', 'particle-fleet-operations/ingestion/particle-credentials');
+    // Full ARN (with its actual random suffix), not fromSecretNameV2's partial-ARN form:
+    // empirically, a partial ARN failed to resolve a *newly added* JSON key
+    // (QUERY_API_SHARED_SECRET, below) via CloudFormation's dynamic-reference mechanism
+    // on this stack specifically (two reproducible UPDATE_FAILED "Could not find a value
+    // associated with JSONKey in SecretString" attempts), even though the exact same
+    // dynamic reference resolved cleanly in an isolated throwaway stack. The full ARN is
+    // also AWS's own documented more-reliable form for dynamic references specifically.
+    const particleCredentials = secretsmanager.Secret.fromSecretCompleteArn(
+      this, 'ParticleCredentialsSecret',
+      'arn:aws:secretsmanager:us-east-1:564771499971:secret:particle-fleet-operations/ingestion/particle-credentials-irvA8y');
     const particleAccessToken = particleCredentials.secretValueFromJson('PARTICLE_ACCESS_TOKEN').unsafeUnwrap();
-    const particleWebhookSecret = particleCredentials.secretValueFromJson('PARTICLE_WEBHOOK_SECRET').unsafeUnwrap();
+    // Renamed from PARTICLE_WEBHOOK_SECRET (same underlying Secrets Manager value, not
+    // rotated) as part of the per-consumer-credentials migration: this now gates the
+    // legacy ingestion path (ingestion.ts) *and* the query API (query.ts) until every
+    // consumer has moved to its own credential and the legacy route is retired, at which
+    // point this becomes solely the query API's shared secret, matching its name.
+    const queryApiSharedSecret = particleCredentials.secretValueFromJson('QUERY_API_SHARED_SECRET').unsafeUnwrap();
 
     // =========================================================================
     // Lambda Function (handles both ingestion and query)
@@ -161,7 +175,7 @@ export class InfraStack extends cdk.Stack {
         EVENT_HISTORY_TABLE_NAME: eventHistoryTable.tableName,
         PARTICLE_ACCESS_TOKEN: particleAccessToken,
         PARTICLE_API_BASE_URL: particleApiBaseUrl,
-        PARTICLE_WEBHOOK_SECRET: particleWebhookSecret,
+        QUERY_API_SHARED_SECRET: queryApiSharedSecret,
         PARTICLE_LEDGER_REFRESH_ENABLED: ledgerRefreshEnabled,
         PARTICLE_LEDGER_REFRESH_DEVICE_IDS: ledgerRefreshDeviceIds,
         PARTICLE_LEDGER_REFRESH_PRODUCT_IDS: ledgerRefreshProductIds,
@@ -541,16 +555,6 @@ export class InfraStack extends cdk.Stack {
       }),
     };
 
-    // Phase 1 + 2A: Ingestion endpoint (POST /particle/log)
-    httpApi.addRoutes({
-      path: '/particle/log',
-      methods: [apigwv2.HttpMethod.POST],
-      integration: new integrations.HttpLambdaIntegration(
-        'ParticleLogIngestionIntegration',
-        ingestionFunction
-      ),
-    });
-
     // Phase 2B: Query API endpoints (GET /device/{deviceId}/...)
     // All query endpoints share the same Lambda handler with internal routing
 
@@ -626,19 +630,15 @@ export class InfraStack extends cdk.Stack {
       ),
     });
 
-    // =========================================================================
-    // Ingestion Custom Domain (Phase 4 migration, staged)
+    // =========================================================================<<<<<<< HEAD
+    // Ingestion Custom Domain + Per-Consumer Credentials (Phase 4 migration, staged)
     // =========================================================================
 
-    // Deliberately just the DomainName resource and its output -- no base path mapping,
-    // no REST API, no per-consumer resources yet. This is the first, isolated step of the
-    // per-consumer-credentials migration (see docs/security/webhook-secret-rotation-runbook.md
-    // and the Phase 3/4 review history): it exists solely to produce a real
-    // RegionalDomainName value so the CNAME can be added in Hover and DNS/TLS verified
-    // before anything else in the migration proceeds. Everything downstream (the REST API,
-    // the base path mapping, per-consumer secrets/API keys/usage plans) is a separate,
-    // later, explicitly-authorized step.
-    const ingestionCustomDomainCertificate = acm.Certificate.fromCertificateArn(
+    // The legacy HTTP API route (POST /particle/log on httpApi, above) stays fully
+    // functional throughout everything below -- no consumer has been told to switch yet,
+    // and the legacy route is not removed until a separate, explicit go/no-go approval
+    // per docs/security/webhook-secret-rotation-runbook.md. Nothing here changes that route.
+   const ingestionCustomDomainCertificate = acm.Certificate.fromCertificateArn(
       this,
       'IngestionCustomDomainCertificate',
       'arn:aws:acm:us-east-1:564771499971:certificate/8475bfaa-b596-4a4c-9b7d-5762646829c3'
@@ -651,8 +651,108 @@ export class InfraStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, 'IngestionCustomDomainRegionalDomainName', {
       value: ingestionCustomDomain.domainNameAliasDomainName,
-      description: 'CNAME target for ingest.seeinsights.com in Hover (regional API Gateway custom domain, not yet mapped to any API)',
+      description: 'CNAME target for ingest.seeinsights.com in Hover (regional API Gateway custom domain)',
     });
+
+    // REST API is required specifically because usage plans + API keys are a REST API
+    // (v1) feature -- confirmed directly against the installed aws-apigatewayv2 library:
+    // HttpApi/HttpStage/HttpRoute under its http/ module have no UsagePlan/ApiKey
+    // constructs at all (those exist only under apigatewayv2's websocket/ module, or in
+    // this older aws-apigateway REST module). One shared POST /particle/log method, not
+    // per-consumer routes -- per-consumer separation comes from credentials, not routing.
+    // Account-level prerequisite for REST API (v1) access logging specifically -- unlike
+    // the HTTP API (v2, see PR #36), a REST API stage can't push access logs to
+    // CloudWatch until the account has a CloudWatchRoleArn configured at all (one setting
+    // per account/region, not per-API). This is the first REST API ever created in this
+    // account, so it's never been set; verified via `aws apigateway get-account` showing
+    // cloudwatchRoleArn unset before this was added.
+    const apiGatewayCloudWatchRole = new iam.Role(this, 'ApiGatewayCloudWatchRole', {
+      assumedBy: new iam.ServicePrincipal('apigateway.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonAPIGatewayPushToCloudWatchLogs'),
+      ],
+    });
+    const apiGatewayAccount = new apigateway.CfnAccount(this, 'ApiGatewayAccount', {
+      cloudWatchRoleArn: apiGatewayCloudWatchRole.roleArn,
+    });
+
+    const ingestionRestApiAccessLogGroup = new logs.LogGroup(this, 'IngestionRestApiAccessLogs', {
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+    const ingestionRestApi = new apigateway.RestApi(this, 'IngestionRestApi', {
+      restApiName: 'particle-ingestion-api',
+      endpointConfiguration: { types: [apigateway.EndpointType.REGIONAL] },
+      deployOptions: {
+        stageName: 'prod',
+        accessLogDestination: new apigateway.LogGroupLogDestination(ingestionRestApiAccessLogGroup),
+        accessLogFormat: apigateway.AccessLogFormat.custom(JSON.stringify({
+          requestId: apigateway.AccessLogField.contextRequestId(),
+          sourceIp: apigateway.AccessLogField.contextIdentitySourceIp(),
+          httpMethod: apigateway.AccessLogField.contextHttpMethod(),
+          resourcePath: apigateway.AccessLogField.contextResourcePath(),
+          status: apigateway.AccessLogField.contextStatus(),
+          apiKeyId: apigateway.AccessLogField.contextIdentityApiKeyId(),
+          integrationError: apigateway.AccessLogField.contextIntegrationErrorMessage(),
+        })),
+      },
+    });
+    // The account's CloudWatchRoleArn (above) has no direct property link to the stage --
+    // it's an account-wide setting, not a Stage/RestApi property -- so CloudFormation
+    // can't infer the ordering on its own. Without this explicit dependency, the stage can
+    // be created before the account setting exists and fails with "CloudWatch Logs role
+    // ARN must be set in account settings to enable logging".
+    ingestionRestApi.deploymentStage.node.addDependency(apiGatewayAccount);
+    ingestionCustomDomain.addBasePathMapping(ingestionRestApi);
+
+    const ingestionRestApiIntegration = new apigateway.LambdaIntegration(ingestionFunction);
+    ingestionRestApi.root
+      .addResource('particle')
+      .addResource('log')
+      .addMethod('POST', ingestionRestApiIntegration, { apiKeyRequired: true });
+
+    // Registry-driven per-consumer resources: config/ingestion-consumers.json is the
+    // single source of truth (see docs/security/webhook-secret-rotation-runbook.md).
+    // Adding a consumer is a registry entry + a pre-created Secrets Manager secret, not a
+    // CDK code change. Schema validation (duplicate ids/secretNames, invalid throttle
+    // values) runs here, at synth time, so a bad registry fails `cdk synth` outright.
+    const ingestionConsumers = loadIngestionConsumerRegistry(DEFAULT_INGESTION_CONSUMER_REGISTRY_PATH);
+    for (const consumer of ingestionConsumers) {
+      const consumerPascalId = consumer.id.replace(/(^|-)([a-z0-9])/g, (_match, _sep, char) => char.toUpperCase());
+
+      // Deliberately not a wildcard: this Lambda role's own secretsmanager:GetSecretValue
+      // access is scoped to exactly this one consumer's secret ARN, never to the whole
+      // .../ingestion/consumers/* prefix. This is a real, deliberate reversal of PR #35's
+      // "zero secretsmanager:* permissions on this role" property -- necessary because a
+      // registry-driven, add-a-consumer-without-redeploying design can't pre-resolve which
+      // secret to check at synth time the way a single static secret could.
+      const consumerSecret = secretsmanager.Secret.fromSecretNameV2(
+        this, `IngestionConsumer${consumerPascalId}Secret`, consumer.secretName);
+      consumerSecret.grantRead(ingestionFunction);
+
+      const consumerApiKey = new apigateway.ApiKey(this, `IngestionConsumer${consumerPascalId}ApiKey`, {
+        apiKeyName: `particle-ingestion-${consumer.id}`,
+        description: `API key for ingestion consumer: ${consumer.displayName} (${consumer.id})`,
+        enabled: consumer.status === 'active',
+      });
+      const consumerUsagePlan = new apigateway.UsagePlan(this, `IngestionConsumer${consumerPascalId}UsagePlan`, {
+        name: `particle-ingestion-${consumer.id}`,
+        throttle: {
+          rateLimit: consumer.usagePlan.ratePerSecond,
+          burstLimit: consumer.usagePlan.burst,
+        },
+        apiStages: [{ api: ingestionRestApi, stage: ingestionRestApi.deploymentStage }],
+      });
+      consumerUsagePlan.addApiKey(consumerApiKey);
+
+      // API key IDs are not sensitive (they identify a key, not its value) -- safe as a
+      // plain environment variable. This is how consumer-auth.ts cross-checks "the secret
+      // matched consumer X" against "the API key belongs to consumer X" without needing
+      // its own separate config file (the ApiKey resource's ID only exists after CDK
+      // creates it, so it can't live in the static registry alongside the rest).
+      const apiKeyEnvVarName = `INGESTION_API_KEY_ID_${consumer.id.toUpperCase().replace(/-/g, '_')}`;
+      ingestionFunction.addEnvironment(apiKeyEnvVarName, consumerApiKey.keyId);
+    }
 
     // =========================================================================
     // CloudFormation Outputs

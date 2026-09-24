@@ -41,17 +41,20 @@ export async function handleQuery(event: QueryEvent): Promise<LambdaResponse> {
   // Authentication
   // ============================================================================
   // 
-  // TEMPORARY: Reusing webhook secret for query endpoints.
-  // 
+  // Renamed from PARTICLE_WEBHOOK_SECRET as part of the per-consumer-credentials
+  // migration: this is now this value's sole purpose, the legacy ingestion path having
+  // been retired -- see docs/security/webhook-secret-rotation-runbook.md. Same
+  // underlying value, not rotated by this rename.
+  //
   // TODO: Implement separate read-only authentication:
   // - API keys for programmatic access
   // - OAuth/JWT for browser dashboard
   // - Separate IAM role with DynamoDB:Query and S3:GetObject only
-  // 
+  //
   // This allows incremental rollout without changing webhook auth.
   // ============================================================================
 
-  const expectedSecret = process.env.PARTICLE_WEBHOOK_SECRET;
+  const expectedSecret = process.env.QUERY_API_SHARED_SECRET;
   const providedSecret =
     event.headers?.['x-particle-webhook-secret'] ||
     event.headers?.['X-Particle-Webhook-Secret'];

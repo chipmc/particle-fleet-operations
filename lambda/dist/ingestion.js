@@ -32,7 +32,13 @@ async function handleIngestion(event) {
     // ============================================================================
     // Authentication (Exact Current Behavior)
     // ============================================================================
-    const expectedSecret = process.env.PARTICLE_WEBHOOK_SECRET;
+    // This is the legacy shared-secret path, kept functional until every consumer has
+    // migrated to a per-consumer credential on the new custom domain and the legacy HTTP
+    // API route is explicitly retired -- see docs/security/webhook-secret-rotation-runbook.md.
+    // QUERY_API_SHARED_SECRET is the same underlying value PARTICLE_WEBHOOK_SECRET used to be
+    // (renamed, not rotated, as part of the per-consumer-credentials migration) -- it still
+    // gates this legacy path today, and will gate only query.ts once this path is removed.
+    const expectedSecret = process.env.QUERY_API_SHARED_SECRET;
     const providedSecret = event.headers?.['x-particle-webhook-secret'] ||
         event.headers?.['X-Particle-Webhook-Secret'];
     if (!expectedSecret || providedSecret !== expectedSecret) {

@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "consumers": [
+    {
+      "id": "particle-cloud-webhook",
+      "displayName": "Particle Cloud webhook",
+      "secretName": "particle-fleet-operations/ingestion/consumers/particle-cloud-webhook/webhook-secret",
+      "usagePlan": {
+        "ratePerSecond": 100,
+        "burst": 500
+      },
+      "status": "active"
+    },
+    {
+      "id": "serial-forwarder",
+      "displayName": "Pi serial log forwarder",
+      "secretName": "particle-fleet-operations/ingestion/consumers/serial-forwarder/webhook-secret",
+      "usagePlan": {
+        "ratePerSecond": 10,
+        "burst": 50
+      },
+      "status": "active"
+    }
+  ]
+}
