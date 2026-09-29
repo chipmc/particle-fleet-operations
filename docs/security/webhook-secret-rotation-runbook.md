@@ -98,3 +98,21 @@ Rollback Procedures section.
   make secret handling foolproof — see "Planned: per-consumer credentials" above for the
   remaining shared-secret blast-radius problem — but this one exposure path specifically
   cannot recur for these two credentials.
+
+- **2026-09-28:** During a read-only investigation of the serial forwarder, an
+  `aws apigateway get-usage-plan-keys` call printed the API key value for the Particle Cloud
+  consumer (key ID `mqdbypomt7`) into one Claude Code session: its local transcript and the
+  model context for that session. It was not written, posted, or sent anywhere else.
+
+  Assessment: low risk. The key alone cannot authenticate, because `consumer-auth.ts` also
+  requires the per-consumer secret (requests without it fail as `missing_secret`,
+  `invalid_secret`, or `credential_pair_mismatch`). The realistic exposure is someone spending
+  that consumer's usage-plan rate limit, not reading or writing data.
+
+  Decision: not rotated now. This departs from the exposure procedure in
+  `secrets-management.md` ("Revoke the exposed credential immediately"). The reason is that
+  rotating an API key means a CDK change, a deploy, and an overlap procedure this runbook does
+  not yet document.
+
+  Revisit: rotate the key at the next planned rotation, or immediately if the per-consumer
+  secret is ever exposed too.
