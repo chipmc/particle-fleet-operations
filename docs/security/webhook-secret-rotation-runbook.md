@@ -71,11 +71,115 @@ architecture review before implementation — not be treated as a quick patch. T
 separate work order; not yet dispatched as of this document's creation.
 
 **Status as of 2026-09-23:** implemented. All six Particle Cloud webhooks and the Pi
-serial-log forwarder are migrated to `ingest.seeinsights.com` with per-consumer credentials;
-the legacy shared-secret HTTP API route is still deployed but retired from active use,
-pending a 24-hour clean-traffic observation window before removal. If it's ever removed and
-needs to come back, see "Legacy HTTP API Route Restoration" in `docs/operations.md`'s
-Rollback Procedures section.
+serial-log forwarder are migrated to `ingest.seeinsights.com` with per-consumer credentials.
+
+**Legacy route removed 2026-09-24 (PR #39):** the legacy shared-secret HTTP API route
+`POST /particle/log` was removed after its 24-hour clean-traffic window. Verified
+2026-09-29: the route is absent from the deployed HTTP API (`dqqrzw16gk`, which keeps its
+seven `GET` query routes), a POST to the old URL returns 404, and its access log
+has no requests after 2026-09-23 02:37 UTC. If it needs to come back, see "Legacy HTTP API
+Route Restoration" in `docs/operations.md`'s Rollback Procedures section.
+
+## API key rotation for one consumer (no outage)
+
+How to replace one registry consumer's API Gateway API key without dropping requests. The
+consumer's webhook secret is not changed by this procedure.
+
+**Status: blocked on a prerequisite that is not implemented.** Do not start step 2 until the
+prerequisite below is deployed.
+
+### Prerequisite: the Lambda must accept two key IDs for one consumer
+
+`consumer-auth.ts` accepts a request only when the API key and the webhook secret belong to
+the same consumer. It maps key IDs to consumers through exactly one environment variable per
+consumer (`INGESTION_API_KEY_ID_<CONSUMER_ID>`, set by `infra-stack.ts`). A second key on
+the same usage plan would pass API Gateway, then fail in the Lambda as
+`credential_pair_mismatch` (401), because its ID maps to no consumer.
+
+A gapless rotation therefore needs a change, not yet designed or approved, that lets:
+
+- the registry or CDK declare a second key for one consumer, associated with the same usage
+  plan; and
+- the Lambda map both key IDs to that consumer for the length of the overlap.
+
+This changes the auth path, so it goes through architecture review before implementation.
+
+Do not rotate by renaming the existing `ApiKey` resource's logical ID. CloudFormation would
+create the new key and delete the old one in the same deploy, and every client still sending
+the old key would fail from that moment.
+
+### Why this is not the AWSCURRENT/AWSPENDING pattern
+
+That pattern is for Secrets Manager secrets, and it does not apply here for two reasons:
+
+- An API key is not stored in Secrets Manager. API Gateway checks the key value, and the
+  Lambda checks the key's ID. The overlap is simply two keys existing at the same time, both
+  accepted.
+- The webhook secret has no overlap mechanism today either. `consumer-auth.ts` reads each
+  consumer's secret by name, which returns only its current version. Nothing reads a pending
+  version. A webhook-secret rotation therefore rejects clients still sending the old value
+  from the moment the new value is live until each client is updated (the Lambda caches
+  secrets for up to 5 minutes, so the switch is not instant).
+
+Overlap matters most for `particle-cloud-webhook`: one key is shared by six Particle Cloud
+webhooks, and each webhook's `x-api-key` header is edited separately in the Particle Console.
+
+### Credential handling
+
+Never print an API key value in an agent session, a shared terminal, or a log:
+
+- `aws apigateway get-usage-plan-keys` returns key values. Run it only with a `--query` that
+  selects `id` and `name`.
+- `aws apigateway get-api-key --include-value` returns the value. Only the operator runs it,
+  piped straight to the clipboard, as in step 3.
+
+Key IDs are not sensitive. Use them for every check below. See the 2026-09-28 incident entry.
+
+### Procedure
+
+1. **Record the current key ID.**
+   ```bash
+   aws apigateway get-api-keys --name-query particle-ingestion-<consumer-id> \
+     --query 'items[].[id,name,enabled]' --output text
+   ```
+2. **Add the second key (deploy 1).** Using the prerequisite mechanism, add a new key for the
+   consumer on the same usage plan and map its ID to the consumer in the Lambda. The
+   `cdk diff` should show only: one new `ApiKey`, one new `UsagePlanKey`, and the Lambda
+   environment change. Deploy. Then confirm both keys are on the plan, without values:
+   ```bash
+   aws apigateway get-usage-plan-keys --usage-plan-id <plan-id> \
+     --query 'items[].[id,name]' --output text
+   ```
+3. **Copy the new key value (operator only).** In your own terminal, not an agent session:
+   ```bash
+   aws apigateway get-api-key --api-key <new-key-id> --include-value \
+     --query value --output text | pbcopy
+   ```
+4. **Update each client, one at a time.** For `particle-cloud-webhook`, edit the `x-api-key`
+   header on each of the six Particle Console webhooks. For `serial-forwarder`, update
+   `AWS_API_KEY` in `/etc/serial-forwarder.env` and restart the service. Both keys are
+   accepted throughout, so there is no gap between edits. After each client, confirm that
+   requests with the new key ID return 200 in the access log (query in step 5, with the new
+   ID). Clear the clipboard when done.
+5. **Confirm the old key is no longer used.** In `IngestionRestApiAccessLogs`, over at least
+   24 hours after the last client was updated (longer if any client publishes less than
+   daily):
+   ```
+   filter apiKeyId = "<old-key-id>" | stats count(*), max(@timestamp)
+   ```
+   Expect no results. Also confirm the new key is working: in the ingestion Lambda's logs,
+   `ingestion_auth` entries for the new key ID should show `authResult: success` and no
+   failures, and each client's events should still be arriving in `ParticleLogEventsTable`.
+   The six webhooks share one key, so this check cannot tell them apart. The zero count for
+   the old key is what shows all six were updated.
+6. **Disable the old key (deploy 2), then delete it (deploy 3).** Disable first
+   (`enabled: false`) and watch for 24 hours: a client still sending it now gets 403, which
+   shows in the access log. Re-enabling is the rollback at this stage. Then remove the old
+   key and its ID mapping, and confirm the `cdk diff` removes only those.
+7. **Update this document.** Add an incident-history entry if the rotation followed an
+   exposure, and note the new key ID wherever the old one is referenced.
+
+**Rollback before step 6:** point clients back to the old key. It stays valid until step 6.
 
 ## Incident history
 

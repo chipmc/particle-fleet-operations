@@ -291,6 +291,23 @@ Still to be drafted: a general C++ house style, which should adapt Google's
   (`.rtc_skew_test_bin`, `.ctt`, `.final_check`, `.t`, `.crwt`), all attributable to local
   dev tooling, all benign, but all needlessly alarm-shaped.
 
+## 8. Credential values in command output
+
+- **Never run a command that prints a credential value in an agent session, a shared
+  terminal, or anything that is logged.** Read-only is not the same as safe: on 2026-09-28 a
+  read-only investigation ran `aws apigateway get-usage-plan-keys` to check usage-plan
+  associations, and it printed the Particle Cloud consumer's API key value into the session
+  transcript (incident entry in `docs/security/webhook-secret-rotation-runbook.md`).
+- Known offenders: `aws apigateway get-usage-plan-keys` returns key values unless filtered,
+  and `aws apigateway get-api-key --include-value` returns the value by design. Always pass a
+  `--query` that selects only non-sensitive fields (`id`, `name`, `enabled`). Only the
+  operator retrieves a value, in their own terminal, piped straight to its destination.
+- Identify credentials by ID, never by value, prefix, or hash, in checks, logs, reports, and
+  documentation. API key IDs and Secrets Manager secret names are not sensitive.
+- Before running an unfamiliar AWS read command against a credential-bearing resource, check
+  whether its default output includes the value. If you can't tell, add a `--query` that
+  excludes it.
+
 ## Maintenance
 
 This document should be updated whenever a review round, an investigation, or a postmortem
