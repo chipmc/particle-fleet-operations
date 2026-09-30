@@ -297,7 +297,8 @@ Still to be drafted: a general C++ house style, which should adapt Google's
   terminal, or anything that is logged.** Read-only is not the same as safe: on 2026-09-28 a
   read-only investigation ran `aws apigateway get-usage-plan-keys` to check usage-plan
   associations, and it printed the Particle Cloud consumer's API key value into the session
-  transcript (incident entry in `docs/security/webhook-secret-rotation-runbook.md`).
+  transcript (2026-09-28 entry under "Incident history" in
+  `docs/security/webhook-secret-rotation-runbook.md`).
 - Known offenders: `aws apigateway get-usage-plan-keys` returns key values unless filtered,
   and `aws apigateway get-api-key --include-value` returns the value by design. Always pass a
   `--query` that selects only non-sensitive fields (`id`, `name`, `enabled`). Only the

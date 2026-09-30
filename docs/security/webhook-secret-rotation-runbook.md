@@ -133,7 +133,8 @@ Never print an API key value in an agent session, a shared terminal, or a log:
 - `aws apigateway get-api-key --include-value` returns the value. Only the operator runs it,
   piped straight to the clipboard, as in step 3.
 
-Key IDs are not sensitive. Use them for every check below. See the 2026-09-28 incident entry.
+Key IDs are not sensitive. Use them for every check below. See the 2026-09-28 entry under
+"Incident history" at the end of this document.
 
 ### Procedure
 
