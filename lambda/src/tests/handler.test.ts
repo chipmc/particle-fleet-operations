@@ -45,7 +45,7 @@ describe('Lambda Handler', () => {
       LOG_EVENTS_TABLE_NAME: 'test-table',
     };
     mockValidateConsumerRequest.mockResolvedValue({ outcome: 'success', consumerId: 'test-consumer' });
-    mockBuildApiKeyConsumerLookup.mockReturnValue(() => 'test-consumer');
+    mockBuildApiKeyConsumerLookup.mockReturnValue(() => ({ kind: 'consumer', consumerId: 'test-consumer' }));
   });
 
   afterEach(() => {

@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "consumers": [
     {
       "id": "particle-cloud-webhook",
@@ -9,7 +9,10 @@
         "ratePerSecond": 100,
         "burst": 500
       },
-      "status": "active"
+      "status": "active",
+      "apiKey": {
+        "primarySlot": "a"
+      }
     },
     {
       "id": "serial-forwarder",
@@ -19,7 +22,10 @@
         "ratePerSecond": 10,
         "burst": 50
       },
-      "status": "active"
+      "status": "active",
+      "apiKey": {
+        "primarySlot": "a"
+      }
     }
   ]
 }

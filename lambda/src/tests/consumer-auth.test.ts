@@ -1,5 +1,6 @@
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import {
+  ApiKeyLookupResult,
   IngestionConsumer,
   buildApiKeyConsumerLookup,
   resetConsumerAuthCacheForTests,
@@ -14,6 +15,7 @@ const CONSUMER_A: IngestionConsumer = {
   secretName: 'test/consumers/particle-cloud-webhook/webhook-secret',
   usagePlan: { ratePerSecond: 100, burst: 500 },
   status: 'active',
+  apiKey: { primarySlot: 'a' },
 };
 const CONSUMER_B: IngestionConsumer = {
   id: 'serial-forwarder',
@@ -21,6 +23,7 @@ const CONSUMER_B: IngestionConsumer = {
   secretName: 'test/consumers/serial-forwarder/webhook-secret',
   usagePlan: { ratePerSecond: 10, burst: 50 },
   status: 'active',
+  apiKey: { primarySlot: 'a' },
 };
 
 const SECRET_BY_NAME: Record<string, string> = {
@@ -28,9 +31,11 @@ const SECRET_BY_NAME: Record<string, string> = {
   [CONSUMER_B.secretName]: 'b'.repeat(64),
 };
 
-function lookup(apiKeyId: string, mapping: Record<string, string>): string | undefined {
-  return mapping[apiKeyId];
+function lookup(apiKeyId: string, mapping: Record<string, string>): ApiKeyLookupResult {
+  return mapping[apiKeyId] ? { kind: 'consumer', consumerId: mapping[apiKeyId] } : { kind: 'unknown' };
 }
+
+const resolvesTo = (consumerId: string) => (): ApiKeyLookupResult => ({ kind: 'consumer', consumerId });
 
 describe('validateConsumerRequest', () => {
   beforeEach(() => {
@@ -58,7 +63,7 @@ describe('validateConsumerRequest', () => {
   });
 
   test('missing secret fails fast without ever calling Secrets Manager', async () => {
-    const result = await validateConsumerRequest(undefined, 'key-a', () => CONSUMER_A.id, [CONSUMER_A]);
+    const result = await validateConsumerRequest(undefined, 'key-a', resolvesTo(CONSUMER_A.id), [CONSUMER_A]);
     expect(result).toEqual({ outcome: 'failure', reason: 'missing_secret' });
     expect(mockSend).not.toHaveBeenCalled();
   });
@@ -88,7 +93,7 @@ describe('validateConsumerRequest', () => {
     const result = await validateConsumerRequest(
       SECRET_BY_NAME[CONSUMER_A.secretName],
       'unknown-key',
-      () => undefined,
+      () => ({ kind: 'unknown' }),
       [CONSUMER_A, CONSUMER_B]
     );
     expect(result).toEqual({ outcome: 'failure', reason: 'credential_pair_mismatch', apiKeyConsumerId: undefined });
@@ -117,14 +122,14 @@ describe('validateConsumerRequest', () => {
 
   test('a Secrets Manager failure surfaces as credential_config_unavailable, not an unhandled rejection', async () => {
     mockSend.mockRejectedValue(new Error('AccessDeniedException') as never);
-    const result = await validateConsumerRequest(SECRET_BY_NAME[CONSUMER_A.secretName], 'key-a', () => CONSUMER_A.id, [CONSUMER_A]);
+    const result = await validateConsumerRequest(SECRET_BY_NAME[CONSUMER_A.secretName], 'key-a', resolvesTo(CONSUMER_A.id), [CONSUMER_A]);
     expect(result).toEqual({ outcome: 'failure', reason: 'credential_config_unavailable' });
   });
 
   test('secrets are cached across calls within the TTL: a second call does not re-fetch', async () => {
-    await validateConsumerRequest(SECRET_BY_NAME[CONSUMER_A.secretName], 'key-a', () => CONSUMER_A.id, [CONSUMER_A]);
+    await validateConsumerRequest(SECRET_BY_NAME[CONSUMER_A.secretName], 'key-a', resolvesTo(CONSUMER_A.id), [CONSUMER_A]);
     expect(mockSend).toHaveBeenCalledTimes(1);
-    await validateConsumerRequest(SECRET_BY_NAME[CONSUMER_A.secretName], 'key-a', () => CONSUMER_A.id, [CONSUMER_A]);
+    await validateConsumerRequest(SECRET_BY_NAME[CONSUMER_A.secretName], 'key-a', resolvesTo(CONSUMER_A.id), [CONSUMER_A]);
     expect(mockSend).toHaveBeenCalledTimes(1);
   });
 
@@ -148,13 +153,13 @@ describe('buildApiKeyConsumerLookup', () => {
       { INGESTION_API_KEY_ID_PARTICLE_CLOUD_WEBHOOK: 'abc123', INGESTION_API_KEY_ID_SERIAL_FORWARDER: 'xyz789' },
       [CONSUMER_A, CONSUMER_B]
     );
-    expect(lookupFn('abc123')).toBe(CONSUMER_A.id);
-    expect(lookupFn('xyz789')).toBe(CONSUMER_B.id);
-    expect(lookupFn('not-configured')).toBeUndefined();
+    expect(lookupFn('abc123')).toEqual({ kind: 'consumer', consumerId: CONSUMER_A.id });
+    expect(lookupFn('xyz789')).toEqual({ kind: 'consumer', consumerId: CONSUMER_B.id });
+    expect(lookupFn('not-configured')).toEqual({ kind: 'unknown' });
   });
 
   test('a consumer with no configured env var simply resolves nothing for its key, not a crash', () => {
     const lookupFn = buildApiKeyConsumerLookup({}, [CONSUMER_A]);
-    expect(lookupFn('anything')).toBeUndefined();
+    expect(lookupFn('anything')).toEqual({ kind: 'unknown' });
   });
 });
