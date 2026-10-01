@@ -9,6 +9,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { Template } from 'aws-cdk-lib/assertions';
 import { InfraStack } from '../lib/infra-stack';
+import { resourcesReferencing } from './helpers/template-references';
 
 const BREAK_GLASS_PRINCIPAL_ARN = 'arn:aws:iam::123456789012:role/test-archive-operator';
 
@@ -65,14 +66,32 @@ describe('every production trigger invokes the alias', () => {
   });
 
   test('nothing references the unqualified function except its version, alias, and log retention', () => {
-    // `$LATEST` would be reached through the function's own Ref/Arn; an event source,
-    // rule target, integration or permission naming it would bypass the alias.
-    const referencing = entries
-      .filter(([id]) => id !== functionId)
-      .filter(([, r]) => JSON.stringify(r).includes(`"${functionId}"`))
-      .map(([id, r]) => `${r.Type} ${id}`);
-    expect(referencing.map(s => s.split(' ')[0]).sort()).toEqual(['AWS::Lambda::Alias', 'AWS::Lambda::Version', 'Custom::LogRetention']);
+    // `$LATEST` would be reached through the function's own Ref/Arn, in any form (Ref,
+    // Fn::GetAtt, Fn::Sub); an event source, rule target, integration or permission naming
+    // it would bypass the alias.
+    const referencing = resourcesReferencing(resources, functionId).map(id => resources[id].Type);
+    expect(referencing.sort()).toEqual(['AWS::Lambda::Alias', 'AWS::Lambda::Version', 'Custom::LogRetention']);
     expect(ofType('AWS::Lambda::EventSourceMapping')).toEqual([]);
+  });
+
+  test('fixture: the scan catches an unqualified scheduled invocation written with Fn::Sub (Codex round-3 survivor I13)', () => {
+    const app = new cdk.App({ context: { archiveOperatorPrincipalArn: BREAK_GLASS_PRINCIPAL_ARN } });
+    const stack = new InfraStack(app, 'InfraStack');
+    const fnId = stack.getLogicalId(stack.node.findChild('ParticleLogIngestionFunction').node.defaultChild as cdk.CfnElement);
+    new cdk.aws_events.CfnRule(stack, 'SubSchedule', {
+      scheduleExpression: 'rate(1 hour)',
+      state: 'ENABLED',
+      targets: [{ id: 'unqualified', arn: cdk.Fn.sub(`\${${fnId}.Arn}`) }],
+    });
+    new lambda.CfnPermission(stack, 'SubSchedulePermission', {
+      action: 'lambda:InvokeFunction',
+      functionName: cdk.Fn.sub(`\${${fnId}}`),
+      principal: 'events.amazonaws.com',
+    });
+    const mutated = Template.fromStack(stack).toJSON().Resources as Record<string, Resource>;
+    // Neither names the function by its quoted logical ID, which the old search relied on.
+    for (const id of ['SubSchedule', 'SubSchedulePermission']) expect(JSON.stringify(mutated[id])).not.toContain(`"${fnId}"`);
+    expect(resourcesReferencing(mutated, fnId)).toEqual(expect.arrayContaining(['SubSchedule', 'SubSchedulePermission']));
   });
 
   test('every API Gateway invoke permission is on the alias, never the bare function', () => {
