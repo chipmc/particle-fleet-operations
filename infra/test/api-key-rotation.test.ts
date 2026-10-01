@@ -294,6 +294,52 @@ describe('daily rotation checker', () => {
   });
 });
 
+describe('daily rotation checker: deployed entry point and complete permission surface', () => {
+  // Synthesized through a real cloud assembly so the bundled asset itself can be loaded.
+  const app = new cdk.App({ context: { archiveOperatorPrincipalArn: BREAK_GLASS_PRINCIPAL_ARN } });
+  new InfraStack(app, 'InfraStack');
+  const assembly = app.synth();
+  const t = Template.fromJSON(assembly.getStackByName('InfraStack').template);
+  const [checkerId, checker] = Object.entries(ofType(t, 'AWS::Lambda::Function'))
+    .find(([id]) => id.startsWith('IngestionApiKeyRotationCheckerFunction'))!;
+  const roleId = (checker.Properties.Role as { 'Fn::GetAtt': [string, string] })['Fn::GetAtt'][0];
+
+  test('the configured handler resolves to an exported function in the synthesized bundle', () => {
+    const [file, exportName] = (checker.Properties.Handler as string).split('.');
+    const s3Key = (checker.Properties.Code as { S3Key: string }).S3Key;
+    const bundle = path.join(assembly.directory, `asset.${s3Key.replace(/\.zip$/, '')}`, `${file}.js`);
+    expect(fs.existsSync(bundle)).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const loaded = require(bundle) as Record<string, unknown>;
+    expect(typeof loaded[exportName]).toBe('function');
+    expect(checkerId).toMatch(/^IngestionApiKeyRotationCheckerFunction/);
+  });
+
+  test('the checker role carries nothing beyond basic Lambda logging and its one exact inline policy', () => {
+    const role = ofType(t, 'AWS::IAM::Role')[roleId];
+    // Managed policies: exactly the Lambda basic-execution policy, nothing broader.
+    expect(role.Properties.ManagedPolicyArns).toEqual([{
+      'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, ':iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']],
+    }]);
+    expect(role.Properties.Policies).toBeUndefined();
+    expect(role.Properties.PermissionsBoundary).toBeUndefined();
+    // Every policy resource of any kind attached to this role, found by reference rather
+    // than by name, so a separately constructed grant can't slip past.
+    const attachedTo = (type: string) => Object.entries(ofType(t, type)).filter(([, r]) =>
+      JSON.stringify(r.Properties.Roles ?? []).includes(JSON.stringify({ Ref: roleId })));
+    expect(attachedTo('AWS::IAM::ManagedPolicy')).toEqual([]);
+    const inline = attachedTo('AWS::IAM::Policy');
+    expect(inline).toHaveLength(1);
+    const apikeysArn = (suffix: string) => ({
+      'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, ':apigateway:', { Ref: 'AWS::Region' }, `::/apikeys${suffix}`]],
+    });
+    expect((inline[0][1].Properties.PolicyDocument as { Statement: unknown[] }).Statement).toEqual([
+      { Action: 'sns:Publish', Effect: 'Allow', Resource: { Ref: expect.stringMatching(/^IngestionApiKeyRotationNotifications/) } },
+      { Action: 'apigateway:GET', Effect: 'Allow', Resource: [apikeysArn(''), apikeysArn('/*')] },
+    ]);
+  });
+});
+
 describe('infra and Lambda agree on the slot naming convention', () => {
   test('key names and environment variable names match the Lambda\'s helpers', () => {
     for (const id of ['alpha', 'alpha-long', 'particle-cloud-webhook']) {

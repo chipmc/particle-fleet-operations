@@ -13,10 +13,12 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { GetApiKeyCommand, GetApiKeysCommand, GetUsagePlanKeysCommand } from '@aws-sdk/client-api-gateway';
-import { PublishCommand } from '@aws-sdk/client-sns';
+import { APIGatewayClient, GetApiKeyCommand, GetApiKeysCommand, GetUsagePlanKeysCommand } from '@aws-sdk/client-api-gateway';
+import { PublishCommand, SNSClient } from '@aws-sdk/client-sns';
+import consumerRegistry from '../../../config/ingestion-consumers.json';
 import {
   CheckerConsumer,
+  handler,
   ROTATION_ALERT_TARGET_MS,
   RotationEvent,
   runRotationCheck,
@@ -148,12 +150,29 @@ function alphaB(overrides: Partial<FakeKey> = {}): FakeKey {
 const BETA_A: FakeKey = { id: 'beta-a', name: 'particle-ingestion-beta', enabled: true, createdDate: OLD_KEY_CREATED };
 const UNRELATED: FakeKey = { id: 'other-1', name: 'some-other-api-key', enabled: true, createdDate: OLD_KEY_CREATED };
 
-let infoLog: jest.SpyInstance;
+// Every output path the checker could plausibly write to: each console method, and raw
+// stdout/stderr writes. The leak assertions below read all of them, not only console.info.
+const CONSOLE_METHODS = ['log', 'info', 'warn', 'error', 'debug', 'trace'] as const;
+let outputSpies: jest.SpyInstance[] = [];
+
+function capturedOutput(): unknown[] {
+  return outputSpies.map(spy => spy.mock.calls);
+}
 
 beforeEach(() => {
-  infoLog = jest.spyOn(console, 'info').mockImplementation(() => undefined);
+  outputSpies = [
+    ...CONSOLE_METHODS.map(method => jest.spyOn(console, method).mockImplementation(() => undefined)),
+    jest.spyOn(process.stdout, 'write'),
+    jest.spyOn(process.stderr, 'write'),
+  ];
 });
 afterEach(() => jest.restoreAllMocks());
+
+function expectNoValueIn(...outputs: unknown[]): void {
+  const everything = JSON.stringify([...outputs, capturedOutput()]);
+  expect(everything).not.toContain(VALUE_SENTINEL);
+  expect(everything).not.toMatch(/"value"/);
+}
 
 async function check(
   keys: FakeKey[],
@@ -165,15 +184,14 @@ async function check(
   const sns = new FakeSns();
   setup(api, sns);
   let error: Error | undefined;
+  let events: RotationEvent[] | undefined;
   try {
-    await runRotationCheck({ apiGateway: api, sns, topicArn: TOPIC_ARN, now: new Date(now), consumers });
+    events = await runRotationCheck({ apiGateway: api, sns, topicArn: TOPIC_ARN, now: new Date(now), consumers });
   } catch (e) {
     error = e as Error;
   }
   expect(api.violations).toEqual([]);
-  const everything = JSON.stringify([sns.raw, infoLog.mock.calls, error?.message]);
-  expect(everything).not.toContain(VALUE_SENTINEL);
-  expect(everything).not.toMatch(/"value"/);
+  expectNoValueIn(sns.raw, events, error?.message, error?.stack);
   return { api, sns, error };
 }
 
@@ -277,6 +295,17 @@ describe('rotation state comes from the observed key count', () => {
   test('0 keys: inconsistency, not healthy', async () => {
     const { sns } = await check([BETA_A], [{ id: 'alpha', apiKey: STEADY }, { id: 'beta', apiKey: STEADY }], late);
     expect(sns.inconsistencies()).toEqual([expect.objectContaining({ consumerId: 'alpha', reason: 'no_keys', keyCount: 0 })]);
+  });
+
+  test.each([
+    ['missing', undefined],
+    ['unparseable string', 'last tuesday'],
+    ['invalid Date', new Date('nope')],
+  ])('1 key, no declared rotation, %s createdDate: inconsistency, never silently healthy', async (_label, createdDate) => {
+    const { sns, error } = await check([alphaA({ createdDate }), BETA_A], [{ id: 'alpha', apiKey: STEADY }, { id: 'beta', apiKey: STEADY }], late);
+    expect(error).toBeUndefined();
+    expect(sns.inconsistencies()).toEqual([expect.objectContaining({ consumerId: 'alpha', reason: 'missing_created_date', keyCount: 1 })]);
+    expect(sns.overdue()).toEqual([]);
   });
 
   test('1 key with a declared rotation: inconsistency, not a completed migration', async () => {
@@ -403,14 +432,83 @@ describe('checker failures surface as errors (for the Errors alarm), not a quiet
   });
 
   test('a GetApiKeys failure fails the whole run', async () => {
-    const api = { send: jest.fn().mockRejectedValue(new Error('AccessDeniedException')) };
+    const failure = Object.assign(new Error('User is not authorized'), { name: 'AccessDeniedException' });
+    const api = { send: jest.fn().mockRejectedValue(failure) };
     const sns = new FakeSns();
     await expect(runRotationCheck({ apiGateway: api, sns, topicArn: TOPIC_ARN, now: new Date(THRESHOLD_MS), consumers }))
       .rejects.toThrow('AccessDeniedException');
     expect(sns.published).toEqual([]);
   });
+
+  test('a GetApiKeys failure never passes upstream error text through, only its name, status and request ID', async () => {
+    // The SDK copies a service error body's message into the thrown error. Whether AWS could
+    // ever echo a value there can't be ruled out, so the checker must not relay that text.
+    const failure = Object.assign(new Error(`bad request near ${VALUE_SENTINEL}`), {
+      name: 'BadRequestException',
+      $metadata: { httpStatusCode: 400, requestId: 'req-123' },
+    });
+    const api = { send: jest.fn().mockRejectedValue(failure) };
+    let thrown: Error | undefined;
+    try {
+      await runRotationCheck({ apiGateway: api, sns: new FakeSns(), topicArn: TOPIC_ARN, now: new Date(THRESHOLD_MS), consumers });
+    } catch (e) {
+      thrown = e as Error;
+    }
+    expect(thrown?.message).toBe('GetApiKeys failed: BadRequestException (HTTP 400, request req-123)');
+    expectNoValueIn(thrown?.message, thrown?.stack, String(thrown));
+  });
 });
 
 test('ROTATION_ALERT_TARGET_MS is seven days', () => {
   expect(ROTATION_ALERT_TARGET_MS).toBe(7 * 24 * HOUR_MS);
+});
+
+describe('the production handler', () => {
+  // Exercises the exported Lambda entry point itself -- real bundled registry, real SDK
+  // client classes (send stubbed), topic ARN from the environment -- so a handler that
+  // stops calling the check, or calls it wrongly, fails here.
+  const originalEnv = process.env;
+  const registered = (consumerRegistry.consumers as { id: string }[]).map(c => c.id);
+  const HANDLER_TOPIC = 'arn:aws:sns:us-east-1:123456789012:from-env';
+
+  afterEach(() => { process.env = originalEnv; });
+
+  test('reads every registered consumer\'s keys and publishes to the topic named in its environment', async () => {
+    process.env = { ...originalEnv, ROTATION_ALERT_TOPIC_ARN: HANDLER_TOPIC };
+    const longAgo = new Date(Date.now() - 30 * 24 * HOUR_MS);
+    // First registered consumer: two keys and no declared rotation (inconsistency + overdue).
+    // Every other registered consumer: one healthy slot-a key.
+    const [rotating, ...steady] = registered;
+    const fake = new FakeApiGateway([
+      { id: 'k-a', name: `particle-ingestion-${rotating}`, enabled: true, createdDate: new Date(longAgo.getTime() - HOUR_MS) },
+      { id: 'k-b', name: `particle-ingestion-${rotating}-b`, enabled: true, createdDate: longAgo },
+      ...steady.map(id => ({ id: `k-${id}`, name: `particle-ingestion-${id}`, enabled: true, createdDate: longAgo })),
+    ]);
+    fake.leakValues = true;
+    jest.spyOn(APIGatewayClient.prototype, 'send').mockImplementation(command => fake.send(command) as never);
+    const published: PublishCommand[] = [];
+    jest.spyOn(SNSClient.prototype, 'send').mockImplementation(async command => {
+      published.push(command as PublishCommand);
+      return { MessageId: 'm' } as never;
+    });
+
+    await handler();
+
+    expect(fake.violations).toEqual([]);
+    expect(fake.calls).toContain('GetApiKeys');
+    expect(published.map(c => c.input.TopicArn)).toEqual([HANDLER_TOPIC, HANDLER_TOPIC]);
+    expect(published.map(c => JSON.parse(c.input.Message!))).toEqual([
+      expect.objectContaining({ event: 'ingestion_api_key_rotation_inconsistency', consumerId: rotating, reason: 'two_keys_without_declared_rotation' }),
+      expect.objectContaining({ event: 'ingestion_api_key_rotation_overdue', consumerId: rotating, secondaryKeyId: 'k-b' }),
+    ]);
+    expectNoValueIn(published.map(c => c.input));
+  });
+
+  test('fails (for the Errors alarm) rather than doing nothing when its topic is not configured', async () => {
+    process.env = { ...originalEnv };
+    delete process.env.ROTATION_ALERT_TOPIC_ARN;
+    const send = jest.spyOn(APIGatewayClient.prototype, 'send');
+    await expect(handler()).rejects.toThrow('ROTATION_ALERT_TOPIC_ARN is not set');
+    expect(send).not.toHaveBeenCalled();
+  });
 });

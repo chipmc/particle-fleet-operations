@@ -167,9 +167,20 @@ describe('one key ID claimed by two consumers', () => {
       resetConsumerAuthCacheForTests();
       setRegistry([...order.map(id => consumer(id, STEADY)), consumer('gamma', STEADY)]);
       process.env = { ...originalEnv, INGESTION_API_KEY_ID_ALPHA: 'shared-id', INGESTION_API_KEY_ID_BETA: 'shared-id', INGESTION_API_KEY_ID_GAMMA: 'gamma-a' };
+      errorLog.mockClear();
       expect(await post('shared-id', 'alpha')).toBe(503);
       expect(await post('shared-id', 'beta')).toBe(503);
       expect(await post('gamma-a', 'gamma')).toBe(200);
+      // The log names every consumer claiming the ID (approved: consumerIds, plural), in
+      // either registry order -- not just whichever claimed it first.
+      const configLogs = errorLog.mock.calls
+        .map(([line]) => JSON.parse(line as string))
+        .filter(entry => entry.event === 'consumer_auth_api_key_config_error');
+      expect(configLogs).toHaveLength(2);
+      for (const entry of configLogs) {
+        expect(entry).toEqual({ event: 'consumer_auth_api_key_config_error', consumerIds: expect.any(Array), reason: 'duplicate_api_key_id', apiKeyId: 'shared-id' });
+        expect([...entry.consumerIds].sort()).toEqual(['alpha', 'beta']);
+      }
     }
   });
 });

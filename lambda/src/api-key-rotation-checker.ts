@@ -97,15 +97,31 @@ function toKeyMetadata(item: unknown): KeyMetadata | undefined {
   return { id, name, enabled: enabled === true, createdDate: parseCreatedDate(createdDate) };
 }
 
+/**
+ * The SDK copies a service error body's message into the thrown error, and nothing rules
+ * out that text echoing request or response content. Only the error's name, HTTP status
+ * and request ID are relayed -- enough to look the failure up, never upstream text.
+ */
+function describeAwsError(operation: string, error: unknown): string {
+  const { name, $metadata } = (error ?? {}) as { name?: unknown; $metadata?: { httpStatusCode?: unknown; requestId?: unknown } };
+  const safe = (value: unknown) => (typeof value === 'string' || typeof value === 'number') && /^[\w.:-]+$/.test(String(value)) ? String(value) : 'unknown';
+  return `${operation} failed: ${safe(name)} (HTTP ${safe($metadata?.httpStatusCode)}, request ${safe($metadata?.requestId)})`;
+}
+
 async function listAllApiKeys(apiGateway: ApiGatewayReader): Promise<KeyMetadata[]> {
   const keys: KeyMetadata[] = [];
   let position: string | undefined;
   do {
-    const page = await apiGateway.send(new GetApiKeysCommand({
-      includeValues: false,
-      limit: GET_API_KEYS_PAGE_LIMIT,
-      position,
-    })) as { items?: unknown[]; position?: string };
+    let page: { items?: unknown[]; position?: string };
+    try {
+      page = await apiGateway.send(new GetApiKeysCommand({
+        includeValues: false,
+        limit: GET_API_KEYS_PAGE_LIMIT,
+        position,
+      })) as { items?: unknown[]; position?: string };
+    } catch (error) {
+      throw new Error(describeAwsError('GetApiKeys', error));
+    }
     for (const item of page.items ?? []) {
       const key = toKeyMetadata(item);
       if (key) keys.push(key);
@@ -152,6 +168,9 @@ async function evaluateConsumer(
   if (slotted.length === 1) {
     if (rotation) return [inconsistency('rotation_declared_with_one_key', slotted)];
     if (slotted[0].slot !== primarySlot) return [inconsistency('only_key_is_not_primary_slot', slotted)];
+    // Steady state needs a readable creation date too: a key whose metadata can't be read
+    // is never reported healthy, whatever the key count.
+    if (!slotted[0].key.createdDate) return [inconsistency('missing_created_date', slotted)];
     return [];
   }
 
