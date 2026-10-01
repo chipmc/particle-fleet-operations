@@ -750,6 +750,44 @@ export class InfraStack extends cdk.Stack {
     });
     ingestionRestApi.latestDeployment!.node.addDependency(ingestionProdAlias.node.findChild('RestApiInvoke'));
 
+    // Retained rollback guards (WO-2026-09-30-001 design, Revision 6, R3-2). Dormant
+    // permissions on the *unqualified* function, one per production method/path: wildcard
+    // stage, this account, both retain policies. Nothing here targets the bare function; they
+    // exist so that if a pre-foundation template is ever redeployed, its integrations can
+    // switch back to the bare function in any order. Without them, that template's REST
+    // permission names the stage and so is created only after the stage already serves the
+    // bare function -- a window of 500s. Retain keeps the statements in the function policy
+    // after such a template removes these resources. Cleanup is a separate, reviewed
+    // operation, never part of credential rotation (see the design's R3-2 section).
+    const rollbackGuards: lambda.CfnPermission[] = [];
+    const addRollbackGuard = (api: 'Http' | 'Rest', method: string, routePath: string, sourceArn: string) => {
+      const guard = new lambda.CfnPermission(this, `IngestionRollbackGuard${api}${method}${routePath.replace(/[^A-Za-z0-9]/g, '')}`, {
+        action: 'lambda:InvokeFunction',
+        functionName: ingestionFunction.functionArn,
+        principal: 'apigateway.amazonaws.com',
+        sourceAccount: this.account,
+        sourceArn,
+      });
+      guard.applyRemovalPolicy(RemovalPolicy.RETAIN);
+      rollbackGuards.push(guard);
+    };
+    for (const route of httpApi.node.findAll().filter((c): c is apigwv2.CfnRoute => c instanceof apigwv2.CfnRoute)) {
+      // Route key is "<METHOD> <path>", e.g. "GET /device/{deviceId}/timeline".
+      const [method, routePath] = route.routeKey.split(' ');
+      addRollbackGuard('Http', method, routePath, httpApi.arnForExecuteApi(method, routePath, '*'));
+    }
+    for (const method of ingestionRestApi.methods) {
+      addRollbackGuard('Rest', method.httpMethod, method.resource.path, ingestionRestApi.arnForExecuteApi(method.httpMethod, method.resource.path, '*'));
+    }
+    // Every guard exists before any integration or stage switches to the alias.
+    for (const guard of rollbackGuards) {
+      for (const child of httpApi.node.findAll()) {
+        if (child instanceof apigwv2.CfnIntegration) child.node.addDependency(guard);
+      }
+      httpApi.defaultStage!.node.addDependency(guard);
+      ingestionRestApi.latestDeployment!.node.addDependency(guard);
+    }
+
     // Registry-driven per-consumer resources: config/ingestion-consumers.json is the
     // single source of truth (see docs/security/webhook-secret-rotation-runbook.md).
     // Adding a consumer is a registry entry + a pre-created Secrets Manager secret, not a
