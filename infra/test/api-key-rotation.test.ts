@@ -12,6 +12,15 @@ import { Match, Template } from 'aws-cdk-lib/assertions';
 import { InfraStack } from '../lib/infra-stack';
 import { apiKeySlotName, loadIngestionConsumerRegistry } from '../lib/ingestion-consumers';
 import * as lambdaSlots from '../../lambda/src/api-key-slots';
+import { apiKeysPage, awsEnvFor, epochSeconds, startFakeAwsEndpoint } from '../../lambda/src/tests/helpers/fake-aws-endpoint';
+import { resourcesReferencing } from './helpers/template-references';
+
+/** Every resource that refers to the checker role, in any form, plus its literal name if one is set. */
+function checkerRoleReferences(template: Template, roleId: string): string[] {
+  const resources = template.toJSON().Resources as Record<string, { Properties?: { RoleName?: unknown } }>;
+  const roleName = resources[roleId].Properties?.RoleName;
+  return resourcesReferencing(resources, roleId, typeof roleName === 'string' ? [roleName] : []);
+}
 
 const BREAK_GLASS_PRINCIPAL_ARN = 'arn:aws:iam::123456789012:role/test-archive-operator';
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wo-2026-09-30-001-'));
@@ -270,9 +279,11 @@ describe('daily rotation checker', () => {
     });
     expect((policies[0][1].Properties.PolicyDocument as { Statement: unknown[] }).Statement).toEqual([
       { Action: 'sns:Publish', Effect: 'Allow', Resource: { Ref: expect.stringMatching(/^IngestionApiKeyRotationNotifications/) } },
-      { Action: 'apigateway:GET', Effect: 'Allow', Resource: [apikeysArn(''), apikeysArn('/*')] },
+      { Action: 'apigateway:GET', Effect: 'Allow', Resource: apikeysArn('') },
     ]);
     const serialized = JSON.stringify(policies);
+    // GetApiKey (/apikeys/{id}) is not needed: GetApiKeys returns every field the checker uses.
+    expect(serialized).not.toContain('/apikeys/');
     // GetUsagePlanKeys returns key values; the checker must have no route to it.
     expect(serialized).not.toContain('usageplans');
     expect(serialized).not.toMatch(/apigateway:(POST|PUT|PATCH|DELETE|\*)/);
@@ -295,7 +306,7 @@ describe('daily rotation checker', () => {
 });
 
 describe('daily rotation checker: deployed entry point and complete permission surface', () => {
-  // Synthesized through a real cloud assembly so the bundled asset itself can be loaded.
+  // Synthesized through a real cloud assembly so the bundled asset itself can be executed.
   const app = new cdk.App({ context: { archiveOperatorPrincipalArn: BREAK_GLASS_PRINCIPAL_ARN } });
   new InfraStack(app, 'InfraStack');
   const assembly = app.synth();
@@ -303,40 +314,121 @@ describe('daily rotation checker: deployed entry point and complete permission s
   const [checkerId, checker] = Object.entries(ofType(t, 'AWS::Lambda::Function'))
     .find(([id]) => id.startsWith('IngestionApiKeyRotationCheckerFunction'))!;
   const roleId = (checker.Properties.Role as { 'Fn::GetAtt': [string, string] })['Fn::GetAtt'][0];
+  const registered = loadIngestionConsumerRegistry(path.join(__dirname, '../../config/ingestion-consumers.json')).map(c => c.id);
 
-  test('the configured handler resolves to an exported function in the synthesized bundle', () => {
+  test('the deployed function is the checker: exact runtime and handler, and the configured export runs the check', async () => {
+    expect(checker.Properties.Runtime).toBe('nodejs22.x');
+    expect(checker.Properties.Handler).toBe('index.handler');
     const [file, exportName] = (checker.Properties.Handler as string).split('.');
     const s3Key = (checker.Properties.Code as { S3Key: string }).S3Key;
     const bundle = path.join(assembly.directory, `asset.${s3Key.replace(/\.zip$/, '')}`, `${file}.js`);
-    expect(fs.existsSync(bundle)).toBe(true);
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const loaded = require(bundle) as Record<string, unknown>;
-    expect(typeof loaded[exportName]).toBe('function');
-    expect(checkerId).toMatch(/^IngestionApiKeyRotationCheckerFunction/);
+    const configured = (require(bundle) as Record<string, unknown>)[exportName] as () => Promise<void>;
+    expect(typeof configured).toBe('function');
+
+    // Execute it against a local fake API Gateway/SNS, with the production registry the
+    // bundle carries: every registered consumer gets one key in the non-primary slot, so
+    // each must produce its own attributable inconsistency.
+    const endpoint = await startFakeAwsEndpoint();
+    const originalEnv = process.env;
+    const topic = 'arn:aws:sns:us-east-1:123456789012:entry-point-test';
+    const info = jest.spyOn(console, 'info').mockImplementation(() => undefined);
+    try {
+      process.env = { ...awsEnvFor(endpoint.url), ROTATION_ALERT_TOPIC_ARN: topic };
+      endpoint.getApiKeys = () => apiKeysPage(registered.map((id, i) => ({
+        id: `key${i}`, name: `particle-ingestion-${id}-b`, enabled: true, createdDate: epochSeconds('2026-09-01T00:00:00Z'), value: 'must-not-cross',
+      })));
+      await configured();
+      expect(endpoint.requests.filter(r => r.path === '/apikeys').map(r => r.query)).toEqual([{ includeValues: 'false', limit: '500' }]);
+      const published = endpoint.requests.filter(r => r.form.Action === 'Publish');
+      expect(published.map(r => r.form.TopicArn)).toEqual(registered.map(() => topic));
+      expect(published.map(r => JSON.parse(r.form.Message))).toEqual(registered.map((id, i) => ({
+        event: 'ingestion_api_key_rotation_inconsistency', consumerId: id, reason: 'only_key_is_not_primary_slot', keyCount: 1,
+        keys: [{ slot: 'b', enabled: true }],
+      })));
+      expect(JSON.stringify([endpoint.requests, info.mock.calls])).not.toContain('must-not-cross');
+    } finally {
+      process.env = originalEnv;
+      info.mockRestore();
+      await endpoint.close();
+    }
   });
 
-  test('the checker role carries nothing beyond basic Lambda logging and its one exact inline policy', () => {
+  test('the whole template references the checker role only from the checker function and its one exact policy', () => {
     const role = ofType(t, 'AWS::IAM::Role')[roleId];
-    // Managed policies: exactly the Lambda basic-execution policy, nothing broader.
     expect(role.Properties.ManagedPolicyArns).toEqual([{
       'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, ':iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']],
     }]);
     expect(role.Properties.Policies).toBeUndefined();
     expect(role.Properties.PermissionsBoundary).toBeUndefined();
-    // Every policy resource of any kind attached to this role, found by reference rather
-    // than by name, so a separately constructed grant can't slip past.
-    const attachedTo = (type: string) => Object.entries(ofType(t, type)).filter(([, r]) =>
-      JSON.stringify(r.Properties.Roles ?? []).includes(JSON.stringify({ Ref: roleId })));
-    expect(attachedTo('AWS::IAM::ManagedPolicy')).toEqual([]);
-    const inline = attachedTo('AWS::IAM::Policy');
-    expect(inline).toHaveLength(1);
-    const apikeysArn = (suffix: string) => ({
-      'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, ':apigateway:', { Ref: 'AWS::Region' }, `::/apikeys${suffix}`]],
-    });
-    expect((inline[0][1].Properties.PolicyDocument as { Statement: unknown[] }).Statement).toEqual([
+    // Any reference form -- Ref, Fn::GetAtt (array or dotted string), Fn::Sub (${Id} or
+    // ${Id.Arn}), DependsOn, or a literal role name if one is ever set -- including the role as
+    // a principal in some other resource's policy.
+    const [policyId, policy] = Object.entries(ofType(t, 'AWS::IAM::Policy')).find(([, r]) => JSON.stringify(r).includes(`"${roleId}"`))!;
+    expect(checkerRoleReferences(t, roleId)).toEqual([policyId, checkerId].sort());
+    expect(policy.Properties.Roles).toEqual([{ Ref: roleId }]);
+    expect((policy.Properties.PolicyDocument as { Statement: unknown[] }).Statement).toEqual([
       { Action: 'sns:Publish', Effect: 'Allow', Resource: { Ref: expect.stringMatching(/^IngestionApiKeyRotationNotifications/) } },
-      { Action: 'apigateway:GET', Effect: 'Allow', Resource: [apikeysArn(''), apikeysArn('/*')] },
+      { Action: 'apigateway:GET', Effect: 'Allow', Resource: { 'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, ':apigateway:', { Ref: 'AWS::Region' }, '::/apikeys']] } },
     ]);
+  });
+
+  test('negative control: IAM does not, and cannot, stop this role requesting key values', () => {
+    // GET /apikeys serves both includeValues=false and includeValues=true, and API Gateway
+    // has no IAM condition key for that parameter. This test documents the limitation so
+    // it is never mistaken for an IAM guarantee: value safety rests on the metadata adapter
+    // (lambda/src/rotation-checker/metadata-adapter.ts), its boundary tests, and review.
+    const [, policy] = Object.entries(ofType(t, 'AWS::IAM::Policy')).find(([, r]) => JSON.stringify(r).includes(`"${roleId}"`))!;
+    const apiGatewayStatements = (policy.Properties.PolicyDocument as { Statement: Record<string, unknown>[] }).Statement
+      .filter(statement => statement.Action === 'apigateway:GET');
+    expect(apiGatewayStatements).toHaveLength(1);
+    expect(apiGatewayStatements[0].Condition).toBeUndefined();
+    expect(JSON.stringify(apiGatewayStatements[0].Resource)).toContain('::/apikeys');
+  });
+
+  test('fixture: the role scan catches a grant that names the role only through Fn::Sub (Codex round-3 survivor I07)', () => {
+    const mutatedApp = new cdk.App({ context: { archiveOperatorPrincipalArn: BREAK_GLASS_PRINCIPAL_ARN } });
+    const stack = new InfraStack(mutatedApp, 'InfraStack');
+    const checkerFn = stack.node.findChild('IngestionApiKeyRotationCheckerFunction') as cdk.aws_lambda.Function;
+    const checkerRoleId = stack.getLogicalId(checkerFn.role!.node.defaultChild as cdk.CfnElement);
+    const topic = stack.node.findChild('IngestionApiKeyRotationNotifications') as cdk.aws_sns.Topic;
+    new cdk.aws_sns.CfnTopicPolicy(stack, 'SubGrant', {
+      topics: [topic.topicArn],
+      policyDocument: {
+        Version: '2012-10-17',
+        Statement: [{ Effect: 'Allow', Action: 'sns:*', Resource: '*', Principal: { AWS: { 'Fn::Sub': `\${${checkerRoleId}.Arn}` } } }],
+      },
+    });
+    const mutated = Template.fromStack(stack);
+    // The grant names the role only inside a Fn::Sub string, which the old quoted-ID search missed.
+    const subGrant = (mutated.toJSON().Resources as Record<string, unknown>).SubGrant;
+    expect(JSON.stringify(subGrant)).not.toContain(`"${checkerRoleId}"`);
+    expect(checkerRoleReferences(mutated, checkerRoleId)).toContain('SubGrant');
+  });
+});
+
+describe('rotation deploys publish a new version of the shared function and move prod to it', () => {
+  const versionOf = (t: Template) => {
+    const fnId = Object.keys(ofType(t, 'AWS::Lambda::Function')).find(id => id.startsWith('ParticleLogIngestionFunction'))!;
+    const versions = Object.entries(ofType(t, 'AWS::Lambda::Version')).filter(([, r]) => JSON.stringify(r.Properties.FunctionName) === JSON.stringify({ Ref: fnId }));
+    expect(versions).toHaveLength(1);
+    const [, alias] = Object.entries(ofType(t, 'AWS::Lambda::Alias')).find(([, r]) => r.Properties.Name === 'prod')!;
+    expect(alias.Properties.FunctionVersion).toEqual({ 'Fn::GetAtt': [versions[0][0], 'Version'] });
+    return versions[0][0];
+  };
+  const steady = versionOf(phase(STEADY_A));
+
+  test('each rotation phase (an environment change) publishes its own version', () => {
+    const ids = [steady, versionOf(phase(OVERLAP_A_TO_B)), versionOf(phase(STEADY_B)), versionOf(phase(OVERLAP_B_TO_A))];
+    expect(new Set(ids).size).toBe(4);
+  });
+
+  test('a change that does not touch the shared function does not churn its version', () => {
+    const throttleOnly = synth(writeRegistry([
+      { ...consumer('alpha', STEADY_A), usagePlan: { ratePerSecond: 77, burst: 99 } },
+      consumer('beta', STEADY_A),
+    ]));
+    expect(versionOf(throttleOnly)).toBe(steady);
   });
 });
 

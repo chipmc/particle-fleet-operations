@@ -847,7 +847,7 @@ export class InfraStack extends cdk.Stack {
     const apiKeyRotationChecker = new NodejsFunction(this, 'IngestionApiKeyRotationCheckerFunction', {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'handler',
-      entry: path.join(__dirname, '../../lambda/src/api-key-rotation-checker.ts'),
+      entry: path.join(__dirname, '../../lambda/src/rotation-checker/handler.ts'),
       timeout: Duration.minutes(1),
       memorySize: 256,
       logRetention: logs.RetentionDays.ONE_MONTH,
@@ -865,16 +865,17 @@ export class InfraStack extends cdk.Stack {
       },
     });
     apiKeyRotationTopic.grantPublish(apiKeyRotationChecker);
-    // Read-only key metadata. IAM cannot tell a value-returning read (includeValue=true)
-    // from a metadata-only one: apigateway:GET on /apikeys/* permits both. What keeps values
-    // out is the checker's code, enforced by its tests, not this policy. Deliberately not
-    // /usageplans/*: GetUsagePlanKeys returns key values.
+    // GetApiKeys only: the checker's one API call (GET /apikeys, includeValues=false) returns
+    // id, name, enabled and createdDate per key, so neither /apikeys/* (GetApiKey) nor
+    // /usageplans/* (GetUsagePlanKeys, which returns values) is granted. IAM cannot limit this
+    // grant to includeValues=false; what keeps values out is the checker's metadata adapter
+    // (lambda/src/rotation-checker/metadata-adapter.ts), its boundary tests, and review --
+    // not this policy (design Revision 5).
     apiKeyRotationChecker.addToRolePolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       actions: ['apigateway:GET'],
       resources: [
         this.formatArn({ service: 'apigateway', account: '', resource: '/apikeys', arnFormat: cdk.ArnFormat.NO_RESOURCE_NAME }),
-        this.formatArn({ service: 'apigateway', account: '', resource: '/apikeys/*', arnFormat: cdk.ArnFormat.NO_RESOURCE_NAME }),
       ],
     }));
     // No Lambda-level retries: a retried run after a partial publish would send a second
