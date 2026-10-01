@@ -168,6 +168,9 @@ export class InfraStack extends cdk.Stack {
       },
       depsLockFilePath: path.join(__dirname, '../../lambda/package-lock.json'),
       projectRoot: path.join(__dirname, '../../lambda'),
+      // Published versions are kept on stack update: each is a rollback target for the
+      // `prod` alias below. Deleting old versions needs its own, separate cleanup policy.
+      currentVersionOptions: { removalPolicy: RemovalPolicy.RETAIN },
       environment: {
         RAW_LOGS_BUCKET_NAME: rawLogsBucket.bucketName,
         LOG_EVENTS_TABLE_NAME: logEventsTable.tableName,
@@ -182,6 +185,19 @@ export class InfraStack extends cdk.Stack {
         PARTICLE_LEDGER_REFRESH_EVENT_NAMES: ledgerRefreshEventNames,
         PARTICLE_LEDGER_REFRESH_MIN_INTERVAL_SECONDS: ledgerRefreshMinIntervalSeconds,
       },
+    });
+
+    // Every production API integration for this shared function invokes the stable `prod`
+    // alias, never the unqualified function or `$LATEST` (WO-2026-09-30-001 design, Revision
+    // 4). CloudFormation applies a function update as two sequential calls (code, then
+    // configuration, or the reverse) and requests can arrive in between, so `$LATEST` can
+    // briefly run new code against old environment variables. A published version is one
+    // immutable snapshot of both; CDK publishes it only after the function update completes,
+    // and the alias moves to it only after it exists. `currentVersion` publishes a new
+    // version whenever the function's code or configuration changes.
+    const ingestionProdAlias = new lambda.Alias(this, 'ParticleLogIngestionFunctionProdAlias', {
+      aliasName: 'prod',
+      version: ingestionFunction.currentVersion,
     });
 
     const archiveTopic = new sns.Topic(this, 'MonthlyArchiveNotifications', {
@@ -564,7 +580,7 @@ export class InfraStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: new integrations.HttpLambdaIntegration(
         'TimelineQueryIntegration',
-        ingestionFunction
+        ingestionProdAlias
       ),
     });
 
@@ -574,7 +590,7 @@ export class InfraStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: new integrations.HttpLambdaIntegration(
         'HealthQueryIntegration',
-        ingestionFunction
+        ingestionProdAlias
       ),
     });
 
@@ -584,7 +600,7 @@ export class InfraStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: new integrations.HttpLambdaIntegration(
         'SummaryQueryIntegration',
-        ingestionFunction
+        ingestionProdAlias
       ),
     });
 
@@ -594,7 +610,7 @@ export class InfraStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: new integrations.HttpLambdaIntegration(
         'AnomaliesQueryIntegration',
-        ingestionFunction
+        ingestionProdAlias
       ),
     });
 
@@ -606,7 +622,7 @@ export class InfraStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: new integrations.HttpLambdaIntegration(
         'FleetSummaryIntegration',
-        ingestionFunction
+        ingestionProdAlias
       ),
     });
 
@@ -616,7 +632,7 @@ export class InfraStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: new integrations.HttpLambdaIntegration(
         'FleetAnomaliesIntegration',
-        ingestionFunction
+        ingestionProdAlias
       ),
     });
 
@@ -626,9 +642,23 @@ export class InfraStack extends cdk.Stack {
       methods: [apigwv2.HttpMethod.GET],
       integration: new integrations.HttpLambdaIntegration(
         'FleetOfflineIntegration',
-        ingestionFunction
+        ingestionProdAlias
       ),
     });
+
+    // API-wide permission for API Gateway to invoke the alias, independent of stage and
+    // route, so it exists before any integration switches to the alias. The per-route
+    // permissions the integrations create cannot guarantee that ordering on their own.
+    // Every HTTP integration, and the auto-deploying default stage, depends on it.
+    ingestionProdAlias.addPermission('HttpApiInvoke', {
+      principal: new iam.ServicePrincipal('apigateway.amazonaws.com'),
+      sourceArn: httpApi.arnForExecuteApi(),
+    });
+    const httpApiAliasPermission = ingestionProdAlias.node.findChild('HttpApiInvoke');
+    for (const child of httpApi.node.findAll()) {
+      if (child instanceof apigwv2.CfnIntegration) child.node.addDependency(httpApiAliasPermission);
+    }
+    httpApi.defaultStage!.node.addDependency(httpApiAliasPermission);
 
     // =========================================================================
     // Ingestion Custom Domain + Per-Consumer Credentials (Phase 4 migration, staged)
@@ -705,11 +735,20 @@ export class InfraStack extends cdk.Stack {
     ingestionRestApi.deploymentStage.node.addDependency(apiGatewayAccount);
     ingestionCustomDomain.addBasePathMapping(ingestionRestApi);
 
-    const ingestionRestApiIntegration = new apigateway.LambdaIntegration(ingestionFunction);
+    const ingestionRestApiIntegration = new apigateway.LambdaIntegration(ingestionProdAlias);
     ingestionRestApi.root
       .addResource('particle')
       .addResource('log')
       .addMethod('POST', ingestionRestApiIntegration, { apiKeyRequired: true });
+    // Same reasoning as the HTTP API above. CDK's per-method permission names the stage, so
+    // it can only be created after the stage already points at the new deployment; this
+    // stage-independent permission is created before the deployment that switches the
+    // method to the alias.
+    ingestionProdAlias.addPermission('RestApiInvoke', {
+      principal: new iam.ServicePrincipal('apigateway.amazonaws.com'),
+      sourceArn: ingestionRestApi.arnForExecuteApi('*', '/*', '*'),
+    });
+    ingestionRestApi.latestDeployment!.node.addDependency(ingestionProdAlias.node.findChild('RestApiInvoke'));
 
     // Registry-driven per-consumer resources: config/ingestion-consumers.json is the
     // single source of truth (see docs/security/webhook-secret-rotation-runbook.md).
