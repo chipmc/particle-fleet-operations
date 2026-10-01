@@ -6,6 +6,15 @@
  *
  * Deliberately conservative: any string equal to the ID or beginning with `Id.` counts as a
  * reference, so a coincidental match fails a test rather than hiding one.
+ *
+ * KNOWN, ACCEPTED GAP (Codex round 4, R4-1; deferred by Chip, 2026-10-01): this matches
+ * references *to a logical ID*, not what an expression resolves to. A target that reaches the
+ * same resource without naming it -- e.g. the bare function's ARN derived by splitting the
+ * alias ARN and dropping `:prod` -- is not recognized, so the bare-function trigger scan and
+ * the checker-role scan can be passed by such a form. Round 4 found no such reference in the
+ * shipped template; this is a limit of the verification layer, not of the product. Tracked as
+ * separate future work: resolve every target expression to the resource it denotes. Until
+ * then, Phase 5 inspection of the synthesized template and deployed triggers covers it.
  */
 export function referencesLogicalId(value: unknown, logicalId: string): boolean {
   if (typeof value === 'string') {
