@@ -65,17 +65,12 @@ describe('every production trigger invokes the alias', () => {
     expect(uri).not.toContain(functionId);
   });
 
-  test('nothing references the unqualified function except its version, alias, log retention, and the dormant rollback guards', () => {
+  test('nothing references the unqualified function except its version, alias, and log retention', () => {
     // `$LATEST` would be reached through the function's own Ref/Arn, in any form (Ref,
-    // Fn::GetAtt, Fn::Sub); an event source, rule target, integration or other permission
-    // naming it would bypass the alias. The Revision 6 rollback guards are the only allowed
-    // bare-function permissions, and they authorize but never trigger an invocation.
-    const referencing = resourcesReferencing(resources, functionId);
-    const guards = referencing.filter(id => id.startsWith('IngestionRollbackGuard'));
-    expect(guards).toHaveLength(8);
-    for (const id of guards) expect(resources[id].Type).toBe('AWS::Lambda::Permission');
-    expect(referencing.filter(id => !guards.includes(id)).map(id => resources[id].Type).sort())
-      .toEqual(['AWS::Lambda::Alias', 'AWS::Lambda::Version', 'Custom::LogRetention']);
+    // Fn::GetAtt, Fn::Sub); an event source, rule target, integration or permission naming
+    // it would bypass the alias.
+    const referencing = resourcesReferencing(resources, functionId).map(id => resources[id].Type);
+    expect(referencing.sort()).toEqual(['AWS::Lambda::Alias', 'AWS::Lambda::Version', 'Custom::LogRetention']);
     expect(ofType('AWS::Lambda::EventSourceMapping')).toEqual([]);
   });
 
@@ -99,16 +94,11 @@ describe('every production trigger invokes the alias', () => {
     expect(resourcesReferencing(mutated, fnId)).toEqual(expect.arrayContaining(['SubSchedule', 'SubSchedulePermission']));
   });
 
-  test('every active API Gateway invoke permission is on the alias; the only bare-function ones are the retained guards', () => {
+  test('every API Gateway invoke permission is on the alias, never the bare function', () => {
     const apigwPermissions = ofType('AWS::Lambda::Permission').filter(([, r]) => r.Properties?.Principal === 'apigateway.amazonaws.com');
-    const onAlias = apigwPermissions.filter(([, r]) => JSON.stringify(r.Properties?.FunctionName) === JSON.stringify({ Ref: aliasId }));
-    const onBareFunction = apigwPermissions.filter(([, r]) => JSON.stringify(r.Properties?.FunctionName) === JSON.stringify({ 'Fn::GetAtt': [functionId, 'Arn'] }));
-    // Active: 7 HTTP routes + 2 REST (stage and test-invoke) per-route permissions + 2 API-wide.
-    expect(onAlias).toHaveLength(11);
-    // Dormant: one retained rollback guard per production method/path (rollback-guards.test.ts).
-    expect(onBareFunction.map(([id]) => id).every(id => id.startsWith('IngestionRollbackGuard'))).toBe(true);
-    expect(onBareFunction).toHaveLength(8);
-    expect(onAlias.length + onBareFunction.length).toBe(apigwPermissions.length);
+    // 7 HTTP routes + 2 REST (stage and test-invoke) per-route permissions + 2 API-wide.
+    expect(apigwPermissions).toHaveLength(11);
+    for (const [, r] of apigwPermissions) expect(r.Properties?.FunctionName).toEqual({ Ref: aliasId });
   });
 });
 
