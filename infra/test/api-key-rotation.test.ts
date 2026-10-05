@@ -219,7 +219,9 @@ describe('no deploy is ever blocked by a stale rotation', () => {
 
   test('synth succeeds for every shape of deploy while alpha is long overdue, and never reads the clock', () => {
     // Far past any alert target. Synth checks registry shape, not age.
-    jest.useFakeTimers({ now: new Date('2031-01-01T00:00:00Z'), doNotFake: ['nextTick', 'setImmediate', 'setTimeout', 'setInterval', 'queueMicrotask'] });
+    // Fake only the clock. Each set*/clear* pair stays real together: faking clear* alone left
+    // clearTimeout/clearInterval/clearImmediate undefined after useRealTimers, hanging later SDK calls.
+    jest.useFakeTimers({ now: new Date('2031-01-01T00:00:00Z'), doNotFake: ['nextTick', 'setImmediate', 'clearImmediate', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'queueMicrotask'] });
     const deploys: [string, unknown, unknown][] = [
       ['unrelated stack fix / shared Lambda asset change with alpha overdue in overlap', OVERLAP_A_TO_B, STEADY_A],
       ['beta rotation while alpha is overdue', OVERLAP_A_TO_B, OVERLAP_A_TO_B],
@@ -333,12 +335,16 @@ describe('daily rotation checker: deployed entry point and complete permission s
     const originalEnv = process.env;
     const topic = 'arn:aws:sns:us-east-1:123456789012:entry-point-test';
     const info = jest.spyOn(console, 'info').mockImplementation(() => undefined);
+    let limit: NodeJS.Timeout | undefined;
     try {
       process.env = { ...awsEnvFor(endpoint.url), ROTATION_ALERT_TOPIC_ARN: topic };
       endpoint.getApiKeys = () => apiKeysPage(registered.map((id, i) => ({
         id: `key${i}`, name: `particle-ingestion-${id}-b`, enabled: true, createdDate: epochSeconds('2026-09-01T00:00:00Z'), value: 'must-not-cross',
       })));
-      await configured();
+      // A hang fails here, inside the try, well before Jest's own timeout, so the finally always runs.
+      await Promise.race([configured(), new Promise<never>((_, reject) => {
+        limit = setTimeout(() => reject(new Error('checker did not finish within 10 s')), 10_000);
+      })]);
       expect(endpoint.requests.filter(r => r.path === '/apikeys').map(r => r.query)).toEqual([{ includeValues: 'false', limit: '500' }]);
       const published = endpoint.requests.filter(r => r.form.Action === 'Publish');
       expect(published.map(r => r.form.TopicArn)).toEqual(registered.map(() => topic));
@@ -348,11 +354,12 @@ describe('daily rotation checker: deployed entry point and complete permission s
       })));
       expect(JSON.stringify([endpoint.requests, info.mock.calls])).not.toContain('must-not-cross');
     } finally {
+      clearTimeout(limit);
       process.env = originalEnv;
       info.mockRestore();
       await endpoint.close();
     }
-  });
+  }, 20_000);
 
   test('the whole template references the checker role only from the checker function and its one exact policy', () => {
     const role = ofType(t, 'AWS::IAM::Role')[roleId];
