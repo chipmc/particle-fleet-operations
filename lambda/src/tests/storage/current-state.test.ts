@@ -604,3 +604,33 @@ describe('DeviceCurrentState storage', () => {
     expect(command.constructor.name).not.toBe('ScanCommand');
   });
 });
+
+// Firmware v37 alert codes (Generalized-Core-Counter 85bd316): health comes from which code, not non-zero.
+describe('health status from the reported alert code', () => {
+  test.each([
+    [0, 'healthy'],
+    [14, 'critical'], [15, 'critical'], [16, 'critical'], [17, 'critical'],
+    [18, 'critical'], [20, 'critical'], [21, 'critical'], [23, 'critical'],
+    [19, 'watchdog_reset'],
+    [30, 'warning'], [31, 'warning'], [32, 'warning'], [40, 'warning'], [41, 'warning'],
+    [42, 'warning'], [43, 'warning'], [44, 'warning'], [45, 'warning'],
+  ])('alert %i reads %s', (code, expected) => {
+    expect(determineHealthStatus({ alertCount: code }, false)).toBe(expected);
+  });
+
+  test.each([22, 99, -1])('unmapped alert %i reads unknown, never healthy', code => {
+    expect(determineHealthStatus({ alertCount: code, battery: 90 }, false)).toBe('unknown');
+  });
+
+  it('a stale watchdog reset (19) is no longer critical', () => {
+    expect(determineHealthStatus({ alertCount: 19, battery: 80, connectTime: 5 }, false)).not.toBe('critical');
+  });
+
+  test.each([
+    ['battery 15', { battery: 15 }],
+    ['connectTime 400', { connectTime: 400 }],
+    ['severity ERROR', { severity: 'ERROR' as const }],
+  ])('alert 19 with %s still reads critical: the other critical inputs win', (_label, other) => {
+    expect(determineHealthStatus({ alertCount: 19, ...other }, false)).toBe('critical');
+  });
+});

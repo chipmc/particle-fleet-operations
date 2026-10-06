@@ -32,6 +32,7 @@ export async function handleFleetSummaryQuery(
     deviceCount: filtered.length,
     healthy: countStatus(filtered, 'healthy'),
     warning: countStatus(filtered, 'warning'),
+    watchdogReset: countStatus(filtered, 'watchdog_reset'),
     critical: countStatus(filtered, 'critical'),
     unknown: countStatus(filtered, 'unknown'),
     lowBatteryCount: filtered.filter(device => device.battery !== undefined && device.battery < 30).length,
@@ -51,7 +52,7 @@ export async function handleFleetAnomaliesQuery(
 ): Promise<FleetAnomaliesResponse> {
   const params = parseFleetParams(queryParameters);
   const devices = filterByStatus(await loadCurrentStates(params.projectId, params.limit), params.status)
-    .filter(device => device.anomalyCount > 0 || device.healthStatus === 'warning' || device.healthStatus === 'critical')
+    .filter(device => device.anomalyCount > 0 || device.healthStatus === 'warning' || device.healthStatus === 'watchdog_reset' || device.healthStatus === 'critical')
     .filter(device => isWithinHours(device.lastEventTime, params.hours))
     .sort(compareFleetRisk)
     .slice(0, params.limit);
@@ -135,8 +136,8 @@ function parsePositiveNumber(value: string | undefined, defaultValue: number, ma
 function parseStatus(status: string | undefined): DeviceHealthStatus | undefined {
   if (!status) return undefined;
   const normalized = status.toLowerCase();
-  if (!['healthy', 'warning', 'critical', 'unknown'].includes(normalized)) {
-    throw new Error(`Invalid status: ${status}. Must be one of healthy, warning, critical, unknown`);
+  if (!['healthy', 'warning', 'watchdog_reset', 'critical', 'unknown'].includes(normalized)) {
+    throw new Error(`Invalid status: ${status}. Must be one of healthy, warning, watchdog_reset, critical, unknown`);
   }
   return normalized as DeviceHealthStatus;
 }
@@ -163,7 +164,8 @@ function isOffline(timestamp: string, thresholdHours: number): boolean {
 
 function compareFleetRisk(a: DeviceCurrentState, b: DeviceCurrentState): number {
   const statusOrder: Record<DeviceHealthStatus, number> = {
-    critical: 4,
+    critical: 5,
+    watchdog_reset: 4,
     warning: 3,
     unknown: 2,
     healthy: 1,

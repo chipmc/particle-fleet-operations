@@ -318,7 +318,10 @@ endpoint does not scan the event-history table and does not read S3.
 - `projectId` (string, optional): Project identifier. Default: `generalized-core-counter`
 - `hours` (number, optional): Recent serial-error window. Default: 24
 - `limit` (number, optional): Max current-state items to query. Default: 100, Max: 1000
-- `status` (string, optional): Filter by `healthy`, `warning`, `critical`, or `unknown`
+- `status` (string, optional): Filter by `healthy`, `warning`, `watchdog_reset`, `critical`, or `unknown`
+
+`watchdog_reset` means the device's current alert code is 19 (firmware watchdog reset) and no
+battery, connect-time or ERROR condition marks it critical.
 
 **Example Request:**
 
@@ -335,6 +338,7 @@ curl -X GET "https://<api-url>/fleet/summary?projectId=generalized-core-counter&
   "deviceCount": 500,
   "healthy": 460,
   "warning": 30,
+  "watchdogReset": 0,
   "critical": 10,
   "unknown": 0,
   "lowBatteryCount": 4,
@@ -359,14 +363,14 @@ curl -X GET "https://<api-url>/fleet/summary?projectId=generalized-core-counter&
 
 ### 6. GET /fleet/anomalies
 
-Returns devices with current warning/critical health or compact recent
+Returns devices with current warning/watchdog_reset/critical health or compact recent
 anomalies from `DeviceCurrentState`.
 
 **Query Parameters:**
 - `projectId` (string, optional): Project identifier. Default: `generalized-core-counter`
 - `hours` (number, optional): Include devices with last events in this window. Default: 24
 - `limit` (number, optional): Max current-state items to query. Default: 100, Max: 1000
-- `status` (string, optional): Filter by `healthy`, `warning`, `critical`, or `unknown`
+- `status` (string, optional): Filter by `healthy`, `warning`, `watchdog_reset`, `critical`, or `unknown`
 
 **Example Response:**
 

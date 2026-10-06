@@ -335,18 +335,33 @@ function determineStateHealthStatus(
   return determineHealthStatus(state, resetCountIncreaseIgnored);
 }
 
+// Firmware v37 alert codes (Generalized-Core-Counter 85bd316, MyPersistentData.cpp:852-893).
+// Health follows which code is reported, not whether it is non-zero.
+const CRITICAL_ALERT_CODES = new Set([14, 15, 16, 17, 18, 20, 21, 23]);
+const WARNING_ALERT_CODES = new Set([30, 31, 32, 40, 41, 42, 43, 44, 45]);
+
+function alertCodeHealthStatus(code: number): DeviceHealthStatus | undefined {
+  if (code === 0) return undefined; // no alert: the remaining inputs decide
+  if (CRITICAL_ALERT_CODES.has(code)) return 'critical';
+  if (code === 19) return 'watchdog_reset';
+  if (WARNING_ALERT_CODES.has(code)) return 'warning';
+  return 'unknown'; // unmapped code: never shown as healthy
+}
+
 function determineHealthStatus(
   state: Partial<DeviceCurrentState>,
   resetIncreased: boolean
 ): DeviceHealthStatus {
   if (
     (state.battery !== undefined && state.battery < 20) ||
-    (state.alertCount !== undefined && state.alertCount > 0) ||
     (state.connectTime !== undefined && state.connectTime > 300) ||
     state.severity === 'ERROR'
   ) {
     return 'critical';
   }
+
+  const alertStatus = state.alertCount === undefined ? undefined : alertCodeHealthStatus(state.alertCount);
+  if (alertStatus) return alertStatus;
 
   if (
     (state.battery !== undefined && state.battery < 30) ||

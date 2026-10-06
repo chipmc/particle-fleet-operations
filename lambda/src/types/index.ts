@@ -332,7 +332,7 @@ export interface AnomaliesResponse {
 /**
  * Phase 3: Fleet current-state types
  */
-export type DeviceHealthStatus = 'healthy' | 'warning' | 'critical' | 'unknown';
+export type DeviceHealthStatus = 'healthy' | 'warning' | 'watchdog_reset' | 'critical' | 'unknown';
 
 export interface CurrentStateAnomaly {
   severity: 'low' | 'medium' | 'high';
@@ -394,6 +394,7 @@ export interface FleetSummaryResponse {
   deviceCount: number;
   healthy: number;
   warning: number;
+  watchdogReset: number;
   critical: number;
   unknown: number;
   lowBatteryCount: number;
