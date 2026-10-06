@@ -17,6 +17,7 @@
 import { createHash, timingSafeEqual } from 'crypto';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import consumerRegistry from '../../config/ingestion-consumers.json';
+import { ConsumerApiKeyConfig, apiKeyConfigProblem, primaryKeyIdEnvVar, rotationKeyIdEnvVar } from './api-key-slots';
 
 export interface IngestionConsumer {
   id: string;
@@ -24,6 +25,7 @@ export interface IngestionConsumer {
   secretName: string;
   usagePlan: { ratePerSecond: number; burst: number };
   status: 'active' | 'inactive';
+  apiKey: ConsumerApiKeyConfig;
 }
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -35,7 +37,7 @@ const secretsManager = new SecretsManagerClient({});
 
 /** The real, active consumers from the checked-in registry -- production default. */
 export function activeConsumers(): IngestionConsumer[] {
-  return (consumerRegistry.consumers as IngestionConsumer[]).filter(c => c.status === 'active');
+  return (consumerRegistry.consumers as unknown as IngestionConsumer[]).filter(c => c.status === 'active');
 }
 
 /** Test-only: clears the in-memory secret cache so a test doesn't leak state into the next. */
@@ -62,6 +64,17 @@ function sha256(value: string): Buffer {
   return createHash('sha256').update(value, 'utf8').digest();
 }
 
+/**
+ * What one presented API key ID resolves to. `config-error` is scoped to the consumer(s)
+ * whose key-ID configuration is malformed: their known IDs answer 503, while every other
+ * consumer's IDs keep resolving normally. `unknown` keeps the existing pair-mismatch (401)
+ * behavior.
+ */
+export type ApiKeyLookupResult =
+  | { kind: 'consumer'; consumerId: string }
+  | { kind: 'config-error'; consumerIds: string[]; reason: string }
+  | { kind: 'unknown' };
+
 export type ConsumerAuthResult =
   | { outcome: 'success'; consumerId: string }
   | { outcome: 'failure'; reason: 'missing_secret' | 'invalid_secret' | 'credential_pair_mismatch' | 'credential_config_unavailable'; apiKeyConsumerId?: string };
@@ -81,7 +94,7 @@ export type ConsumerAuthResult =
 export async function validateConsumerRequest(
   providedSecret: string | undefined,
   apiKeyId: string | undefined,
-  apiKeyIdToConsumerId: (apiKeyId: string) => string | undefined,
+  lookupApiKey: (apiKeyId: string) => ApiKeyLookupResult,
   consumers: IngestionConsumer[] = activeConsumers()
 ): Promise<ConsumerAuthResult> {
   if (!providedSecret) {
@@ -107,9 +120,13 @@ export async function validateConsumerRequest(
     }
   }
 
-  if (matchedConsumerIds.length === 0) {
-    return { outcome: 'failure', reason: 'invalid_secret', apiKeyConsumerId: apiKeyId ? apiKeyIdToConsumerId(apiKeyId) : undefined };
-  }
+  // Resolved only after every candidate has been compared, so a misconfigured or unknown
+  // key does not shorten the comparison loop above.
+  const keyResult: ApiKeyLookupResult = apiKeyId ? lookupApiKey(apiKeyId) : { kind: 'unknown' };
+  const apiKeyConsumerId = keyResult.kind === 'consumer'
+    ? keyResult.consumerId
+    : keyResult.kind === 'config-error' && keyResult.consumerIds.length === 1 ? keyResult.consumerIds[0] : undefined;
+
   if (matchedConsumerIds.length > 1) {
     // Two active consumers configured with the same secret value -- a deployment/
     // configuration error (the registry's own schema validation rejects duplicate
@@ -118,9 +135,18 @@ export async function validateConsumerRequest(
     console.error(JSON.stringify({ event: 'consumer_auth_duplicate_secret', consumerIds: matchedConsumerIds }));
     return { outcome: 'failure', reason: 'credential_config_unavailable' };
   }
+  if (keyResult.kind === 'config-error') {
+    // This key belongs to a consumer whose key-ID configuration is malformed (e.g. a
+    // declared rotation with no secondary ID). 503 for that consumer only; other consumers'
+    // keys never resolve to this result. Logs IDs and a fixed reason, never a credential.
+    console.error(JSON.stringify({ event: 'consumer_auth_api_key_config_error', consumerIds: keyResult.consumerIds, reason: keyResult.reason, apiKeyId }));
+    return { outcome: 'failure', reason: 'credential_config_unavailable', apiKeyConsumerId };
+  }
+  if (matchedConsumerIds.length === 0) {
+    return { outcome: 'failure', reason: 'invalid_secret', apiKeyConsumerId };
+  }
 
   const secretConsumerId = matchedConsumerIds[0];
-  const apiKeyConsumerId = apiKeyId ? apiKeyIdToConsumerId(apiKeyId) : undefined;
   if (!apiKeyConsumerId || apiKeyConsumerId !== secretConsumerId) {
     return { outcome: 'failure', reason: 'credential_pair_mismatch', apiKeyConsumerId };
   }
@@ -129,23 +155,58 @@ export async function validateConsumerRequest(
 }
 
 /**
- * Non-secret API-key-ID-to-consumer-ID mapping, derived from the same registry. API key
+ * Non-secret API-key-ID-to-consumer mapping, derived from the same registry. API key
  * IDs are not sensitive (they identify a key, not its value), so this is safe to bundle
  * at build time same as the rest of the registry -- but the mapping from a *specific*
  * API Gateway-assigned key ID to a consumer ID isn't in the registry file itself (that ID
  * only exists after CDK creates the ApiKey resource), so it's supplied via environment
- * variables at deploy time instead, one per active consumer:
- * INGESTION_API_KEY_ID_<CONSUMER_ID_UPPER_SNAKE> = <api key id>.
+ * variables at deploy time instead, per active consumer:
+ * INGESTION_API_KEY_ID_<CONSUMER_ID_UPPER_SNAKE> = <primary slot's key id>, plus, only
+ * while the registry declares a rotation,
+ * INGESTION_API_KEY_ROTATION_ID_<CONSUMER_ID_UPPER_SNAKE> = <secondary slot's key id>.
+ *
+ * Each consumer is validated independently. A malformed one maps only its own known IDs to
+ * `config-error`; it never throws or discards the rest of the map. An ID claimed by two
+ * consumers is `config-error` for both, never resolved by registry order. There is no
+ * deadline here: an old key keeps resolving until cleanup removes its ID, and API Gateway,
+ * not this Lambda's clock, rejects a disabled key.
  */
 export function buildApiKeyConsumerLookup(
   env: NodeJS.ProcessEnv,
   consumers: IngestionConsumer[] = activeConsumers()
-): (apiKeyId: string) => string | undefined {
-  const byApiKeyId = new Map<string, string>();
+): (apiKeyId: string) => ApiKeyLookupResult {
+  const claimsByApiKeyId = new Map<string, { consumerId: string; problem?: string }[]>();
   for (const consumer of consumers) {
-    const envVarName = `INGESTION_API_KEY_ID_${consumer.id.toUpperCase().replace(/-/g, '_')}`;
-    const apiKeyId = env[envVarName];
-    if (apiKeyId) byApiKeyId.set(apiKeyId, consumer.id);
+    const primaryId = env[primaryKeyIdEnvVar(consumer.id)] || undefined;
+    const secondaryId = env[rotationKeyIdEnvVar(consumer.id)] || undefined;
+    let problem = apiKeyConfigProblem(consumer.apiKey);
+    if (!problem) {
+      const isRotationDeclared = consumer.apiKey.rotation !== undefined;
+      if (isRotationDeclared && !secondaryId) problem = 'missing_secondary_key_id';
+      else if (isRotationDeclared && !primaryId) problem = 'missing_primary_key_id';
+      else if (!isRotationDeclared && secondaryId) problem = 'undeclared_secondary_key_id';
+      else if (primaryId && primaryId === secondaryId) problem = 'secondary_key_id_equals_primary';
+    }
+    // An ID that was never supplied can't be attributed to anyone, so it stays unknown;
+    // whichever of this consumer's IDs *are* known carry the problem.
+    for (const knownId of new Set([primaryId, secondaryId])) {
+      if (!knownId) continue;
+      const claims = claimsByApiKeyId.get(knownId) ?? [];
+      claims.push({ consumerId: consumer.id, problem });
+      claimsByApiKeyId.set(knownId, claims);
+    }
   }
-  return (apiKeyId: string) => byApiKeyId.get(apiKeyId);
+
+  const byApiKeyId = new Map<string, ApiKeyLookupResult>();
+  for (const [apiKeyId, claims] of claimsByApiKeyId) {
+    const consumerIds = [...new Set(claims.map(claim => claim.consumerId))];
+    if (consumerIds.length > 1) {
+      byApiKeyId.set(apiKeyId, { kind: 'config-error', consumerIds, reason: 'duplicate_api_key_id' });
+    } else if (claims[0].problem) {
+      byApiKeyId.set(apiKeyId, { kind: 'config-error', consumerIds, reason: claims[0].problem });
+    } else {
+      byApiKeyId.set(apiKeyId, { kind: 'consumer', consumerId: consumerIds[0] });
+    }
+  }
+  return (apiKeyId: string) => byApiKeyId.get(apiKeyId) ?? { kind: 'unknown' };
 }

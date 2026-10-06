@@ -41,7 +41,7 @@ describe('handleIngestion auth dispatch to consumer-auth.ts', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env = { ...originalEnv };
-    mockBuildApiKeyConsumerLookup.mockReturnValue(() => undefined);
+    mockBuildApiKeyConsumerLookup.mockReturnValue(() => ({ kind: 'unknown' }));
     mockStoreRawEvent.mockResolvedValue();
     mockIndexEvent.mockResolvedValue();
     mockGetCurrentState.mockResolvedValue(null);

@@ -24,11 +24,21 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
-import { loadIngestionConsumerRegistry, DEFAULT_INGESTION_CONSUMER_REGISTRY_PATH } from './ingestion-consumers';
+import {
+  ApiKeySlot,
+  apiKeySlotName,
+  loadIngestionConsumerRegistry,
+  DEFAULT_INGESTION_CONSUMER_REGISTRY_PATH,
+} from './ingestion-consumers';
 import * as path from 'path';
 
+export interface InfraStackProps extends cdk.StackProps {
+  /** Test seam: synthesize against another registry file. Defaults to config/ingestion-consumers.json. */
+  ingestionConsumerRegistryPath?: string;
+}
+
 export class InfraStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props?: InfraStackProps) {
     super(scope, id, props);
 
     // =========================================================================
@@ -755,7 +765,8 @@ export class InfraStack extends cdk.Stack {
     // Adding a consumer is a registry entry + a pre-created Secrets Manager secret, not a
     // CDK code change. Schema validation (duplicate ids/secretNames, invalid throttle
     // values) runs here, at synth time, so a bad registry fails `cdk synth` outright.
-    const ingestionConsumers = loadIngestionConsumerRegistry(DEFAULT_INGESTION_CONSUMER_REGISTRY_PATH);
+    const ingestionConsumers = loadIngestionConsumerRegistry(
+      props?.ingestionConsumerRegistryPath ?? DEFAULT_INGESTION_CONSUMER_REGISTRY_PATH);
     for (const consumer of ingestionConsumers) {
       const consumerPascalId = consumer.id.replace(/(^|-)([a-z0-9])/g, (_match, _sep, char) => char.toUpperCase());
 
@@ -769,11 +780,6 @@ export class InfraStack extends cdk.Stack {
         this, `IngestionConsumer${consumerPascalId}Secret`, consumer.secretName);
       consumerSecret.grantRead(ingestionFunction);
 
-      const consumerApiKey = new apigateway.ApiKey(this, `IngestionConsumer${consumerPascalId}ApiKey`, {
-        apiKeyName: `particle-ingestion-${consumer.id}`,
-        description: `API key for ingestion consumer: ${consumer.displayName} (${consumer.id})`,
-        enabled: consumer.status === 'active',
-      });
       const consumerUsagePlan = new apigateway.UsagePlan(this, `IngestionConsumer${consumerPascalId}UsagePlan`, {
         name: `particle-ingestion-${consumer.id}`,
         throttle: {
@@ -782,16 +788,114 @@ export class InfraStack extends cdk.Stack {
         },
         apiStages: [{ api: ingestionRestApi, stage: ingestionRestApi.deploymentStage }],
       });
-      consumerUsagePlan.addApiKey(consumerApiKey);
+
+      // Two stable key slots per consumer (WO-2026-09-30-001). Normally only the primary
+      // slot exists; during a rotation the registry also declares the other slot, and both
+      // keys stay attached to the same usage plan until cleanup. Slots alternate across
+      // rotations: promoting slot b keeps its resource and deletes slot a; nothing is ever
+      // renamed, because renaming a logical ID would create the new key and delete the old
+      // one in the same deploy. Slot a keeps the construct ID every consumer's key had
+      // before slots existed, so rolling the mechanism out replaces no key. Each usage-plan
+      // association's logical ID is derived from its own key's construct path
+      // (APIGATEWAY_USAGEPLANKEY_ORDERINSENSITIVE_ID), so adding or removing one slot never
+      // renames the other's association -- infra.test.ts pins this.
+      const { primarySlot, rotation } = consumer.apiKey;
+      const keyIdBySlot = new Map<ApiKeySlot, string>();
+      for (const slot of ['a', 'b'] as const) {
+        if (slot !== primarySlot && slot !== rotation?.secondarySlot) continue;
+        const slotApiKey = new apigateway.ApiKey(
+          this,
+          slot === 'a' ? `IngestionConsumer${consumerPascalId}ApiKey` : `IngestionConsumer${consumerPascalId}ApiKeyB`,
+          {
+            apiKeyName: apiKeySlotName(consumer.id, slot),
+            description: slot === 'a'
+              ? `API key for ingestion consumer: ${consumer.displayName} (${consumer.id})`
+              : `API key for ingestion consumer: ${consumer.displayName} (${consumer.id}), slot b`,
+            // old-disabled: API Gateway, not the Lambda, rejects the old key from here on.
+            enabled: consumer.status === 'active' && !(rotation?.phase === 'old-disabled' && slot === primarySlot),
+          });
+        consumerUsagePlan.addApiKey(slotApiKey);
+        keyIdBySlot.set(slot, slotApiKey.keyId);
+      }
 
       // API key IDs are not sensitive (they identify a key, not its value) -- safe as a
       // plain environment variable. This is how consumer-auth.ts cross-checks "the secret
       // matched consumer X" against "the API key belongs to consumer X" without needing
       // its own separate config file (the ApiKey resource's ID only exists after CDK
-      // creates it, so it can't live in the static registry alongside the rest).
-      const apiKeyEnvVarName = `INGESTION_API_KEY_ID_${consumer.id.toUpperCase().replace(/-/g, '_')}`;
-      ingestionFunction.addEnvironment(apiKeyEnvVarName, consumerApiKey.keyId);
+      // creates it, so it can't live in the static registry alongside the rest). The
+      // primary variable keeps its pre-slot name and follows whichever slot is primary.
+      const envSuffix = consumer.id.toUpperCase().replace(/-/g, '_');
+      ingestionFunction.addEnvironment(`INGESTION_API_KEY_ID_${envSuffix}`, keyIdBySlot.get(primarySlot)!);
+      if (rotation) {
+        ingestionFunction.addEnvironment(`INGESTION_API_KEY_ROTATION_ID_${envSuffix}`, keyIdBySlot.get(rotation.secondarySlot)!);
+      }
     }
+
+    // =========================================================================
+    // Ingestion API key rotation checker (WO-2026-09-30-001)
+    // =========================================================================
+
+    // Alert-only safeguard against a forgotten rotation. Nothing here rejects a request or
+    // blocks a deploy: deploys stay plain `cdk deploy`, and after an alert Chip decides
+    // whether to resume, roll back, or clean up. Its own topic, not the monthly-archive
+    // one, so rotation alerts are a distinct channel.
+    const apiKeyRotationTopic = new sns.Topic(this, 'IngestionApiKeyRotationNotifications', {
+      displayName: 'Particle ingestion API key rotation',
+    });
+    apiKeyRotationTopic.addSubscription(new subscriptions.EmailSubscription('chip@seeinsights.com'));
+
+    const apiKeyRotationChecker = new NodejsFunction(this, 'IngestionApiKeyRotationCheckerFunction', {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: 'handler',
+      entry: path.join(__dirname, '../../lambda/src/rotation-checker/handler.ts'),
+      timeout: Duration.minutes(1),
+      memorySize: 256,
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      bundling: {
+        minify: false,
+        sourceMap: true,
+        target: 'es2022',
+        externalModules: [],
+        forceDockerBundling: false,
+      },
+      depsLockFilePath: path.join(__dirname, '../../lambda/package-lock.json'),
+      projectRoot: path.join(__dirname, '../../lambda'),
+      environment: {
+        ROTATION_ALERT_TOPIC_ARN: apiKeyRotationTopic.topicArn,
+      },
+    });
+    apiKeyRotationTopic.grantPublish(apiKeyRotationChecker);
+    // GetApiKeys only: the checker's one API call (GET /apikeys, includeValues=false) returns
+    // id, name, enabled and createdDate per key, so neither /apikeys/* (GetApiKey) nor
+    // /usageplans/* (GetUsagePlanKeys, which returns values) is granted. IAM cannot limit this
+    // grant to includeValues=false; what keeps values out is the checker's metadata adapter
+    // (lambda/src/rotation-checker/metadata-adapter.ts), its boundary tests, and review --
+    // not this policy (design Revision 5).
+    apiKeyRotationChecker.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['apigateway:GET'],
+      resources: [
+        this.formatArn({ service: 'apigateway', account: '', resource: '/apikeys', arnFormat: cdk.ArnFormat.NO_RESOURCE_NAME }),
+      ],
+    }));
+    // No Lambda-level retries: a retried run after a partial publish would send a second
+    // copy of the same day's alerts. A failed run surfaces through the Errors alarm instead.
+    apiKeyRotationChecker.configureAsyncInvoke({ retryAttempts: 0 });
+
+    new events.Rule(this, 'IngestionApiKeyRotationCheckSchedule', {
+      schedule: events.Schedule.cron({ minute: '0', hour: '9' }),
+      targets: [new eventTargets.LambdaFunction(apiKeyRotationChecker)],
+    });
+
+    const apiKeyRotationCheckerErrorsAlarm = new cloudwatch.Alarm(this, 'IngestionApiKeyRotationCheckerErrorsAlarm', {
+      metric: apiKeyRotationChecker.metricErrors({ period: Duration.minutes(5) }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      alarmDescription: 'The daily ingestion API key rotation checker failed (key metadata read, alert publish, or execution error). Overdue-rotation alerts may not have been sent -- check its logs.',
+    });
+    apiKeyRotationCheckerErrorsAlarm.addAlarmAction(new cloudwatchActions.SnsAction(apiKeyRotationTopic));
 
     // =========================================================================
     // CloudFormation Outputs
