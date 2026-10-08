@@ -1,10 +1,18 @@
 /**
  * Production-handler fixture (WO-2026-09-30-001 design, Revision 5). Runs the exported
- * `handler` -- real adapter, core, and emitters, real bundled registry, real SDK clients --
- * against a local fake API Gateway/SNS endpoint. Every registered consumer is given its own
- * key state that yields exactly one attributable event, so a handler that skips any consumer,
- * publishes to the wrong topic, or uses the wrong clock fails here.
+ * `handler` -- real adapter, core, and emitters, real SDK clients -- against a local fake
+ * API Gateway/SNS endpoint. It does not use the real bundled registry: the jest.mock below
+ * gives the handler and this test the real consumer IDs, each in steady state, so the
+ * expectations hold in any rotation state of the checked-in file. The real registry and
+ * bundle run in infra/test/api-key-rotation.test.ts's deployed-entry-point test. Every
+ * registered consumer is given its own key state that yields exactly one attributable event,
+ * so a handler that skips any consumer, publishes to the wrong topic, or uses the wrong clock
+ * fails here.
  */
+jest.mock('../../../../config/ingestion-consumers.json', () => {
+  const real = jest.requireActual('../../../../config/ingestion-consumers.json');
+  return { ...real, consumers: real.consumers.map((c: object) => ({ ...c, apiKey: { primarySlot: 'a' } })) };
+});
 import consumerRegistry from '../../../../config/ingestion-consumers.json';
 import { CHECKER_FAILED_MESSAGE, handler } from '../../rotation-checker/handler';
 import * as core from '../../rotation-checker/rotation-core';

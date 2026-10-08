@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import { InfraStack } from '../lib/infra-stack';
@@ -236,17 +238,22 @@ test('custom domain has exactly one base path mapping, to the ingestion REST API
 	});
 });
 
-test('registry-driven per-consumer resources: one API key and usage plan per registered consumer, throttled per its own numbers', () => {
+test('registry-driven per-consumer resources: one API key per declared slot and one usage plan per registered consumer, throttled per its own numbers', () => {
 	const synthesized = template();
-	synthesized.resourceCountIs('AWS::ApiGateway::ApiKey', 2);
-	synthesized.hasResourceProperties('AWS::ApiGateway::ApiKey', {
-		Name: 'particle-ingestion-particle-cloud-webhook',
-		Enabled: true,
-	});
-	synthesized.hasResourceProperties('AWS::ApiGateway::ApiKey', {
-		Name: 'particle-ingestion-serial-forwarder',
-		Enabled: true,
-	});
+	// Expected keys are read from the checked-in registry file, with the slot naming and the
+	// old-disabled rule written out here, not taken from infra/lib: one key for the primary slot,
+	// one more for a declared secondary, and the primary disabled only in phase old-disabled.
+	type RegistryConsumer = { id: string; status: string; apiKey: { primarySlot: string; rotation?: { secondarySlot: string; phase: string } } };
+	const consumers: RegistryConsumer[] = JSON.parse(fs.readFileSync(path.join(__dirname, '../../config/ingestion-consumers.json'), 'utf8')).consumers;
+	const expectedKeys = consumers.flatMap(({ id, status, apiKey: { primarySlot, rotation } }) =>
+		[primarySlot, ...(rotation ? [rotation.secondarySlot] : [])].map(slot => ({
+			Name: slot === 'a' ? `particle-ingestion-${id}` : `particle-ingestion-${id}-b`,
+			Enabled: status === 'active' && !(rotation?.phase === 'old-disabled' && slot === primarySlot),
+		})));
+	const byName = (x: { Name: string }, y: { Name: string }) => x.Name.localeCompare(y.Name);
+	const keys = Object.values(synthesized.findResources('AWS::ApiGateway::ApiKey'))
+		.map(key => ({ Name: key.Properties.Name, Enabled: key.Properties.Enabled }));
+	expect(keys.sort(byName)).toEqual(expectedKeys.sort(byName));
 	synthesized.hasResourceProperties('AWS::ApiGateway::UsagePlan', {
 		UsagePlanName: 'particle-ingestion-particle-cloud-webhook',
 		Throttle: { RateLimit: 100, BurstLimit: 500 },
@@ -255,7 +262,7 @@ test('registry-driven per-consumer resources: one API key and usage plan per reg
 		UsagePlanName: 'particle-ingestion-serial-forwarder',
 		Throttle: { RateLimit: 10, BurstLimit: 50 },
 	});
-	synthesized.resourceCountIs('AWS::ApiGateway::UsagePlanKey', 2);
+	synthesized.resourceCountIs('AWS::ApiGateway::UsagePlanKey', expectedKeys.length);
 });
 
 test('ingestion function IAM policy grants per-consumer secretsmanager:GetSecretValue scoped to each consumer secret ARN, never a wildcard', () => {
