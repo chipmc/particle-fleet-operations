@@ -19,7 +19,7 @@ Responsibilities:
 * Priority setting
 * Acceptance of architectural changes
 * Determination of production readiness
-* Chatty may propose implementation patterns and review diffs, but should not author large repo changes unless explicitly requested by Chip.
+* The architect may propose implementation patterns and review diffs, but should not author large repo changes unless explicitly requested by Chip.
 
 No AI agent may be considered the final approver of a change.
 
@@ -27,7 +27,7 @@ Claude Code in this repo acts only on dispatches from Chip or this repo's archit
 
 ⸻
 
-Chatty — Observability Architect
+Architect — Claude (app chat)
 
 Responsibilities:
 
@@ -99,6 +99,8 @@ Important boundary:
 
 The AWS agent may investigate and validate deployed infrastructure, but should not deploy destructive changes or modify IAM/security posture without Chip approval.
 
+AWS access in Claude Code sessions is administrator-level (IAM Identity Center permission set); read-only is enforced by discipline and permission prompts, not by the credentials.
+
 ⸻
 
 GitHub Copilot
@@ -117,21 +119,36 @@ GitHub Copilot should not make architecture-sensitive changes without prior revi
 
 Standard Workflow
 
-Phase 1 — Repository Investigation
+The stages match the firmware repository's workflow. Where fleet-ops differs, the stage says so.
 
-CODEX reviews particle-fleet-operations and local-serial-log-forwarder.
+Stage 1 — Intake
 
-Phase 2 — Deployed AWS Investigation
+The architect opens the Work Order: ID, problem, scope, and links to related work.
 
-AWS Agent reviews API Gateway, Lambda, S3, DynamoDB, CloudWatch, IAM, and CDK/CloudFormation state.
+Stage 2 — Evidence Collection
 
-Phase 3 — Architecture Review
+Claude Code, read-only, reviews particle-fleet-operations and local-serial-log-forwarder, and the
+deployed API Gateway, Lambda, S3, DynamoDB, CloudWatch, IAM, and CDK/CloudFormation state.
 
-Chatty reviews evidence and proposes schema, normalization, enrichment, and timeline model.
+Stage 3 — Preliminary Architecture
 
-Phase 4 — Implementation
+The architect, with Chip, reviews evidence and proposes schema, normalization, enrichment, and
+timeline model. Sol, via Copilot, reviews the architecture when the dispatch asks.
 
-Claude implements approved changes in repo branches.
+Stage 4 — Independent Investigation (optional)
+
+Codex, dispatched by Claude Code, reviews the evidence and proposal independently and returns its
+assessment, alternatives, missing evidence and a recommendation. The dispatch says whether this
+stage runs; when it is skipped, the dispatch says so and why.
+
+Stage 5 — Approval Gate
+
+Chip approves, revises, re-scopes or rejects the Work Order. The decision is recorded in the
+dispatch. No implementation begins before it.
+
+Stage 6 — Implementation
+
+The implementer named in the dispatch implements approved changes in repo branches.
 
 Every proposed change should be classified as:
 - additive
@@ -141,16 +158,25 @@ Every proposed change should be classified as:
 - security-sensitive
 - infrastructure-sensitive
 
-Escalation back to Phase 3
+Escalation back to Stage 3
 
 If two consecutive review rounds on the same implementation each surface a new defect in
 the same mechanism — not a different part of the change, the same one, just an adjacent
-gap the prior fix didn't close — stop patching narrowly and return to Phase 3 for a
+gap the prior fix didn't close — stop patching narrowly and return to Stage 3 for a
 holistic redesign of that mechanism, rather than continuing incremental fixes. This
 happened across the archival job's S3-lock-plus-failure-reporting mechanism: successive
 rounds each closed one gap and surfaced the next before it was named explicitly. The
 narrow-patch loop is itself the signal — it means the mechanism's design is the problem,
 not its latest bug.
+
+Stage 7 — Independent Verification
+
+Codex, dispatched by Claude Code, reviews the complete diff against the Work Order. The dispatch
+sets the scope of the review.
+
+Stage 8 — Final Gate and Deployment Review
+
+The architect reviews the verified diff and report. Then, before deployment:
 
 Security Gate — Required Before Deployment
 - no plaintext secrets
@@ -159,15 +185,13 @@ Security Gate — Required Before Deployment
 - no contract-breaking API/schema change
 - no destructive data operation
 
-Phase 5 — Deployment Review
+AWS Agent shows CDK diff / CloudFormation impact before deployment. Chip deploys.
 
-AWS Agent shows CDK diff / CloudFormation impact before deployment.
+Stage 9 — Validation, Release and Feedback
 
-Phase 6 — Validation
-
-Chip validates behavior using AWS logs, S3, DynamoDB queries, and Pi/device soak logs.
-
-Phase 7 — Cleanup / Documentation
+Chip validates behavior using AWS logs, S3, DynamoDB queries, and Pi/device soak logs. Then the PR
+records the deployed state and Chip merges it. Fleet-ops merges after deploying so that main
+follows production, because a rollback after a merge is awkward; the firmware merges first.
 
 Claude updates README, architecture docs, runbooks, and removes temporary diagnostics.
 
