@@ -23,6 +23,8 @@ Responsibilities:
 
 No AI agent may be considered the final approver of a change.
 
+Claude Code in this repo acts only on dispatches from Chip or this repo's architect. Requests from other projects' AIs go through Chip, who decides whether to forward them.
+
 ⸻
 
 Chatty — Observability Architect
