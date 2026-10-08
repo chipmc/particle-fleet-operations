@@ -98,7 +98,10 @@ const associationsFor = (t: Template, keyLogicalId: string) =>
 describe('mechanism rollout on the checked-in registry replaces nothing', () => {
   test('slot a keeps the exact logical IDs recorded from a pre-change synth of main (a15734b)', () => {
     // Recorded independently, before any change, from `cdk synth` on main. Not derived here.
-    const t = synth();
+    // A steady-state fact: synthesize the checked-in consumers with no rotation, whatever state
+    // the checked-in file is in during a live rotation.
+    const checkedIn = JSON.parse(fs.readFileSync(path.join(__dirname, '../../config/ingestion-consumers.json'), 'utf8'));
+    const t = synth(writeRegistry(checkedIn.consumers.map((c: object) => ({ ...c, apiKey: STEADY_A })), checkedIn.schemaVersion));
     const keys = ofType(t, 'AWS::ApiGateway::ApiKey');
     expect(Object.keys(keys).sort()).toEqual([
       'IngestionConsumerParticleCloudWebhookApiKeyA4BA5483',
@@ -329,8 +332,8 @@ describe('daily rotation checker: deployed entry point and complete permission s
     expect(typeof configured).toBe('function');
 
     // Execute it against a local fake API Gateway/SNS, with the production registry the
-    // bundle carries: every registered consumer gets one key in the non-primary slot, so
-    // each must produce its own attributable inconsistency.
+    // bundle carries: every registered consumer gets only a key whose name matches neither of
+    // its slots, so in any rotation state each must produce its own no_keys inconsistency.
     const endpoint = await startFakeAwsEndpoint();
     const originalEnv = process.env;
     const topic = 'arn:aws:sns:us-east-1:123456789012:entry-point-test';
@@ -339,7 +342,7 @@ describe('daily rotation checker: deployed entry point and complete permission s
     try {
       process.env = { ...awsEnvFor(endpoint.url), ROTATION_ALERT_TOPIC_ARN: topic };
       endpoint.getApiKeys = () => apiKeysPage(registered.map((id, i) => ({
-        id: `key${i}`, name: `particle-ingestion-${id}-b`, enabled: true, createdDate: epochSeconds('2026-09-01T00:00:00Z'), value: 'must-not-cross',
+        id: `key${i}`, name: `particle-ingestion-${id}-retired`, enabled: true, createdDate: epochSeconds('2026-09-01T00:00:00Z'), value: 'must-not-cross',
       })));
       // A hang fails here, inside the try, well before Jest's own timeout, so the finally always runs.
       await Promise.race([configured(), new Promise<never>((_, reject) => {
@@ -349,8 +352,8 @@ describe('daily rotation checker: deployed entry point and complete permission s
       const published = endpoint.requests.filter(r => r.form.Action === 'Publish');
       expect(published.map(r => r.form.TopicArn)).toEqual(registered.map(() => topic));
       expect(published.map(r => JSON.parse(r.form.Message))).toEqual(registered.map((id, i) => ({
-        event: 'ingestion_api_key_rotation_inconsistency', consumerId: id, reason: 'only_key_is_not_primary_slot', keyCount: 1,
-        keys: [{ slot: 'b', enabled: true }],
+        event: 'ingestion_api_key_rotation_inconsistency', consumerId: id, reason: 'no_keys', keyCount: 0,
+        keys: [],
       })));
       expect(JSON.stringify([endpoint.requests, info.mock.calls])).not.toContain('must-not-cross');
     } finally {
@@ -457,9 +460,10 @@ describe('infra and Lambda agree on the slot naming convention', () => {
 describe('registry schema version 2 validation', () => {
   const load = (consumers: unknown[], schemaVersion = 2) => () => loadIngestionConsumerRegistry(writeRegistry(consumers, schemaVersion));
 
-  test('the checked-in registry is valid, with every consumer on slot a and no rotation', () => {
+  test('the checked-in registry is valid in whatever rotation state it is in, by the Lambda\'s own check too', () => {
+    // Which slots and phases are allowed is covered by the fixtures in this file, not by the live file.
     const real = loadIngestionConsumerRegistry(path.join(__dirname, '../../config/ingestion-consumers.json'));
-    expect(real.map(c => c.apiKey)).toEqual(real.map(() => ({ primarySlot: 'a' })));
+    expect(real.map(c => lambdaSlots.apiKeyConfigProblem(c.apiKey))).toEqual(real.map(() => undefined));
   });
 
   test('schema version 1 is rejected', () => {
