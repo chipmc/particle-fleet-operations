@@ -41,6 +41,7 @@ test('monthly archive is scheduled with deletion disabled', () => {
 		EvaluationPeriods: 7,
 		Threshold: 1,
 		TreatMissingData: 'notBreaching',
+		EvaluationWindow: { WallClockWindow: { Timezone: 'UTC' } },
 		Metrics: Match.arrayWith([
 			Match.objectLike({
 				Expression: 'IF(DATE(FILL(completed, 0)) <= 7, FILL(completed, 0), 1)',

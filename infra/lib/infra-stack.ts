@@ -505,6 +505,11 @@ export class InfraStack extends cdk.Stack {
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
       alarmDescription: 'No successful or partial monthly archive completion was recorded during days 1-7 of the month.',
     });
+    // Align daily buckets to midnight UTC (wall clock) so the 02:00 UTC day-1 run counts toward
+    // day 1; a sliding window put it in the previous day's bucket. CDK has no prop for this yet.
+    (missedArchiveAlarm.node.defaultChild as cloudwatch.CfnAlarm).addPropertyOverride('EvaluationWindow', {
+      WallClockWindow: { Timezone: 'UTC' },
+    });
     missedArchiveAlarm.addAlarmAction(new cloudwatchActions.SnsAction(archiveTopic));
 
     // -------------------------------------------------------------------------
