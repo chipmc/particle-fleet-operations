@@ -169,6 +169,11 @@ rounds each closed one gap and surfaced the next before it was named explicitly.
 narrow-patch loop is itself the signal — it means the mechanism's design is the problem,
 not its latest bug.
 
+A WO gets at most two review rounds (rule b). If the second round's verdict is NOT VERIFIED only
+on edge cases that are not regressions against main, the architect may accept them at Stage 8.
+The closing record then says "NOT VERIFIED, accepted by the architect" and gives the reason. Any
+new finding goes to docs/next-steps.md, not into a third round.
+
 Stage 7 — Independent Verification
 
 Codex, dispatched by Claude Code, reviews the complete diff against the Work Order. The dispatch
@@ -176,7 +181,8 @@ sets the scope of the review.
 
 Stage 8 — Final Gate and Deployment Review
 
-The architect reviews the verified diff and report. Then, before deployment:
+The architect reviews the verified diff and report. Claude Code then commits the verified
+implementation, pushes, and opens the PR (rule a). Then, before deployment:
 
 Security Gate — Required Before Deployment
 - no plaintext secrets
@@ -185,7 +191,8 @@ Security Gate — Required Before Deployment
 - no contract-breaking API/schema change
 - no destructive data operation
 
-AWS Agent shows CDK diff / CloudFormation impact before deployment. Chip deploys.
+AWS Agent shows CDK diff / CloudFormation impact before deployment. Chip deploys from that commit
+(rule j).
 
 Stage 9 — Validation, Release and Feedback
 
@@ -199,6 +206,38 @@ Also update docs/STYLE_GUIDE.md whenever a round surfaced a convention that was 
 written down. The guide's own maintenance rule is that "we had to rediscover this" is the
 trigger to add a line, not just to fix the immediate instance. A work order that produced
 a new rule is not finished until the rule is in the guide.
+
+Working Rules (adopted 7–8 October 2026)
+
+Copied from the firmware repo's AI_DEVELOPMENT_WORKFLOW.md, section 2 (rule a) and section 13
+(merged as d4b0300), with the fleet-ops differences written in. The letters match the firmware's.
+
+(a) Commits. Claude Code commits and pushes each WO's records (the WO file, dispatches, reports and
+verdicts) on the WO branch at the end of each stage, and the verified implementation when it opens
+the WO's PR after the architect's Stage 8. It never merges, deploys, or commits unverified source.
+Chip merges and deploys.
+(b) Small WOs. Every WO has one plain goal. Its default budget is at most +20 net lambda/src and
+infra/lib lines; tests and docs get their own stated budget. A larger budget needs Chip's approval
+in the dispatch. Over budget means stop and report. Review rounds: see Escalation back to Stage 3.
+(c) Step 0 before implementation. Claude Code re-checks every citation the WO relies on, searches
+the history (restoring old behaviour is the default fix), names every reader and writer the change
+touches, and gives a size estimate. Step 0 ends with STOP or PROCEED. It stops if the estimate is
+over budget, or if the fix needs a new stored field, schedule, alarm or config flag. The report is
+committed on the WO branch.
+(d) Narrow controller edits. Chip or the architect may pre-authorize Claude Code to make a one-line
+edit or deletion of the same kind as existing code. It doesn't count as a review round, it must
+land with a test run before Stage 7, and it is recorded in the closing record.
+(e) Models. The architect picks the tier by complexity, and Claude Code probes each model with a
+one-line call before every dispatch. Accepted models are recorded per tool with the date they were
+probed, not as permanent rules.
+(f) Communication. Chip talks mainly to the architect. Every architect update ends with a pasteable
+"Message for Claude Code" and a "Your focus" list of at most three items. Evidence and Step 0
+reports are at most 150 lines.
+(g) Tests. Each mutation must be caught by the check aimed at it.
+(h) Every verification step names its environment: production, disposable stack, or local.
+(i) Deploy in small increments, with an observation gate before the next.
+(j) Results count only from a fresh npm ci, and a deploy comes from the exact checkout and cdk.out
+that produced the reviewed diff.
 
 ⸻
 
