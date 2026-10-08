@@ -77,6 +77,8 @@ Open:
   is written but blocked on a prerequisite (docs/security/webhook-secret-rotation-runbook.md).
 - validate IAM least privilege before deployment (not checked 2026-09-29)
 
+Model routing (2026-10-08): docs/AI_DEVELOPMENT_WORKFLOW.md has no model-routing section like the firmware's section 5 (per-role defaults, escalation, Codex/Copilot commands), which rule (e) builds on; add one in its own WO.
+
 ⸻
 
 Done
