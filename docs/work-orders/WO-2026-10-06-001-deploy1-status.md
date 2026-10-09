@@ -49,7 +49,34 @@ From: Claude Code (claude-opus-5-5). To: architect. As of 2026-10-09 ~03:00 UTC.
 - **First paste:** the value Chip pasted carried a trailing CR. Particle rejected the webhook before sending: `Invalid character in header content ["x-api-key"]`.
 - **Effect:** no webhook traffic reached AWS from 02:40:37 UTC (the last `mqdbypomt7` request) to 02:54:59 UTC. Reports in that window were lost on the Particle side; the serial forwarder was unaffected.
 - **Fix:** Chip re-pasted without the CR. The first `mug6eyfk1l` request came at 02:54:59 UTC with status 200, and Chip confirmed from the Particle side that it is working.
+- **Detection:** the failing sends never reached AWS: no rejected requests, nothing on any webhook key from 02:40:37 to 02:54:59 UTC. AWS-side metrics therefore cannot detect a bad paste. The runbook step 4 check is the first 200 on the new key ID plus no delivery errors in the Particle integration log.
+- **Zero-use gate (architect):** runs from key a's last request, 2026-10-09 02:40:37.502 UTC; earliest close 2026-10-10 02:40:37 UTC.
 - **Key values:** no key value was read by Claude Code; `get-api-key --include-value` was never run by Claude Code.
+
+## Key b event-type evidence (interim, production, as of 2026-10-09 03:20 UTC)
+
+**Method.** The ingestion Lambda does not log API Gateway's request ID. Instead, the join is per Lambda request ID: the `ingestion_auth` line (`apiKeyId`) is matched to the `Stored Particle event` line (`eventName`) of the same invocation. Every key b invocation matched a stored event. The count of 7 equals key b's access-log count.
+
+| Time (UTC) | Lambda request ID | Event |
+|---|---|---|
+| 02:54:59.603 | bc6ad6c4-ff67-4641-92e4-7a59f60b547c | Ubidots-Sensor-Hook-v1 |
+| 02:55:01.546 | 8082a619-2edc-489d-8cca-0588460cff6e | Ubidots-Sensor-Hook-v1 |
+| 03:00:13.049 | 6fe76f7d-8582-43e7-bf2c-9cb7ae78ec5b | Ubidots-Sensor-Hook-v1 |
+| 03:00:18.106 | 0dfce693-24b1-4c97-8f09-0fb6a8b3d2ee | Ubidots-Sensor-Hook-v1 |
+| 03:00:23.586 | ea2debfd-8db0-4b4b-9ef4-dc326d0bb4b5 | Ubidots-Sensor-Hook-v1 |
+| 03:00:24.725 | 48185af8-3eb2-43f4-8e02-2c698c5849af | Ubidots-Sensor-Hook-v1 |
+| 03:00:26.013 | 067cea59-28ce-42cd-8f40-e0a27e92031a | Ubidots-Sensor-Hook-v1 |
+
+**Counts so far:**
+
+| Event | Key b | Key a, previous 7 days (last seen, UTC) |
+|---|---|---|
+| Ubidots-Sensor-Hook-v1 | 7 | 3298 (10-09 02:40:37) |
+| status | 0 | 151 (10-09 01:02:33) |
+| hibernate_wake | 0 | 22 (10-08 22:01:06) |
+| watchdog | 0 | 35 (10-08 23:00:20) |
+
+At key a's 7-day rates, all four types should appear on key b well inside the gate. The final evidence will be re-run before 2026-10-10 02:40:37 UTC.
 
 ## Checker runs
 
