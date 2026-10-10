@@ -8,7 +8,7 @@ From: Claude Code (claude-opus-5-5). To: architect. As of 2026-10-09 ~03:00 UTC.
 - **Cutover:** the Particle Cloud webhook now authenticates with key b (`mug6eyfk1l`).
 - **Key a:** `mqdbypomt7` is still enabled on plan fef2gk, as the overlap phase intends.
 - **PR #54:** open, not merged.
-- **Still outstanding:** the 2026-10-09 09:00 UTC checker run, then Chip's merge of PR #54.
+- **Still outstanding:** Chip's merge of PR #54, and deploy 2 (held for the architect's check). The zero-use gate on key a passed (0 requests in 24 h).
 
 ## Sequence
 
@@ -81,7 +81,23 @@ At key a's 7-day rates, all four types should appear on key b well inside the ga
 ## Checker runs
 
 - **2026-10-08 09:00 UTC** (before deploy 1): `consumersChecked: 2, overdue: [], inconsistencies: [], failure: null, publishFailures: 0`. No SNS publishes on either topic between 08:55 and 09:15 UTC.
-- **2026-10-09 09:00 UTC:** pending. This is the first run with the registry in overlap.
+- **2026-10-09 09:00 UTC** (first run with the registry in overlap): `consumersChecked: 2, overdue: [], inconsistencies: [], failure: null, publishFailures: 0`. No SNS publishes on the rotation topic between 08:55 and 09:15 UTC.
+
+## Key b event-type evidence (final, production, 2026-10-09 02:54:59 to 2026-10-10 02:30 UTC)
+
+**Method.** Same as the interim: each invocation's `ingestion_auth` line joined to its `Stored Particle event` line by Lambda request ID.
+
+| Event | Key b (`mug6eyfk1l`) | First (UTC) | First Lambda request ID |
+|---|---|---|---|
+| Ubidots-Sensor-Hook-v1 | 471 | 10-09 02:54:59.603 | `bc6ad6c4-ff67-4641-92e4-7a59f60b547c` |
+| status | 16 | 10-09 03:40:30.415 | `935239ab-936c-489b-b010-9b2c35912da5` |
+| hibernate_wake | 3 | 10-09 10:00:21.431 | `2212313e-4d0e-4925-b1ac-619ceed89391` |
+| watchdog | 1 | 10-10 00:00:44.530 | `a6ead7e5-8513-48de-8554-fd3725f6e35b` |
+
+- **Coverage:** all four event types the webhook carried on key a over the previous 7 days have now arrived on key b.
+- **Access log:** key b had 491 requests in the period, all 200 (the join's 491 = 471 + 16 + 3 + 1).
+- **Zero-use gate, key a (`mqdbypomt7`), 2026-10-09 02:40:37 to 2026-10-10 02:40:37 UTC:** 0 requests after its last request at 02:40:37.502 (the only key a entry in the access log since then is that request itself, 200). Checked at 02:41:57 UTC on Oct 10; the key is still enabled. In the same period the access log has key b 492 (all 200), serial forwarder 2,636 (all 200), and 3 requests with no key (403).
+- **Deploy 2:** not run; held for the architect's check.
 
 ## Commit contents (`0c7b0ae`, PR #54)
 
@@ -93,5 +109,5 @@ At key a's 7-day rates, all four types should appear on key b well inside the ga
 ## For the architect
 
 1. **Lesson for step 4 in future rotations:** have the operator copy the value with whitespace stripped (`… --query value --output text | tr -d '\r\n\t ' | pbcopy`), and confirm the first request on the new key ID within one reporting interval.
-2. **Merge:** Chip merges PR #54 after the 2026-10-09 09:00 UTC checker run and the live checks.
+2. **Merge:** the 2026-10-09 09:00 UTC checker run was clean (see Checker runs). Chip merges PR #54 after the live checks.
 3. **Retiring key a** (`mqdbypomt7`, ending the overlap) is the next phase and needs its own dispatch.
