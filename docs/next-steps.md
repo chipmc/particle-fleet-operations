@@ -30,6 +30,8 @@ Status (checked 2026-09-29): partial. Serial lines mentioning modem, ncp, cellul
 
 Near Term
 
+Repo hygiene (own WO): untrack lambda/dist and ignore the stray compiled .js/.d.ts files under lambda/src.
+
 Add operational dashboards
 
 Potential:
