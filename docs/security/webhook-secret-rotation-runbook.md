@@ -145,8 +145,10 @@ Key IDs are not sensitive. Use them for every check below. See the 2026-09-28 en
    ```
 2. **Add the second key (deploy 1).** Using the prerequisite mechanism, add a new key for the
    consumer on the same usage plan and map its ID to the consumer in the Lambda. The
-   `cdk diff` should show only: one new `ApiKey`, one new `UsagePlanKey`, and the Lambda
-   environment change. Deploy. Then confirm both keys are on the plan, without values:
+   `cdk diff` should show only: one new `ApiKey`, one new `UsagePlanKey`, the Lambda
+   environment change, a new Lambda Version with the prod alias moving to it, and the
+   ingestion and checker code assets (registry content only). Deploy. Then confirm both keys
+   are on the plan, without values:
    ```bash
    aws apigateway get-usage-plan-keys --usage-plan-id <plan-id> \
      --query 'items[].[id,name]' --output text
@@ -154,14 +156,17 @@ Key IDs are not sensitive. Use them for every check below. See the 2026-09-28 en
 3. **Copy the new key value (operator only).** In your own terminal, not an agent session:
    ```bash
    aws apigateway get-api-key --api-key <new-key-id> --include-value \
-     --query value --output text | pbcopy
+     --query value --output text | tr -d '\r\n' | pbcopy
    ```
 4. **Update each client, one at a time.** For `particle-cloud-webhook`, edit the `x-api-key`
    header on each of the six Particle Console webhooks. For `serial-forwarder`, update
    `AWS_API_KEY` in `/etc/serial-forwarder.env` and restart the service. Both keys are
    accepted throughout, so there is no gap between edits. After each client, confirm that
    requests with the new key ID return 200 in the access log (query in step 5, with the new
-   ID). Clear the clipboard when done.
+   ID). Clear the clipboard when done. A bad paste (for example a trailing CR) makes Particle
+   reject the webhook before sending, so nothing reaches AWS and AWS-side metrics cannot
+   detect it: the check is the first 200 on the new key ID plus no delivery errors in the
+   Particle integration log.
 5. **Confirm the old key is no longer used.** In `IngestionRestApiAccessLogs`, over at least
    24 hours after the last client was updated (longer if any client publishes less than
    daily):
@@ -175,7 +180,9 @@ Key IDs are not sensitive. Use them for every check below. See the 2026-09-28 en
    the old key is what shows all six were updated.
 6. **Disable the old key (deploy 2), then delete it (deploy 3).** Disable first
    (`enabled: false`) and watch for 24 hours: a client still sending it now gets 403, which
-   shows in the access log. Re-enabling is the rollback at this stage. Then remove the old
+   shows in the access log. Not verified (rotation of 2026-10): whether that 403 logs the old
+   key ID or `-`. No deliberate old-key request is sent, because it needs `--include-value`.
+   Re-enabling is the rollback at this stage. Then remove the old
    key and its ID mapping, and confirm the `cdk diff` removes only those.
 7. **Update this document.** Add an incident-history entry if the rotation followed an
    exposure, and note the new key ID wherever the old one is referenced.

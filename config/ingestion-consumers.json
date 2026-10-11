@@ -14,7 +14,7 @@
         "primarySlot": "a",
         "rotation": {
           "secondarySlot": "b",
-          "phase": "overlap"
+          "phase": "old-disabled"
         }
       }
     },
