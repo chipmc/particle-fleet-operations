@@ -6,7 +6,7 @@ From: Claude Code (claude-opus-5-5). To: architect. Opened 2026-10-10.
 
 - **Change:** `config/ingestion-consumers.json`, particle-cloud-webhook `rotation.phase` `"overlap"` → `"old-disabled"` (1 line changed, 0 net).
 - **Effect:** API Gateway disables the primary slot's key, slot a (`mqdbypomt7`). Key b (`mug6eyfk1l`) stays enabled (`infra/lib/infra-stack.ts:819-820`).
-- **Status:** deployed 2026-10-10 09:19:41 to 09:20:06 UTC and verified (below). The 24-hour watch is running.
+- **Status:** deployed 2026-10-10 09:19:41 to 09:20:06 UTC, verified, and the 24-hour watch passed (below).
 
 ## Pre-deploy (local unless stated)
 
@@ -54,7 +54,22 @@ From: Claude Code (claude-opus-5-5). To: architect. Opened 2026-10-10.
   - No key a request since the deploy (checked to 09:22:43 UTC).
 - **Deploy window:** no request on any key inside 09:19:41 to 09:20:06. Not exercised live, as expected (see the notes above).
 
-## 24-hour watch (pending)
+## 24-hour watch (production, 2026-10-10 09:20:06 to 2026-10-11 09:20:06 UTC; checked 2026-10-11 13:22 UTC)
 
-- Key b and the serial key keep returning 200s; key a stays at 0 requests.
-- Whether a disabled-key request logs the old key ID or `-` in the access log. A deliberate key a request will be sent only if Chip agrees; no key value is printed.
+| Access log | Requests | Status |
+|---|---|---|
+| Key a `mqdbypomt7` | 0 (also 0 from the deploy to 13:22 UTC Oct 11) | – |
+| Key b `mug6eyfk1l` | 364 | all 200 |
+| Serial key `2eisotew77` | 1,771 | all 200 |
+| No key (`-`) | 13 | 403 |
+
+- **The 13 no-key 403s:** all `GET /` or `GET /robots.txt` from 12 unrelated addresses (scanners). None is a `POST /particle/log`. The 24 h before deploy 2 had 4.
+- **Key states:** `mqdbypomt7` False, `mug6eyfk1l` True, `2eisotew77` True.
+- **Checker run, 2026-10-11 09:00 UTC:** `consumersChecked: 2, overdue: [], inconsistencies: [], failure: null, publishFailures: 0`. No SNS publishes on the rotation topic 08:55–09:15 UTC; the checker Errors alarm is OK.
+- **Architect decision (2026-10-11):** no deliberate key a request, because it needs `get-api-key --include-value`. Whether a disabled-key 403 logs the old key ID or `-` is recorded in the runbook as **not verified**.
+- **Runbook close-out** (`docs/security/webhook-secret-rotation-runbook.md`, +12/−5):
+  - Step 2: the full expected deploy 1 diff.
+  - Step 3: copy with `tr -d '\r\n'`.
+  - Step 4: a bad paste never reaches AWS; check the first 200 on the new key ID plus the Particle integration log.
+  - Step 6: the 403 logging is not verified.
+- **Result:** the watch passed. PR #55 is ready for Chip to merge. Deploy 3 (delete key a) needs its own dispatch.
