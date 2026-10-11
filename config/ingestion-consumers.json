@@ -11,11 +11,7 @@
       },
       "status": "active",
       "apiKey": {
-        "primarySlot": "a",
-        "rotation": {
-          "secondarySlot": "b",
-          "phase": "old-disabled"
-        }
+        "primarySlot": "b"
       }
     },
     {
