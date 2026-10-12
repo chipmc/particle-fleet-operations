@@ -194,10 +194,10 @@ Key IDs are not sensitive. Use them for every check below. See the 2026-09-28 en
 - **2026-09-18:** `PARTICLE_WEBHOOK_SECRET` and `PARTICLE_ACCESS_TOKEN` were exposed via a
   `cdk diff` output pasted into a separate chat session (not this repo's Claude Code session).
   Both credentials were rotated. Post-rotation, the Pi serial forwarder (consumer #2 above)
-  continued sending the old secret, producing a stream of 401s from its public IP
-  (`219.74.165.4`, SingNet residential, Singapore) that was briefly investigated as a possible
-  external probe before being traced back to the Pi's own `/etc/serial-forwarder.env`, which
-  had not been part of the original rotation checklist. This document was created as the
+  continued sending the old secret, producing a stream of 401s from the Pi's residential IP
+  that was briefly investigated as a possible external probe before being traced back to
+  the Pi's own `/etc/serial-forwarder.env`, which had not been part of the original rotation
+  checklist. This document was created as the
   direct remediation for that gap.
 
   This specific exposure vector — a `cdk diff` printing a secret's plaintext value — is now
@@ -228,3 +228,12 @@ Key IDs are not sensitive. Use them for every check below. See the 2026-09-28 en
 
   Revisit: rotate the key at the next planned rotation, or immediately if the per-consumer
   secret is ever exposed too.
+
+- **2026-10-12:** Closes the 2026-09-28 decision. The exposed key `mqdbypomt7` was retired by
+  the planned rotation WO-2026-10-06-001. Its replacement, `mug6eyfk1l`, was added
+  2026-10-09 (deploy 1); the webhook's first request with it was 02:54:59 UTC that day.
+  The old key's zero-use gate passed (0 requests in the 24 h from 2026-10-09 02:40:37 UTC).
+  It was disabled 2026-10-10 09:20 UTC (deploy 2), and the 24 h disabled watch passed
+  with 0 requests. It was deleted 2026-10-12 05:03:27 UTC (deploy 3); get-api-key for
+  key a, no value flag, now returns NotFound. Rotation done; one key per consumer again.
+  Records: `docs/work-orders/WO-2026-10-06-001-*.md`.
