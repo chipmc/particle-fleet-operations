@@ -5,7 +5,7 @@ From: Claude Code (claude-opus-5-5). To: architect. 2026-10-11. Step 0: `WO-2026
 ## Summary
 
 - **Change:** `config/ingestion-consumers.json`, particle-cloud-webhook `apiKey` `{primarySlot: "a", rotation: {secondarySlot: "b", phase: "old-disabled"}}` → `{primarySlot: "b"}`. −4 net (budget −4); source code 0 lines.
-- **Status:** deployed 2026-10-12 05:02:56 to 05:03:28 UTC by Chip; post-deploy checks passed (Dev-09's report not received, device-side). Observation gate running.
+- **Status:** deployed 2026-10-12 05:02:56 to 05:03:28 UTC by Chip; post-deploy checks passed (Dev-09's report not received, device-side). Observation gate passed. Close-out held for the architect.
 
 ## Build (local unless stated)
 
@@ -52,4 +52,8 @@ From: Claude Code (claude-opus-5-5). To: architect. 2026-10-11. Step 0: `WO-2026
 
 - **Deploy window:** no request on any key between 05:02:56 and 05:03:28; not exercised live, as in deploys 1 and 2. **Check 3:** Dev-14's success shows `INGESTION_API_KEY_ID_PARTICLE_CLOUD_WEBHOOK` now resolves to key b (environment not read).
 
-## Observation gate (production) — through the 2026-10-12 09:00 UTC checker run, pending
+## Observation gate (production, 05:03:28 to the 09:00 UTC checker run; checked 12:15 UTC) — passed
+
+- **Access log:** key b 12, serial 2eisotew77 216, all `POST /particle/log` 200. No 401 or 403 on any path. `ingestion_auth`: 12 key b and 216 serial, all `success`, 0 failures.
+- **Checker 09:00:03 UTC:** `consumersChecked: 2, overdue: [], inconsistencies: [], failure: null, publishFailures: 0`. No SNS publish 08:55–09:15; Errors alarm OK.
+- **Dev-09 (from AWS):** serial `SERIAL_MISSING` at 05:00:20 (after its 05:00:14 Ubidots report), absent until `SERIAL_CONNECTED` at 06:00:07. At 06:02:14–06:02:22 it disconnected and reconnected; the 06:03:06 line shows uptime 47 s (restart about 06:02:19). Then Ubidots 06:02:47 and status 06:02:51 on key b, `success` (Lambda requests `8eaf79f7-…`, `6b1a952a-…`), and hourly since. Last seen at 12:15 UTC: log line 12:13:32 (`[app] INFO: ChargeDiag: chg=DONE(3) …`), CONNECTED 12:15:26, MISSING 12:15:30, Ubidots on key b 12:13:18. **The trigger at about 05:30 fell while Dev-09 was off serial (05:00:20 to 06:00:07); its first report after the deploy arrived at 06:02:47.**
