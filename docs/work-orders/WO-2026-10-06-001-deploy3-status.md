@@ -5,7 +5,7 @@ From: Claude Code (claude-opus-5-5). To: architect. 2026-10-11. Step 0: `WO-2026
 ## Summary
 
 - **Change:** `config/ingestion-consumers.json`, particle-cloud-webhook `apiKey` `{primarySlot: "a", rotation: {secondarySlot: "b", phase: "old-disabled"}}` → `{primarySlot: "b"}`. −4 net (budget −4); source code 0 lines.
-- **Status:** Stage 8 OK from the architect (2026-10-11). Waiting for Chip's deploy.
+- **Status:** deployed 2026-10-12 05:02:56 to 05:03:28 UTC by Chip; post-deploy checks passed (Dev-09's report not received, device-side). Observation gate running.
 
 ## Build (local unless stated)
 
@@ -46,4 +46,21 @@ From: Claude Code (claude-opus-5-5). To: architect. 2026-10-11. Step 0: `WO-2026
 - **Kept aside:** deploy 2's applied `cdk.out` is in the scratchpad as `cdk.out.deploy2-applied`.
 - **Deadline:** before 2026-10-16T00:24Z (key b createdDate + 168 h), or the checker alerts overdue.
 
-## Post-deploy and observation gate (production) — pending
+## Post-deploy checks (production, 2026-10-12)
+
+| Check | Result |
+|---|---|
+| 1. Stack | `UPDATE_COMPLETE`, 05:02:56 to 05:03:28 UTC (32 s); post-deploy `cdk diff --app cdk.out`: "There were no differences" |
+| 1. Deletes | UsagePlanKey 05:03:25.953, key a ApiKey 05:03:27.773 (`DELETE_COMPLETE`), both in the cleanup phase after the Lambda update; old Version `DELETE_SKIPPED` (retained); prod alias version 6 |
+| 2. Key a | get-api-key for key a, no value flag: `NotFoundException` |
+| 2. Key b / serial | `mug6eyfk1l` enabled / `2eisotew77` enabled |
+| 2. Plans | fef2gk lists only `mug6eyfk1l`; t3oq8d lists only `2eisotew77` |
+| 3. Dev-14 report | 05:30:12.548, key b, 200; Lambda request `47a92ccb-2402-4b43-a008-537888235651`: `authResult: success`, consumer `particle-cloud-webhook`, boron-soak-1, Ubidots-Sensor-Hook-v1 |
+| 3. Dev-09 report | not received by 05:52:57 UTC. No webhook or serial event from Dev-09 since 05:00:17 (last serial line), and no rejected request on any key, so it never reached AWS (device-side) |
+| 3. Auth failures | 0 `ingestion_auth` failures from 05:03:28 to 05:49 UTC |
+| Serial key | 7 requests, all 200, 05:03:28 to 05:49 UTC |
+
+- **Deploy window:** no request on any key between 05:02:56 and 05:03:28. Not exercised live, as in deploys 1 and 2.
+- **Check 3 result:** Dev-14's success shows `INGESTION_API_KEY_ID_PARTICLE_CLOUD_WEBHOOK` now resolves to key b. The function environment was not read.
+
+## Observation gate (production) — through the 2026-10-12 09:00 UTC checker run, pending
