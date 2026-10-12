@@ -75,8 +75,6 @@ Open:
   secrets, which the Lambda reads by name at runtime. Not done for PARTICLE_ACCESS_TOKEN and
   QUERY_API_SHARED_SECRET: CloudFormation resolves them from Secrets Manager at deploy time
   into the Lambda's environment as values (infra/lib/infra-stack.ts).
-- define rotation runbooks. The webhook secret runbook exists; the API key rotation procedure
-  is written but blocked on a prerequisite (docs/security/webhook-secret-rotation-runbook.md).
 - validate IAM least privilege before deployment (not checked 2026-09-29)
 
 Model routing (2026-10-08): docs/AI_DEVELOPMENT_WORKFLOW.md has no model-routing section like the firmware's section 5 (per-role defaults, escalation, Codex/Copilot commands), which rule (e) builds on; add one in its own WO.
@@ -101,5 +99,8 @@ Checked against main on 2026-09-29.
   was removed on 2026-09-24 (PR #39), ingestion accepts only per-consumer credentials and
   QUERY_API_SHARED_SECRET is used only by the query API. Its value was carried over from the
   old PARTICLE_WEBHOOK_SECRET, not rotated.
+* Define rotation runbooks: done 2026-10-12. The two-key mechanism shipped (WO-2026-09-30-001)
+  and the first API key rotation (WO-2026-10-06-001) retired key mqdbypomt7; procedure in
+  docs/security/webhook-secret-rotation-runbook.md.
 * Use a 1-year Particle token and keep a local operator copy in
   ~/.particle-log-monitoring/secrets.env: documented in docs/security/secrets-management.md.
