@@ -5,7 +5,7 @@ AUTHORIZATION SCOPE: edit `docs/AI_DEVELOPMENT_WORKFLOW.md` on a new branch, com
 
 Governing: `docs/AI_DEVELOPMENT_WORKFLOW.md` "Working Rules (adopted 7–8 October 2026)", rules (a) records/PR, (b) small WOs, (c) Step 0. Plain goal: write down, as one rule, what keeps a public repo safe, so every agent and Chip follow it without being told each time.
 
-Why: chipmc/particle-fleet-operations is public (Chip's decision, 2026-10-13). On 2026-10-11 GitGuardian flagged a literal `--api-key <id>` command line in a pushed dispatch (a key ID, a false positive), and a scan found the home IP in a runbook entry (since redacted). No credential was ever found in the files or history.
+Why: chipmc/particle-fleet-operations is public (Chip's decision, 2026-10-13). On 2026-10-11 GitGuardian flagged a command line in a pushed dispatch that passed a key ID to the `--api-key` flag (a key ID, not a value: a false positive), and a scan found the home IP in a runbook entry (since redacted). No credential was ever found in the files or history.
 
 ## Budget (stop and report if over)
 - `docs/AI_DEVELOPMENT_WORKFLOW.md`: at most +7 net lines. Source, tests, other docs: 0.
