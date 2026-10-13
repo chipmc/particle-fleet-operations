@@ -210,7 +210,8 @@ a new rule is not finished until the rule is in the guide.
 Working Rules (adopted 7–8 October 2026)
 
 Copied from the firmware repo's AI_DEVELOPMENT_WORKFLOW.md, section 2 (rule a) and section 13
-(merged as d4b0300), with the fleet-ops differences written in. The letters match the firmware's.
+(merged as d4b0300), with the fleet-ops differences written in. Letters (a)–(j) match the
+firmware's; (k) is fleet-ops only.
 
 (a) Commits. Claude Code commits and pushes each WO's records (the WO file, dispatches, reports and
 verdicts) on the WO branch at the end of each stage, and the verified implementation when it opens
@@ -238,6 +239,11 @@ reports are at most 150 lines.
 (i) Deploy in small increments, with an observation gate before the next.
 (j) Results count only from a fresh npm ci, and a deploy comes from the exact checkout and cdk.out
 that produced the reviewed diff.
+(k) Public repo. This repository is public. Records, dispatches, reports and commit messages carry
+names, IDs and counts only: never a key or secret value, an IP address or a personal contact
+detail, and never a command line with a literal credential option (write "get-api-key for key a,
+no value flag", not `--api-key <id>`). Account IDs and the alert email stay only where the code
+needs them. The detect-secrets hook is a backstop, not a substitute for this rule.
 
 ⸻
 
