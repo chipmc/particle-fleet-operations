@@ -20,7 +20,7 @@ Re-check on main: (j) is the last rule in the Working Rules section; the sentenc
 (k) Public repo. This repository is public. Records, dispatches, reports and commit messages carry
 names, IDs and counts only: never a key or secret value, an IP address or a personal contact
 detail, and never a command line with a literal credential option (write "get-api-key for key a,
-no value flag", not `--api-key <id>`). Account IDs and the alert email stay only where the code
+no value flag", not the `--api-key` flag followed by a value). Account IDs and the alert email stay only where the code
 needs them. The detect-secrets hook is a backstop, not a substitute for this rule.
 
 ## Report to the architect (stop here, at most 15 lines)
