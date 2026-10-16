@@ -19,7 +19,7 @@ const DEFAULT_FLEET_PRODUCT_ID = '42131';
 const LOCAL_SECRETS_RELATIVE_PATH = '.particle-log-monitoring/secrets.env';
 const DEFAULT_TIMELINE_HOURS = 24;
 const DEFAULT_TIMELINE_LIMIT = 25;
-const DEFAULT_FLEET_ACTIVITY_LIMIT = 10;
+const DEFAULT_FLEET_ACTIVITY_LIMIT = 0;
 const DEFAULT_TRANSPORT_ALLOWANCE_SECONDS = 60;
 const DEFAULT_WATCH_INTERVAL_SECONDS = 3;
 const WATCH_TIMELINE_LIMIT = 200;
@@ -145,7 +145,7 @@ function printUsage() {
   ./tools/telemetry --help
   ./tools/telemetry help [command]
   ./tools/telemetry devices [--json]
-  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit ${DEFAULT_FLEET_ACTIVITY_LIMIT}] [--transport-allowance 60s] [--json] [--verbose]
+  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit <n>] [--transport-allowance 60s] [--json] [--verbose]
   ./tools/telemetry device <name-or-device-id> [--json]
   ./tools/telemetry timeline <name-or-device-id> [--since 1h | --start <ISO8601> [--until <ISO8601>] | --hours 24] [--limit 50] [--json]
   ./tools/telemetry watch <name-or-device-id> [--interval 3] [--since 5m] [--serial-only] [--json]
@@ -164,13 +164,13 @@ Options:
   --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
   --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
   --product-id <id>    Particle product ID for fleet summary (default: ${DEFAULT_FLEET_PRODUCT_ID})
-  --activity-limit <n> Recent Activity row limit (default: ${DEFAULT_FLEET_ACTIVITY_LIMIT})
+  --activity-limit <n> Recent Activity row limit (default: ${DEFAULT_FLEET_ACTIVITY_LIMIT}, off)
   --transport-allowance <duration>
                        Expected-report delivery allowance (default: 60s)
   --profile <name>     AWS CLI profile
   --region <region>    AWS region
   --json               Emit JSON output
-  --verbose            Include additional per-device metadata where supported
+  --verbose            Include additional per-device metadata (and the Device OS column in fleet)
   --hours <hours>      Timeline lookback window
   --limit <count>      Timeline max events
   --interval <seconds> Watch polling interval, minimum 1 (default: ${DEFAULT_WATCH_INTERVAL_SECONDS})
@@ -204,40 +204,36 @@ Options:
   --region <region>    AWS region
 `,
     fleet: `Usage:
-  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit ${DEFAULT_FLEET_ACTIVITY_LIMIT}] [--transport-allowance 60s] [--json] [--verbose]
+  ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit <n>] [--transport-allowance 60s] [--json] [--verbose]
 
 Summarize one Particle product fleet by joining Particle product inventory,
 DeviceCurrentState, and the existing runtime projection. This report does not
 infer health.
 
 Terms:
-  CS                  Current State. Indicates that a DeviceCurrentState projection exists for the device.
-  RT                  Runtime Status. Indicates that a device-status Ledger snapshot has been projected.
-  DD                  Device Data. Indicates that a device-data Ledger snapshot has been projected.
   Cloud               Point-in-time Particle Cloud connection status. Online or Offline is not equivalent to device health because sleeping devices may normally be offline.
   Last Heard          The most recent time Particle Cloud heard from the device.
   Firmware            The application firmware version reported by Particle.
-  Device OS           The Particle Device OS version reported by Particle.
-  Runtime             Runtime-status projection presence: Observed, Pending, or Unknown.
+  Device OS           The Particle Device OS version reported by Particle (--verbose column; overview when versions differ).
   SOC                 Battery State of Charge. Fleet Summary prefers device-status Ledger SOC and falls back to telemetry battery SOC.
-  Expected            Next application report derived from effective Ledger configuration and the last application report.
-  Coverage            Evidence completeness across the Particle product inventory.
+  Next Report         Next application report derived from effective Ledger configuration and the last application report.
+  Status              OVERDUE or UNKNOWN from the Next Report expectation, otherwise OK. Not a health score.
+  Coverage            Evidence completeness across the Particle product inventory (overview shows it only when incomplete).
   Attention           Factual observations that may warrant operator review; not a derived health classification.
-  Recent Activity     Recent fleet observations, newest first.
+  Recent Activity     Recent fleet observations, newest first (only with --activity-limit).
 
 Notes:
   Product inventory is authoritative for fleet membership.
-  CS, RT, and DD are evidence-presence indicators, not health scores.
   Online/Offline is Particle Cloud connection state, not reporting health.
   Device Data: Not Enabled means no device in the scoped product currently has a device-data projection.
 
 Options:
   --product-id <id>    Particle product ID (default: ${DEFAULT_FLEET_PRODUCT_ID})
-  --activity-limit <n> Recent Activity row limit (default: ${DEFAULT_FLEET_ACTIVITY_LIMIT})
+  --activity-limit <n> Recent Activity row limit (default: ${DEFAULT_FLEET_ACTIVITY_LIMIT}, off)
   --transport-allowance <duration>
                        Fleet-side delivery allowance added after the reporting interval and connection budget (default: 60s)
   --json               Emit fleet-summary.v1 JSON output
-  --verbose            Include additional per-device metadata
+  --verbose            Include additional per-device metadata and the Device OS column
   --stack <name>       CloudFormation stack name (default: ${DEFAULT_STACK_NAME})
   --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
   --profile <name>     AWS CLI profile
@@ -1420,8 +1416,10 @@ function renderFleetSummary(summary, options = {}) {
   const inventory = summary.coverage.inventory;
 
   lines.push(`Fleet Summary: Product ${summary.productId}`);
-  lines.push(`Schema: ${summary.schema}`);
-  lines.push(`Generated: ${summary.generatedAt}`);
+  lines.push(`Generated: ${formatLocalStamp(summary.generatedAt, options, true)}`);
+  const counts = { OK: 0, OVERDUE: 0, UNKNOWN: 0 };
+  for (const device of summary.devices) counts[fleetReportingStatus(device)] += 1;
+  lines.push(Object.entries(counts).map(([status, count]) => `${count} ${status}`).join(' · '));
   lines.push('');
   lines.push(...formatFleetOverview(summary, options));
   lines.push('');
@@ -1430,35 +1428,36 @@ function renderFleetSummary(summary, options = {}) {
   lines.push(...formatFleetAttention(summary.attention || buildFleetAttention(summary.devices, summary.coverage, options)));
   lines.push('');
 
-  const rows = summary.devices.map(device => fleetSummaryTextRow(device, options, color));
+  const byName = (left, right) => safe(left.deviceName).localeCompare(safe(right.deviceName)) || safe(left.deviceId).localeCompare(safe(right.deviceId));
+  const rows = [...summary.devices].sort(byName).map(device => fleetSummaryTextRow(device, options, color));
   const columns = options.verbose
-    ? ['NAME', 'DEVICE ID', 'CS', 'RT', 'DD', 'CLOUD', 'FIRMWARE', 'DEVICE OS', 'SOC', 'EXPECTED', 'LAST HEARD', 'RUNTIME', 'SOC OBSERVED', 'SOC SOURCE', 'PARTICLE HEARD', 'LEDGER UPDATED', 'LAST EVENT', 'SCHEMA VER']
-    : ['NAME', 'DEVICE ID', 'CS', 'RT', 'DD', 'CLOUD', 'FIRMWARE', 'DEVICE OS', 'SOC', 'EXPECTED', 'LAST HEARD', 'RUNTIME'];
+    ? ['NAME', 'DEVICE ID', 'FIRMWARE', 'DEVICE OS', 'SOC', 'CLOUD', 'NEXT REPORT', 'LAST HEARD', 'STATUS', 'SOC OBSERVED', 'SOC SOURCE', 'PARTICLE HEARD', 'LEDGER UPDATED', 'LAST EVENT', 'SCHEMA VER']
+    : ['NAME', 'DEVICE ID', 'FIRMWARE', 'SOC', 'CLOUD', 'NEXT REPORT', 'LAST HEARD', 'STATUS'];
   lines.push(...formatTable(rows, columns));
-  lines.push('');
-  lines.push('Recent Activity');
-  lines.push('---------------');
-  lines.push(...formatRecentActivity(summary.recentActivity || buildFleetRecentActivity(summary.devices, options), options));
+  const activity = formatRecentActivity(summary.recentActivity || buildFleetRecentActivity(summary.devices, options), options);
+  if (activity.length > 0) lines.push('', 'Recent Activity', '---------------', ...activity);
   return lines;
+}
+
+function fleetReportingStatus(device) {
+  if (device.expectationStatus === 'overdue') return 'OVERDUE';
+  return device.expectationStatus === 'upcoming' ? 'OK' : 'UNKNOWN';
 }
 
 function fleetSummaryTextRow(device, options, color) {
   const row = {
     NAME: safe(device.deviceName),
     'DEVICE ID': safe(device.deviceId),
-    CS: evidenceCell(device.coverage.currentState, color),
-    RT: evidenceCell(device.coverage.runtimeStatus, color),
-    DD: evidenceCell(device.coverage.deviceData, color),
-    CLOUD: cloudCell(device.connected, color),
     FIRMWARE: safe(device.firmwareVersion),
-    'DEVICE OS': safe(device.deviceOsVersion),
     SOC: formatSocPercent(device.socPercent),
-    EXPECTED: expectedReportCell(device, options.now || new Date(), color),
+    CLOUD: cloudCell(device.connected, color),
+    'NEXT REPORT': expectedReportCell(device, options.now || new Date(), color),
     'LAST HEARD': formatFleetTime(fleetDeviceLastHeardTime(device), options),
-    RUNTIME: runtimeStatusCell(device, color),
+    STATUS: colorText(fleetReportingStatus(device), { OVERDUE: 'red', UNKNOWN: 'dim' }[fleetReportingStatus(device)], color),
   };
 
   if (options.verbose) {
+    row['DEVICE OS'] = safe(device.deviceOsVersion);
     row['SOC OBSERVED'] = safeIso(device.socObservedAt);
     row['SOC SOURCE'] = safe(device.socSource);
     row['PARTICLE HEARD'] = safeIso(device.lastHeard);
@@ -1481,8 +1480,10 @@ function formatFleetOverview(summary, options = {}) {
 
 function buildFleetOverviewSections(summary) {
   const inventory = summary.coverage.inventory;
+  const { currentState, runtimeStatus, deviceData } = summary.coverage;
+  const coverageIncomplete = currentState < inventory || runtimeStatus < inventory || (deviceData > 0 && deviceData < inventory);
   return [
-    {
+    ...(coverageIncomplete ? [{
       title: 'COVERAGE',
       rows: [
         ['Inventory', formatCompactCoverage(summary.coverage.inventory, inventory)],
@@ -1490,7 +1491,7 @@ function buildFleetOverviewSections(summary) {
         ['Runtime Status', formatCompactCoverage(summary.coverage.runtimeStatus, inventory)],
         ['Device Data', formatDeviceDataCoverage(summary.coverage, inventory)],
       ],
-    },
+    }] : []),
     {
       title: 'CLOUD',
       rows: [
@@ -1503,10 +1504,10 @@ function buildFleetOverviewSections(summary) {
       title: 'FIRMWARE',
       rows: summary.distributions.firmware.map(entry => [entry.value, entry.count]),
     },
-    {
+    ...(summary.distributions.deviceOs.length > 1 ? [{
       title: 'DEVICE OS',
       rows: summary.distributions.deviceOs.map(entry => [entry.value, entry.count]),
-    },
+    }] : []),
     {
       title: 'BATTERY SOC',
       rows: batterySocOverviewRows(summary.batterySoc || buildBatterySocOverview(summary.devices, inventory)),
@@ -1622,7 +1623,13 @@ function buildFleetAttention(devices, coverage, options = {}) {
       observations.push(`Recent serial activity; Particle last heard ${formatRelativeDuration(device.lastHeard, now)} ago`);
     }
     if (device.expectationStatus === 'overdue' && device.expectedNextReport) {
-      observations.push(`Expected application report ${formatLongRelativeDuration(device.expectedNextReport, now)} ago`);
+      const lastHeard = fleetDeviceLastHeardTime(device);
+      observations.push([
+        `Overdue ${formatLongRelativeDuration(device.expectedNextReport, now)}`,
+        `cloud ${{ true: 'online', false: 'offline' }[device.connected] || 'unknown'}`,
+        lastHeard && `last heard ${formatLongRelativeDuration(lastHeard, now)} ago`,
+        device.lastApplicationReportAt && `last report ${formatLocalStamp(device.lastApplicationReportAt, { ...options, now })}`,
+      ].filter(Boolean).join(' · '));
     }
     return {
       deviceId: device.deviceId,
@@ -1728,6 +1735,26 @@ function formatActivityTime(value, options) {
   });
 }
 
+// "HH:MM ZONE" for today, "MM-DD HH:MM ZONE" otherwise or when forceDate is set.
+function formatLocalStamp(value, options = {}, forceDate = false) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return safe(value);
+  const partsAt = instant => Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: options.timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  }).formatToParts(instant).map(part => [part.type, part.value]));
+  const parts = partsAt(date);
+  const today = partsAt(new Date(options.now || Date.now()));
+  const sameDay = ['year', 'month', 'day'].every(key => parts[key] === today[key]);
+  return `${forceDate || !sameDay ? `${parts.month}-${parts.day} ` : ''}${parts.hour}:${parts.minute} ${parts.timeZoneName}`;
+}
+
 function fleetDeviceLastHeardTime(device) {
   return device.lastHeard || device.lastEventTime;
 }
@@ -1769,19 +1796,9 @@ function isOlderThan(value, now, thresholdMs) {
   return nowTime - time >= thresholdMs;
 }
 
-function evidenceCell(value, color) {
-  return value ? colorText('Y', 'green', color) : colorText('-', 'dim', color);
-}
-
 function cloudCell(value, color) {
   if (value === true) return colorText('Online', 'green', color);
   if (value === false) return colorText('Offline', 'red', color);
-  return colorText('Unknown', 'dim', color);
-}
-
-function runtimeStatusCell(device, color) {
-  if (device.coverage.runtimeStatus) return colorText('Observed', 'green', color);
-  if (device.coverage.currentState) return colorText('Pending', 'dim', color);
   return colorText('Unknown', 'dim', color);
 }
 

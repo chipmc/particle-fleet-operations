@@ -717,9 +717,8 @@ test('fleet help exits successfully without external configuration', () => {
     assert.equal(result.status, 0);
     assert.match(result.stdout, /fleet-summary\.v1/);
     assert.match(result.stdout, /--product-id <id>/);
-    assert.match(result.stdout, /CS\s+Current State/);
-    assert.match(result.stdout, /RT\s+Runtime Status/);
-    assert.match(result.stdout, /DD\s+Device Data/);
+    assert.match(result.stdout, /Status\s+OVERDUE or UNKNOWN/);
+    assert.doesNotMatch(result.stdout, /Runtime-status projection presence/);
     assert.match(result.stdout, /Online or Offline is not equivalent to device health/);
     assert.doesNotMatch(result.stderr, /AWS|region|credentials/i);
   }
@@ -1672,6 +1671,7 @@ test('fleet summary overlays device settings and derives upcoming and overdue ap
     generatedAt: now.toISOString(),
     now,
     transportAllowanceSeconds: 60,
+    timeZone: 'UTC',
   });
 
   assert.deepEqual({
@@ -1690,12 +1690,12 @@ test('fleet summary overlays device settings and derives upcoming and overdue ap
   assert.equal(summary.devices[0].lastApplicationReportAt, '2026-07-14T08:10:00.000Z');
   assert.equal(summary.devices[1].expectedNextReport, '2026-07-14T08:36:00.000Z');
   assert.equal(summary.devices[1].expectationStatus, 'overdue');
-  assert.ok(summary.attention.find(entry => entry.deviceId === 'device-overdue').observations.includes(
-    'Expected application report 4 minutes ago'
+  assert.ok(summary.attention.find(entry => entry.deviceId === 'device-overdue').observations.some(
+    observation => observation.startsWith('Overdue 4 minutes · cloud ')
   ));
 
   const plain = renderFleetSummary(summary, { color: false, now, terminalWidth: 180 }).join('\n');
-  assert.match(plain, /SOC\s+\| EXPECTED/);
+  assert.match(plain, /SOC\s+\| CLOUD\s+\| NEXT REPORT/);
   assert.match(plain, /Upcoming Counter[\s\S]*in 6 min/);
   assert.match(plain, /Overdue Counter[\s\S]*4 min overdue/);
   assert.doesNotMatch(summary.attention.flatMap(entry => entry.observations).join(' '), /health|score|warning|critical/i);
@@ -1903,12 +1903,13 @@ test('sleeping devices avoid attention until the first opening report is actuall
   const missed = buildFleetSummary([device], {
     now: new Date('2026-07-15T10:02:00.000Z'),
     transportAllowanceSeconds: 0,
+    timeZone: 'UTC',
   });
   assert.equal(missed.devices[0].expectationStatus, 'overdue');
   assert.deepEqual(missed.attention, [{
     deviceId: 'sleeping-device',
     deviceName: 'Raleigh Counter',
-    observations: ['Expected application report 2 minutes ago'],
+    observations: ['Overdue 2 minutes · cloud offline · last heard 8 hours ago · last report 02:00 UTC'],
   }]);
 });
 
@@ -2060,7 +2061,7 @@ test('fleet summary JSON includes optional attention observations', () => {
       deviceDataLedgerUpdatedAt: '2026-07-14T08:01:00.000Z',
       particle: { connected: true, last_heard: '2026-07-14T08:00:00.000Z' },
     },
-  ], { productId: '42131', generatedAt: '2026-07-14T08:05:00.000Z', now: new Date('2026-07-14T08:05:00.000Z') });
+  ], { productId: '42131', activityLimit: 10, generatedAt: '2026-07-14T08:05:00.000Z', now: new Date('2026-07-14T08:05:00.000Z') });
 
   assert.deepEqual(fleetSummaryJson(summary, { verbose: false }).attention, [
     {
@@ -2105,26 +2106,50 @@ test('fleet summary JSON includes an empty attention list when no observations a
   assert.deepEqual(fleetSummaryJson(summary, { verbose: false }).attention, []);
 });
 
-test('fleet text renders compact overview, evidence columns, relative last heard, and empty attention', () => {
-  const lines = renderFleetSummary(fleetSummaryFixture(), {
+test('fleet text renders compact overview, name-sorted table, relative last heard, and empty attention', () => {
+  const output = renderFleetSummary(fleetSummaryFixture(), {
     now: new Date('2026-07-14T08:05:00.000Z'),
     color: false,
     terminalWidth: 120,
-  });
-  const output = lines.join('\n');
+    timeZone: 'UTC',
+  }).join('\n');
 
-  assert.match(output, /COVERAGE\s+CLOUD\s+FIRMWARE\s+DEVICE OS/);
-  assert.match(output, /Inventory\s+2 \/ 2\s+Online\s+1\s+14\s+2\s+5\.8\.0\s+2/);
-  assert.match(output, /Current State\s+2 \/ 2\s+Offline\s+1/);
-  assert.match(output, /Device Data\s+2 \/ 2 \(100%\)/);
-  assert.match(output, /Recent Activity\n---------------\n[\s\S]*TELEMETRY\s+Counter A Occupancy report[\s\S]*TELEMETRY\s+Counter B Occupancy report/);
-  assert.match(output, /NAME\s+\| DEVICE ID\s+\| CS \| RT \| DD \| CLOUD/);
-  assert.match(output, /Counter A[\s\S]*\| Y\s+\| Y\s+\| Y\s+\| Online[\s\S]*\| 2 min ago\s+\| Observed/);
-  assert.match(output, /Counter B[\s\S]*\| Y\s+\| Y\s+\| Y\s+\| Offline[\s\S]*\| 1 hr ago\s+\| Observed/);
+  assert.match(output, /^Generated: 07-14 08:05 UTC\n0 OK · 0 OVERDUE · 2 UNKNOWN\n/m);
+  assert.doesNotMatch(output, /Schema:|COVERAGE|DEVICE OS|Recent Activity|RUNTIME|\| CS /);
+  assert.match(output, /CLOUD\s+FIRMWARE\s+BATTERY SOC/);
+  assert.match(output, /Online\s+1\s+14\s+2/);
+  assert.match(output, /NAME\s+\| DEVICE ID\s+\| FIRMWARE\s+\| SOC\s+\| CLOUD\s+\| NEXT REPORT\s+\| LAST HEARD\s+\| STATUS/);
+  assert.match(output, /Counter A[\s\S]*\| Online[\s\S]*\| 2 min ago\s+\| UNKNOWN/);
+  assert.match(output, /Counter B[\s\S]*\| Offline[\s\S]*\| 1 hr ago\s+\| UNKNOWN/);
   assert.doesNotMatch(output, /LAST SEEN/);
   assert.doesNotMatch(output, /Connected:/);
   assert.match(output, /Devices Requiring Attention\n---------------------------\n\nNAME/);
-  assert.ok(output.indexOf('Recent Activity') > output.indexOf('Counter B | device-b'));
+});
+
+test('fleet STATUS comes from expectationStatus, attention states the evidence, and rows sort by name', () => {
+  const base = fleetSummaryFixture().devices[0];
+  const device = (deviceName, connected, expectationStatus, extra = {}) => ({
+    ...base, deviceId: deviceName.toLowerCase(), deviceName, connected, expectationStatus, ...extra,
+  });
+  const overdue = { expectedNextReport: '2026-07-14T07:19:00.000Z' };
+  const summary = fleetSummaryFixture({
+    devices: [
+      device('Zeta', false, 'upcoming'),
+      device('Echo', true, 'overdue', { ...overdue, lastApplicationReportAt: '2026-07-13T07:00:00.000Z' }),
+      device('Delta', false, 'overdue', { ...overdue, lastApplicationReportAt: '2026-07-14T06:30:00.000Z' }),
+      device('Alpha', true, 'unknown'),
+    ],
+  });
+  const output = renderFleetSummary(summary, { now: new Date('2026-07-14T08:05:00.000Z'), color: false, terminalWidth: 180, timeZone: 'UTC' }).join('\n');
+  const rows = output.split('\n').filter(line => /^(Alpha|Delta|Echo|Zeta) /.test(line));
+
+  assert.match(output, /^1 OK · 2 OVERDUE · 1 UNKNOWN$/m);
+  assert.deepEqual(rows.map(row => row.split(' ')[0]), ['Alpha', 'Delta', 'Echo', 'Zeta']);
+  assert.deepEqual(rows.map(row => row.match(/(OK|OVERDUE|UNKNOWN)\s*$/)[1]), ['UNKNOWN', 'OVERDUE', 'OVERDUE', 'OK']);
+  assert.match(output, /Delta\n  - Overdue 46 minutes · cloud offline · last heard 2 minutes ago · last report 06:30 UTC/);
+  assert.match(output, /Echo\n  - Overdue 46 minutes · cloud online · last heard 2 minutes ago · last report 07-13 07:00 UTC/);
+  assert.doesNotMatch(output, /Zeta\n/);
+  assert.deepEqual(summary.devices.map(entry => entry.deviceName), ['Zeta', 'Echo', 'Delta', 'Alpha']);
 });
 
 test('fleet overview renders multiple firmware and Device OS cohorts with uneven section lengths', () => {
@@ -2142,25 +2167,31 @@ test('fleet overview renders multiple firmware and Device OS cohorts with uneven
     },
   }), { color: false, terminalWidth: 120 }).join('\n');
 
-  assert.match(output, /COVERAGE\s+CLOUD\s+FIRMWARE\s+DEVICE OS/);
-  assert.match(output, /Inventory\s+2 \/ 2\s+Online\s+1\s+20\s+5\s+6\.4\.1\s+4/);
-  assert.match(output, /Current State\s+2 \/ 2\s+Offline\s+1\s+<unknown>\s+1\s+6\.3\.3\s+1/);
-  assert.match(output, /Runtime Status\s+2 \/ 2\s+Unknown\s+0\s+<unknown>\s+1/);
+  assert.match(output, /CLOUD\s+FIRMWARE\s+DEVICE OS/);
+  assert.doesNotMatch(output, /COVERAGE/);
+  assert.match(output, /Online\s+1\s+20\s+5\s+6\.4\.1\s+4/);
+  assert.match(output, /Offline\s+1\s+<unknown>\s+1\s+6\.3\.3\s+1/);
+  assert.match(output, /Unknown\s+0\s+<unknown>\s+1/);
 });
 
 test('fleet overview falls back to stacked layout for narrow terminals', () => {
-  const output = renderFleetSummary(fleetSummaryFixture(), { color: false, terminalWidth: 72 }).join('\n');
+  const output = renderFleetSummary(fleetSummaryFixture({ coverage: { inventory: 2, currentState: 2, runtimeStatus: 1, deviceData: 2 } }), { color: false, terminalWidth: 72 }).join('\n');
 
   assert.match(output, /COVERAGE\n--------\nInventory\s+2 \/ 2/);
   assert.match(output, /CLOUD\n-----\nOnline\s+1\nOffline\s+1\nUnknown\s+0/);
   assert.match(output, /FIRMWARE\n--------\n14\s+2/);
   assert.doesNotMatch(output, /COVERAGE\s+CLOUD\s+FIRMWARE\s+DEVICE OS/);
+  for (const [deviceData, expected] of [[1, 'match'], [0, 'doesNotMatch']]) {
+    const coverage = { inventory: 2, currentState: 2, runtimeStatus: 2, deviceData };
+    assert[expected](renderFleetSummary(fleetSummaryFixture({ coverage }), { color: false }).join('\n'), /COVERAGE/);
+  }
 });
 
 test('fleet verbose text keeps ISO timestamps and additional metadata', () => {
   const output = renderFleetSummary(fleetSummaryFixture(), { verbose: true, color: false }).join('\n');
 
   assert.match(output, /LAST HEARD/);
+  assert.match(output, /FIRMWARE\s+\| DEVICE OS/);
   assert.match(output, /PARTICLE HEARD/);
   assert.match(output, /LEDGER UPDATED/);
   assert.match(output, /2026-07-14T08:03:00\.000Z/);
@@ -2203,8 +2234,8 @@ test('fleet attention groups actionable device observations and suppresses undep
   assert.match(output, /Counter A\n  - Last heard 6 hours ago\n  - Runtime status not yet observed/);
   assert.match(output, /Counter B\n  - No Current State\n  - Last heard 66 days ago\n  - Runtime status not yet observed/);
   assert.doesNotMatch(output, /Device Data not observed/);
-  assert.match(output, /Counter A[\s\S]*\| Y\s+\| -\s+\| -\s+\| Online[\s\S]*\| 6 hr ago\s+\| Pending/);
-  assert.match(output, /Counter B[\s\S]*\| -\s+\| -\s+\| -\s+\| Unknown[\s\S]*\| 66 days ago\s+\| Unknown/);
+  assert.match(output, /Counter A[\s\S]*\| Online[\s\S]*\| 6 hr ago\s+\| UNKNOWN/);
+  assert.match(output, /Counter B[\s\S]*\| Unknown[\s\S]*\| 66 days ago\s+\| UNKNOWN/);
   assert.deepEqual(fleetSummaryJson(summary, { verbose: false }).coverage, {
     inventory: 2,
     currentState: 1,
@@ -2287,7 +2318,7 @@ test('fleet summary treats recent serial activity and old Particle last_heard as
       deviceStatusLedgerUpdatedAt: '2026-07-14T11:11:30.000Z',
       particle: { connected: false, last_heard: '2026-07-14T07:11:00.000Z' },
     },
-  ], { productId: '42131', generatedAt: '2026-07-14T11:12:00.000Z', now: new Date('2026-07-14T11:12:00.000Z') });
+  ], { productId: '42131', activityLimit: 10, generatedAt: '2026-07-14T11:12:00.000Z', now: new Date('2026-07-14T11:12:00.000Z') });
 
   assert.equal(summary.devices[0].connected, false);
   assert.equal(summary.devices[0].lastHeard, '2026-07-14T07:11:00.000Z');
@@ -2355,7 +2386,7 @@ test('fleet summary classifies telemetry, lifecycle, and unknown latest events f
       deviceStatusLedgerUpdatedAt: '2026-07-14T11:08:30.000Z',
       particle: { connected: true, last_heard: '2026-07-14T11:08:05.000Z' },
     },
-  ], { productId: '42131', generatedAt: '2026-07-14T11:12:00.000Z', now: new Date('2026-07-14T11:12:00.000Z') });
+  ], { productId: '42131', activityLimit: 10, generatedAt: '2026-07-14T11:12:00.000Z', now: new Date('2026-07-14T11:12:00.000Z') });
 
   assert.deepEqual(summary.recentActivity.map(entry => [entry.deviceName, entry.kind, entry.summary]), [
     ['Telemetry Device', 'TELEMETRY', 'Occupancy report'],
@@ -2444,19 +2475,25 @@ test('fleet Recent Activity omits collector failures while detailed timelines ke
   ]);
 });
 
-test('fleet recent activity can be empty', () => {
-  const summary = buildFleetSummary([
-    {
-      deviceId: 'quiet',
-      deviceName: 'Quiet Counter',
-      hasProductInventory: true,
-      hasCurrentState: false,
-      particle: { connected: false },
-    },
-  ], { productId: '42131' });
+test('fleet recent activity is off by default and returns with an activity limit', () => {
+  const devices = [{
+    projectId: 'generalized-core-counter',
+    deviceId: 'device-a',
+    deviceName: 'Counter A',
+    hasProductInventory: true,
+    hasCurrentState: true,
+    lastEventTime: '2026-07-14T11:11:00.000Z',
+    lastEventType: 'telemetry.status',
+    lastPlane: 'forensic',
+    particle: { connected: true },
+  }];
+  const off = buildFleetSummary(devices, { productId: '42131' });
+  const on = buildFleetSummary(devices, { productId: '42131', activityLimit: 5 });
 
-  assert.deepEqual(summary.recentActivity, []);
-  assert.match(renderFleetSummary(summary, { color: false }).join('\n'), /NAME[\s\S]*Quiet Counter[\s\S]*\n\nRecent Activity\n---------------$/);
+  assert.deepEqual(off.recentActivity, []);
+  assert.doesNotMatch(renderFleetSummary(off, { color: false }).join('\n'), /Recent Activity/);
+  assert.equal(on.recentActivity.length, 1);
+  assert.match(renderFleetSummary(on, { color: false }).join('\n'), /Recent Activity\n---------------\n.*Counter A/);
 });
 
 test('fleet JSON is unchanged by compact text layout options', () => {
@@ -2469,7 +2506,7 @@ test('fleet text color is optional and disabled for JSON', () => {
   const colored = renderFleetSummary(fleetSummaryFixture(), { color: true }).join('\n');
   const plain = renderFleetSummary(fleetSummaryFixture(), { color: true, json: true }).join('\n');
 
-  assert.match(colored, /\x1b\[32mY\x1b\[39m/);
+  assert.match(colored, /\x1b\[32mOnline\x1b\[39m/);
   assert.doesNotMatch(plain, /\x1b\[/);
 });
 
