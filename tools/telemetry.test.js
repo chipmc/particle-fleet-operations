@@ -31,6 +31,7 @@ const {
   fetchTimeline,
   fetchSerialTimeline,
   formatDuration,
+  formatLongRelativeDuration,
   formatRelativeTime,
   formatSerialEntry,
   formatTruncationWarning,
@@ -2037,6 +2038,38 @@ test('fleet summary reports additive battery SOC facts from Ledger SOC with tele
   assert.match(output, /Counter B[\s\S]*43%[\s\S]*2026-07-14T11:30:00\.000Z[\s\S]*telemetry/);
   assert.match(output, /Counter C[\s\S]*0%[\s\S]*2026-07-14T11:57:00\.000Z[\s\S]*telemetry/);
   assert.doesNotMatch(summary.attention.map(entry => entry.observations.join(' ')).join(' '), /healthy|low|warning|critical/i);
+});
+
+test('long durations are singular for 1 and plural otherwise', () => {
+  const now = new Date('2026-07-14T12:00:00.000Z');
+  const ago = ms => new Date(now.getTime() - ms).toISOString();
+  const long = ms => formatLongRelativeDuration(ago(ms), now);
+  assert.deepEqual([long(3600e3), long(7200e3), long(60e3), long(120e3)], ['1 hour', '2 hours', '1 minute', '2 minutes']);
+});
+
+test('stale SOC is an attention item only when the device is not on schedule', () => {
+  const now = new Date('2026-07-14T12:00:00.000Z');
+  const defaults = { timing: { reportingIntervalSec: 3600, connectAttemptBudgetSec: 300 } };
+  const device = (deviceId, socAt, lastReport) => ({
+    deviceId, deviceName: deviceId, hasProductInventory: true, hasCurrentState: true,
+    lastEventTime: '2026-07-14T11:55:00.000Z',
+    ...(lastReport && { lastApplicationReportAt: lastReport, productDefaultsLedgerData: defaults }),
+    deviceStatusLedgerUpdatedAt: socAt,
+    deviceStatusLedgerData: { battery: { soc: 79 }, connection: { state: 'connected' } },
+    particle: { connected: true, last_heard: '2026-07-14T11:55:00.000Z' },
+  });
+  const old = '2026-07-14T05:00:00.000Z';
+  const summary = buildFleetSummary([
+    device('upcoming-stale', old, '2026-07-14T11:30:00.000Z'),
+    device('overdue-stale', old, '2026-07-14T08:00:00.000Z'),
+    device('unknown-stale', old, null),
+    device('upcoming-fresh', '2026-07-14T11:50:00.000Z', '2026-07-14T11:30:00.000Z'),
+    device('unknown-fresh', '2026-07-14T11:50:00.000Z', null),
+  ], { productId: '42131', generatedAt: now.toISOString(), now });
+  const status = Object.fromEntries(summary.devices.map(entry => [entry.deviceId, entry.expectationStatus]));
+  assert.deepEqual(status, { 'upcoming-stale': 'upcoming', 'overdue-stale': 'overdue', 'unknown-stale': 'unknown', 'upcoming-fresh': 'upcoming', 'unknown-fresh': 'unknown' });
+  const soc = Object.fromEntries(summary.attention.map(entry => [entry.deviceId, entry.observations.some(text => /SOC/.test(text))]));
+  assert.deepEqual(soc, { 'overdue-stale': true, 'unknown-stale': true });
 });
 
 test('fleet summary JSON includes optional attention observations', () => {
