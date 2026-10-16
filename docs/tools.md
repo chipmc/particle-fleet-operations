@@ -138,31 +138,31 @@ echo "PARTICLE_ACCESS_TOKEN=${PARTICLE_ACCESS_TOKEN:+SET}"
 The confirmation command reports only whether a token is set; it does not expose the token.
 
 The text report includes:
-- Fleet header: local generated time and zone, and a count line (`9 OK · 1 OVERDUE · 0 UNKNOWN`)
-- Compact overview with Cloud, Firmware, and Battery SOC; Coverage appears only when incomplete and Device OS only when versions differ
-- Devices Requiring Attention section with factual per-device observations
+- One header line: product, local generated time and zone, and status counts
+- Attention section with one line per device and factual observations separated by ` / `, or `Attention: none`
 - Device table sorted by name with `Next Report`, `Last Heard`, and `Status`
 - Recent Activity section only when `--activity-limit <n>` is given
 
-Compact overview example:
+The text report does not repeat Cloud, Firmware, Battery SOC, Coverage, or Device OS summaries; the table shows them per device. `--json` still carries `connected`, `distributions`, `batterySoc`, and `coverage` unchanged.
+
+Example:
 
 ```text
-Fleet Summary: Product 42131
-Generated: 07-14 08:01 EDT
-5 OK · 1 OVERDUE · 0 UNKNOWN
+Fleet Summary: Product 42131 · 07-14 08:01 EDT · 1 OK · 1 OVERDUE · 0 UNKNOWN
 
-COVERAGE                  CLOUD             FIRMWARE          BATTERY SOC
-Inventory       6 / 6     Online       5    20          5     Observed  4 / 6
-Current State   5 / 6     Offline      1    <unknown>   1     Lowest    18%
-Runtime Status  4 / 6     Unknown      0                      Median    54%
-Device Data     Not Enabled                                    Unknown   2
+Attention (2)
+Counter A: Last heard 21 minutes ago / Runtime status not yet observed
+Counter F: Last heard 2 hours ago / Runtime status not yet observed / Overdue 55 minutes · cloud offline · last heard 2 hours ago · last report 06:00 EDT
+
+NAME      | DEVICE ID                | FIRMWARE | SOC | CLOUD   | NEXT REPORT    | LAST HEARD | STATUS
+----------|--------------------------|----------|-----|---------|----------------|------------|--------
+Counter A | e00fce68a1b2c3d4e5f60001 | 20       | -   | Online  | in 45 min      | 21 min ago | OK
+Counter F | e00fce68a1b2c3d4e5f60002 | 20       | -   | Offline | 55 min overdue | 2 hr ago   | OVERDUE
 ```
-
-For narrow terminals, the overview falls back to stacked sections so values remain readable and are not silently truncated.
 
 Default text output uses relative times such as `2 min ago` and labels the activity column `Last Heard`. Use `--verbose` to show ISO timestamps, the `Device OS` column, and additional per-device metadata.
 
-When no devices have produced Device Data, the text coverage line reports `Device Data: Not Enabled` and Device Data is not listed as an operator attention item. If any device begins publishing Device Data later, the report automatically returns to numeric Device Data coverage and can show per-device Device Data observations.
+When no devices have produced Device Data, Device Data is not listed as an operator attention item. If any device begins publishing Device Data later, the report can show per-device Device Data observations.
 
 `Status` is `OVERDUE` or `UNKNOWN` from the report expectation, otherwise `OK`. Fleet Summary does not infer health.
 
@@ -170,7 +170,7 @@ Terminology:
 - `Cloud`: Point-in-time Particle Cloud connection status. `Online` or `Offline` is not equivalent to device health because sleeping devices may normally be offline.
 - `Last Heard`: The most recent time Particle Cloud heard from the device.
 - `Firmware`: The application firmware version reported by Particle.
-- `Device OS`: The Particle Device OS version reported by Particle. Shown in the overview only when versions differ, and as a `--verbose` column.
+- `Device OS`: The Particle Device OS version reported by Particle. Shown as a `--verbose` column.
 - `SOC`: Battery State of Charge. Fleet Summary prefers the `device-status` Ledger SOC value and falls back to telemetry-derived battery SOC when needed.
 - `Next Report`: The next application-report delivery expectation. Fleet Operations first selects the next valid scheduled reporting slot from the effective interval, operating window, and device timezone, then applies the connection-attempt budget and Fleet Operations transport allowance. Upcoming expectations are green and overdue expectations are red in color-enabled terminals.
 - `Status`: `OVERDUE` when the expectation has passed, `UNKNOWN` when no expectation can be computed, otherwise `OK`.
@@ -178,9 +178,9 @@ Terminology:
 - `Attention`: Factual observations that may warrant operator review. This is not a derived health classification.
 - `Recent Activity`: Recent fleet observations, newest first.
 
-Product inventory is authoritative for fleet membership and displayed fleet identity. `Device Data: Not Enabled` means no device in the scoped product currently has a `device-data` projection.
+Product inventory is authoritative for fleet membership and displayed fleet identity. When no device has a `device-data` projection, Device Data is not listed as an attention item.
 
-Devices Requiring Attention groups factual observations by device. For an online device that has not reported telemetry yet, the section says `Cloud connected` and `Waiting for first telemetry` instead of listing low-level missing projections. For devices with existing telemetry but missing runtime projection evidence, observations use factual wording such as `Last heard 6 hours ago` and `Runtime status not yet observed`. Stale SOC evidence is reported factually, for example `Last reported SOC 18%` and `SOC observation is 7 hr old`. Overdue expectations are also stated as operational facts, for example `Overdue 46 minutes · cloud offline · last heard 1 hour ago · last report 13:20 EDT`. A device intentionally sleeping outside its reporting window is not overdue; it becomes overdue only after the first scheduled slot after reopening plus the configured delivery allowances has passed. Fleet Summary does not convert these facts into health scores or healthy, low, warning, or critical labels. An empty section means no observations apply in the current snapshot.
+The Attention section gives one line per device, `Name: first / second`, headed `Attention (N)` where N counts devices. For an online device that has not reported telemetry yet, the section says `Cloud connected` and `Waiting for first telemetry` instead of listing low-level missing projections. For devices with existing telemetry but missing runtime projection evidence, observations use factual wording such as `Last heard 6 hours ago` and `Runtime status not yet observed`. Stale SOC evidence is reported factually, for example `Last reported SOC 18%` and `SOC observation is 7 hr old`. Overdue expectations are also stated as operational facts, for example `Overdue 46 minutes · cloud offline · last heard 1 hour ago · last report 13:20 EDT`. A device intentionally sleeping outside its reporting window is not overdue; it becomes overdue only after the first scheduled slot after reopening plus the configured delivery allowances has passed. Fleet Summary does not convert these facts into health scores or healthy, low, warning, or critical labels. With no observations the section is the single line `Attention: none`.
 
 Expected reporting uses the existing configuration hierarchy. Fleet Operations deep-overlays the optional `device-settings` projection onto `default-settings`, then reads `timing.reportingIntervalSec`, `timing.connectAttemptBudgetSec`, `timing.openHour`, `timing.closeHour`, and `timing.timezone` from that internal effective configuration. The merged object is not written back to Particle or exposed as a new firmware/cloud contract.
 
