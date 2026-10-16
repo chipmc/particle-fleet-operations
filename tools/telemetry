@@ -1485,7 +1485,7 @@ function buildFleetAttention(devices, coverage, options = {}) {
     }
 
     if (deviceDataEnabled && !device.coverage.deviceData) observations.push('Device Data not observed');
-    if (device.socPercent !== null && device.socObservedAt && isOlderThan(device.socObservedAt, now, 6 * 60 * 60 * 1000)) {
+    if (device.expectationStatus !== 'upcoming' && device.socPercent !== null && device.socObservedAt && isOlderThan(device.socObservedAt, now, 6 * 60 * 60 * 1000)) {
       observations.push(`Last reported SOC ${formatSocPercent(device.socPercent)}`);
       observations.push(`SOC observation is ${formatRelativeDuration(device.socObservedAt, now)} old`);
     }
@@ -1651,8 +1651,8 @@ function formatRelativeDuration(value, now) {
 
 function formatLongRelativeDuration(value, now) {
   return formatRelativeDuration(value, now)
-    .replace(/\bhr\b/g, 'hours')
-    .replace(/\bmin\b/g, 'minutes');
+    .replace(/\b(\d+) hr\b/g, (_, n) => `${n} ${n === '1' ? 'hour' : 'hours'}`)
+    .replace(/\b(\d+) min\b/g, (_, n) => `${n} ${n === '1' ? 'minute' : 'minutes'}`);
 }
 
 function isOlderThan(value, now, thresholdMs) {
@@ -2683,6 +2683,7 @@ module.exports = {
   detectCurrentStateChanges,
   enrichDeviceNames,
   formatDuration,
+  formatLongRelativeDuration,
   formatRelativeTime,
   formatSerialEntry,
   formatTruncationWarning,
