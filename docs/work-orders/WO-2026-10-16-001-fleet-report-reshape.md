@@ -65,3 +65,11 @@ the live command: it needs the Particle access token, which this WO does not aut
 ## Out of scope
 Health score, multi-product view, a problems-only flag, a per-device detail command, the e-paper
 dashboard, and any server-side change.
+
+## Closing note (2026-10-16, commit 18174fa)
+Budget versus actual: tools/telemetry +17 net (limit +30); tools/telemetry.test.js +37 net (limit +40);
+docs/tools.md about 23 replaced lines (limit 30; replaced lines count, per Chip).
+Tests: node --check clean; node --test 215 tests, 208 pass, 0 fail, 7 skipped (Node v26.3.0, macOS).
+Live `telemetry fleet` not run by Claude Code; Chip runs it after merge.
+JSON: no field added, removed or renamed; `attention` text changed by value (new overdue wording,
+last-report time in the host zone). No additive fields were added. Non-US zones show as GMT+N.
