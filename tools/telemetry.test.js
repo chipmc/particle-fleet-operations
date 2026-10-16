@@ -2032,7 +2032,6 @@ test('fleet summary reports additive battery SOC facts from Ledger SOC with tele
   assert.equal(json.batterySoc.median, 46.28);
 
   const output = renderFleetSummary(summary, { color: false, now, terminalWidth: 160, verbose: true }).join('\n');
-  assert.match(output, /BATTERY SOC[\s\S]*Observed\s+4 \/ 5[\s\S]*Lowest\s+0%[\s\S]*Median\s+46%[\s\S]*Unknown\s+1/);
   assert.match(output, /SOC/);
   assert.match(output, /Counter A[\s\S]*79%[\s\S]*2026-07-14T05:00:00\.000Z[\s\S]*device-status/);
   assert.match(output, /Counter B[\s\S]*43%[\s\S]*2026-07-14T11:30:00\.000Z[\s\S]*telemetry/);
@@ -2106,7 +2105,7 @@ test('fleet summary JSON includes an empty attention list when no observations a
   assert.deepEqual(fleetSummaryJson(summary, { verbose: false }).attention, []);
 });
 
-test('fleet text renders compact overview, name-sorted table, relative last heard, and empty attention', () => {
+test('fleet text renders one-line header, name-sorted table, relative last heard, and empty attention', () => {
   const output = renderFleetSummary(fleetSummaryFixture(), {
     now: new Date('2026-07-14T08:05:00.000Z'),
     color: false,
@@ -2114,16 +2113,14 @@ test('fleet text renders compact overview, name-sorted table, relative last hear
     timeZone: 'UTC',
   }).join('\n');
 
-  assert.match(output, /^Generated: 07-14 08:05 UTC\n0 OK · 0 OVERDUE · 2 UNKNOWN\n/m);
-  assert.doesNotMatch(output, /Schema:|COVERAGE|DEVICE OS|Recent Activity|RUNTIME|\| CS /);
-  assert.match(output, /CLOUD\s+FIRMWARE\s+BATTERY SOC/);
-  assert.match(output, /Online\s+1\s+14\s+2/);
+  assert.match(output, /^Fleet Summary: Product 42131 · 07-14 08:05 UTC · 0 OK · 0 OVERDUE · 2 UNKNOWN\n\nAttention: none\n\nNAME/);
+  assert.doesNotMatch(output, /Schema:|Generated:|COVERAGE|DEVICE OS|Recent Activity|RUNTIME|\| CS /);
   assert.match(output, /NAME\s+\| DEVICE ID\s+\| FIRMWARE\s+\| SOC\s+\| CLOUD\s+\| NEXT REPORT\s+\| LAST HEARD\s+\| STATUS/);
   assert.match(output, /Counter A[\s\S]*\| Online[\s\S]*\| 2 min ago\s+\| UNKNOWN/);
   assert.match(output, /Counter B[\s\S]*\| Offline[\s\S]*\| 1 hr ago\s+\| UNKNOWN/);
   assert.doesNotMatch(output, /LAST SEEN/);
   assert.doesNotMatch(output, /Connected:/);
-  assert.match(output, /Devices Requiring Attention\n---------------------------\n\nNAME/);
+  assert.doesNotMatch(output, /Devices Requiring Attention|CLOUD\s+FIRMWARE|BATTERY SOC/);
 });
 
 test('fleet STATUS comes from expectationStatus, attention states the evidence, and rows sort by name', () => {
@@ -2143,48 +2140,29 @@ test('fleet STATUS comes from expectationStatus, attention states the evidence, 
   const output = renderFleetSummary(summary, { now: new Date('2026-07-14T08:05:00.000Z'), color: false, terminalWidth: 180, timeZone: 'UTC' }).join('\n');
   const rows = output.split('\n').filter(line => /^(Alpha|Delta|Echo|Zeta) /.test(line));
 
-  assert.match(output, /^1 OK · 2 OVERDUE · 1 UNKNOWN$/m);
+  assert.match(output, / · 1 OK · 2 OVERDUE · 1 UNKNOWN\n\nAttention \(2\)\n/);
   assert.deepEqual(rows.map(row => row.split(' ')[0]), ['Alpha', 'Delta', 'Echo', 'Zeta']);
   assert.deepEqual(rows.map(row => row.match(/(OK|OVERDUE|UNKNOWN)\s*$/)[1]), ['UNKNOWN', 'OVERDUE', 'OVERDUE', 'OK']);
-  assert.match(output, /Delta\n  - Overdue 46 minutes · cloud offline · last heard 2 minutes ago · last report 06:30 UTC/);
-  assert.match(output, /Echo\n  - Overdue 46 minutes · cloud online · last heard 2 minutes ago · last report 07-13 07:00 UTC/);
+  assert.match(output, /^Delta: Overdue 46 minutes · cloud offline · last heard 2 minutes ago · last report 06:30 UTC$/m);
+  assert.match(output, /^Echo: Overdue 46 minutes · cloud online · last heard 2 minutes ago · last report 07-13 07:00 UTC$/m);
   assert.doesNotMatch(output, /Zeta\n/);
   assert.deepEqual(summary.devices.map(entry => entry.deviceName), ['Zeta', 'Echo', 'Delta', 'Alpha']);
 });
 
-test('fleet overview renders multiple firmware and Device OS cohorts with uneven section lengths', () => {
-  const output = renderFleetSummary(fleetSummaryFixture({
-    distributions: {
-      firmware: [
-        { value: '20', count: 5 },
-        { value: '<unknown>', count: 1 },
-      ],
-      deviceOs: [
-        { value: '6.4.1', count: 4 },
-        { value: '6.3.3', count: 1 },
-        { value: '<unknown>', count: 1 },
-      ],
-    },
-  }), { color: false, terminalWidth: 120 }).join('\n');
-
-  assert.match(output, /CLOUD\s+FIRMWARE\s+DEVICE OS/);
-  assert.doesNotMatch(output, /COVERAGE/);
-  assert.match(output, /Online\s+1\s+20\s+5\s+6\.4\.1\s+4/);
-  assert.match(output, /Offline\s+1\s+<unknown>\s+1\s+6\.3\.3\s+1/);
-  assert.match(output, /Unknown\s+0\s+<unknown>\s+1/);
-});
-
-test('fleet overview falls back to stacked layout for narrow terminals', () => {
-  const output = renderFleetSummary(fleetSummaryFixture({ coverage: { inventory: 2, currentState: 2, runtimeStatus: 1, deviceData: 2 } }), { color: false, terminalWidth: 72 }).join('\n');
-
-  assert.match(output, /COVERAGE\n--------\nInventory\s+2 \/ 2/);
-  assert.match(output, /CLOUD\n-----\nOnline\s+1\nOffline\s+1\nUnknown\s+0/);
-  assert.match(output, /FIRMWARE\n--------\n14\s+2/);
-  assert.doesNotMatch(output, /COVERAGE\s+CLOUD\s+FIRMWARE\s+DEVICE OS/);
-  for (const [deviceData, expected] of [[1, 'match'], [0, 'doesNotMatch']]) {
-    const coverage = { inventory: 2, currentState: 2, runtimeStatus: 2, deviceData };
-    assert[expected](renderFleetSummary(fleetSummaryFixture({ coverage }), { color: false }).join('\n'), /COVERAGE/);
-  }
+test('fleet text drops the overview blocks while JSON keeps connected, distributions, batterySoc and coverage', () => {
+  const now = new Date('2026-07-14T08:05:00.000Z');
+  const summary = buildFleetSummary([
+    { deviceId: 'a', deviceName: 'A', hasProductInventory: true, hasCurrentState: true, fwVersion: '20', particle: { connected: true } },
+    { deviceId: 'b', deviceName: 'B', hasProductInventory: true, hasCurrentState: false, fwVersion: '21', particle: { connected: false } },
+  ], { productId: '42131', now });
+  const output = renderFleetSummary(summary, { color: false, now, terminalWidth: 72 }).join('\n');
+  assert.doesNotMatch(output, /^(CLOUD|FIRMWARE|BATTERY SOC|COVERAGE|DEVICE OS)\b/m);
+  const json = fleetSummaryJson(summary, { verbose: false });
+  assert.deepEqual(json.connected, { connected: 1, disconnected: 1, unknown: 0 });
+  assert.deepEqual(json.distributions.firmware.map(entry => entry.count), [1, 1]);
+  assert.equal(json.coverage.inventory, 2);
+  assert.equal(json.coverage.currentState, 1);
+  assert.equal(json.batterySoc.unknown, 2);
 });
 
 test('fleet verbose text keeps ISO timestamps and additional metadata', () => {
@@ -2230,9 +2208,9 @@ test('fleet attention groups actionable device observations and suppresses undep
   });
   const output = renderFleetSummary(summary, { color: false, now: new Date('2026-07-14T08:05:00.000Z') }).join('\n');
 
-  assert.match(output, /Device Data\s+Not Enabled/);
-  assert.match(output, /Counter A\n  - Last heard 6 hours ago\n  - Runtime status not yet observed/);
-  assert.match(output, /Counter B\n  - No Current State\n  - Last heard 66 days ago\n  - Runtime status not yet observed/);
+  assert.doesNotMatch(output, /Not Enabled|COVERAGE/);
+  assert.match(output, /^Attention \(2\)\nCounter A: Last heard 6 hours ago \/ Runtime status not yet observed\n/m);
+  assert.match(output, /^Counter B: No Current State \/ Last heard 66 days ago \/ Runtime status not yet observed\n\nNAME/m);
   assert.doesNotMatch(output, /Device Data not observed/);
   assert.match(output, /Counter A[\s\S]*\| Online[\s\S]*\| 6 hr ago\s+\| UNKNOWN/);
   assert.match(output, /Counter B[\s\S]*\| Unknown[\s\S]*\| 66 days ago\s+\| UNKNOWN/);
@@ -2263,7 +2241,7 @@ test('fleet attention uses waiting-for-first-telemetry onboarding wording', () =
       'Waiting for first telemetry',
     ],
   }]);
-  assert.match(renderFleetSummary(summary, { color: false }).join('\n'), /Boron-Dev-v11\n  - Cloud connected\n  - Waiting for first telemetry/);
+  assert.match(renderFleetSummary(summary, { color: false }).join('\n'), /^Attention \(1\)\nBoron-Dev-v11: Cloud connected \/ Waiting for first telemetry\n\nNAME/m);
 });
 
 test('fleet recent activity is newest first and respects the activity limit', () => {

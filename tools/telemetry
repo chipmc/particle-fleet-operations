@@ -214,18 +214,17 @@ Terms:
   Cloud               Point-in-time Particle Cloud connection status. Online or Offline is not equivalent to device health because sleeping devices may normally be offline.
   Last Heard          The most recent time Particle Cloud heard from the device.
   Firmware            The application firmware version reported by Particle.
-  Device OS           The Particle Device OS version reported by Particle (--verbose column; overview when versions differ).
+  Device OS           The Particle Device OS version reported by Particle (--verbose column).
   SOC                 Battery State of Charge. Fleet Summary prefers device-status Ledger SOC and falls back to telemetry battery SOC.
   Next Report         Next application report derived from effective Ledger configuration and the last application report.
   Status              OVERDUE or UNKNOWN from the Next Report expectation, otherwise OK. Not a health score.
-  Coverage            Evidence completeness across the Particle product inventory (overview shows it only when incomplete).
-  Attention           Factual observations that may warrant operator review; not a derived health classification.
+  Coverage            Evidence completeness across the Particle product inventory (JSON only).
+  Attention           One line per device, observations separated by ' / '; factual, not a derived health classification.
   Recent Activity     Recent fleet observations, newest first (only with --activity-limit).
 
 Notes:
   Product inventory is authoritative for fleet membership.
   Online/Offline is Particle Cloud connection state, not reporting health.
-  Device Data: Not Enabled means no device in the scoped product currently has a device-data projection.
 
 Options:
   --product-id <id>    Particle product ID (default: ${DEFAULT_FLEET_PRODUCT_ID})
@@ -1413,20 +1412,14 @@ function outputFleetSummary(summary, options) {
 function renderFleetSummary(summary, options = {}) {
   const color = shouldUseColor(options);
   const lines = [];
-  const inventory = summary.coverage.inventory;
-
-  lines.push(`Fleet Summary: Product ${summary.productId}`);
-  lines.push(`Generated: ${formatLocalStamp(summary.generatedAt, options, true)}`);
   const counts = { OK: 0, OVERDUE: 0, UNKNOWN: 0 };
   for (const device of summary.devices) counts[fleetReportingStatus(device)] += 1;
-  lines.push(Object.entries(counts).map(([status, count]) => `${count} ${status}`).join(' · '));
-  lines.push('');
-  lines.push(...formatFleetOverview(summary, options));
-  lines.push('');
-  lines.push('Devices Requiring Attention');
-  lines.push('---------------------------');
-  lines.push(...formatFleetAttention(summary.attention || buildFleetAttention(summary.devices, summary.coverage, options)));
-  lines.push('');
+  lines.push([
+    `Fleet Summary: Product ${summary.productId}`,
+    formatLocalStamp(summary.generatedAt, options, true),
+    ...Object.entries(counts).map(([status, count]) => `${count} ${status}`),
+  ].join(' · '));
+  lines.push('', ...formatFleetAttention(summary.attention || buildFleetAttention(summary.devices, summary.coverage, options)), '');
 
   const byName = (left, right) => safe(left.deviceName).localeCompare(safe(right.deviceName)) || safe(left.deviceId).localeCompare(safe(right.deviceId));
   const rows = [...summary.devices].sort(byName).map(device => fleetSummaryTextRow(device, options, color));
@@ -1466,129 +1459,6 @@ function fleetSummaryTextRow(device, options, color) {
     row['SCHEMA VER'] = safe(device.schemaVersion);
   }
   return row;
-}
-
-function printDistribution(label, distribution) {
-  for (const line of formatDistribution(label, distribution)) console.log(line);
-}
-
-function formatFleetOverview(summary, options = {}) {
-  const sections = buildFleetOverviewSections(summary);
-  if (terminalWidth(options) < 100) return formatStackedOverview(sections);
-  return formatHorizontalOverview(sections);
-}
-
-function buildFleetOverviewSections(summary) {
-  const inventory = summary.coverage.inventory;
-  const { currentState, runtimeStatus, deviceData } = summary.coverage;
-  const coverageIncomplete = currentState < inventory || runtimeStatus < inventory || (deviceData > 0 && deviceData < inventory);
-  return [
-    ...(coverageIncomplete ? [{
-      title: 'COVERAGE',
-      rows: [
-        ['Inventory', formatCompactCoverage(summary.coverage.inventory, inventory)],
-        ['Current State', formatCompactCoverage(summary.coverage.currentState, inventory)],
-        ['Runtime Status', formatCompactCoverage(summary.coverage.runtimeStatus, inventory)],
-        ['Device Data', formatDeviceDataCoverage(summary.coverage, inventory)],
-      ],
-    }] : []),
-    {
-      title: 'CLOUD',
-      rows: [
-        ['Online', summary.connected.connected],
-        ['Offline', summary.connected.disconnected],
-        ['Unknown', summary.connected.unknown],
-      ],
-    },
-    {
-      title: 'FIRMWARE',
-      rows: summary.distributions.firmware.map(entry => [entry.value, entry.count]),
-    },
-    ...(summary.distributions.deviceOs.length > 1 ? [{
-      title: 'DEVICE OS',
-      rows: summary.distributions.deviceOs.map(entry => [entry.value, entry.count]),
-    }] : []),
-    {
-      title: 'BATTERY SOC',
-      rows: batterySocOverviewRows(summary.batterySoc || buildBatterySocOverview(summary.devices, inventory)),
-    },
-  ];
-}
-
-function batterySocOverviewRows(batterySoc) {
-  return [
-    ['Observed', formatCompactCoverage(batterySoc.observed, batterySoc.inventory)],
-    ['Lowest', formatSocPercent(batterySoc.lowest)],
-    ['Median', formatSocPercent(batterySoc.median)],
-    ['Unknown', batterySoc.unknown],
-  ];
-}
-
-function formatHorizontalOverview(sections) {
-  const rendered = sections.map(renderOverviewSection);
-  const widths = rendered.map(section => Math.max(section.title.length, ...section.rows.map(row => row.length)));
-  const maxRows = Math.max(...rendered.map(section => section.rows.length));
-  const lines = [rendered.map((section, index) => section.title.padEnd(widths[index])).join('   ')];
-
-  for (let rowIndex = 0; rowIndex < maxRows; rowIndex += 1) {
-    lines.push(rendered.map((section, index) => (section.rows[rowIndex] || '').padEnd(widths[index])).join('   ').trimEnd());
-  }
-  return lines;
-}
-
-function formatStackedOverview(sections) {
-  const lines = [];
-  for (const section of sections) {
-    if (lines.length > 0) lines.push('');
-    lines.push(...formatCountBlock(section.title, section.rows));
-  }
-  return lines;
-}
-
-function renderOverviewSection(section) {
-  const labelWidth = Math.max(1, ...section.rows.map(([label]) => String(label).length));
-  return {
-    title: section.title,
-    rows: section.rows.map(([label, value]) => `${String(label).padEnd(labelWidth)}  ${value}`),
-  };
-}
-
-function terminalWidth(options) {
-  if (Number.isInteger(options.terminalWidth)) return options.terminalWidth;
-  return process.stdout.columns || 120;
-}
-
-function formatDistribution(label, distribution) {
-  return formatCountBlock(label, distribution.map(entry => [entry.value, entry.count]));
-}
-
-function formatCountBlock(label, entries) {
-  const width = Math.max(1, ...entries.map(([name]) => String(name).length));
-  return [
-    label,
-    '-'.repeat(label.length),
-    ...entries.map(([name, count]) => `${String(name).padEnd(width)}  ${count}`),
-  ];
-}
-
-function formatCoverage(count, inventory) {
-  if (inventory === 0) return `${count} / 0 (-)`;
-  return `${count} / ${inventory} (${formatPercent(count / inventory)})`;
-}
-
-function formatCompactCoverage(count, inventory) {
-  if (inventory === 0) return `${count} / 0`;
-  return `${count} / ${inventory}`;
-}
-
-function formatDeviceDataCoverage(coverage, inventory) {
-  if (coverage.deviceData === 0) return 'Not Enabled';
-  return formatCoverage(coverage.deviceData, inventory);
-}
-
-function formatPercent(ratio) {
-  const percent = ratio * 100;
-  return `${Number.isInteger(percent) ? percent.toFixed(0) : percent.toFixed(1)}%`;
 }
 
 function formatSocPercent(value) {
@@ -1640,15 +1510,11 @@ function buildFleetAttention(devices, coverage, options = {}) {
 }
 
 function formatFleetAttention(attention) {
-  const lines = [];
-  for (const entry of attention) {
-    if (lines.length > 0) lines.push('');
-    lines.push(safe(entry.deviceName));
-    for (const observation of entry.observations) {
-      lines.push(`  - ${observation}`);
-    }
-  }
-  return lines;
+  if (attention.length === 0) return ['Attention: none'];
+  return [
+    `Attention (${attention.length})`,
+    ...attention.map(entry => `${safe(entry.deviceName)}: ${entry.observations.join(' / ')}`),
+  ];
 }
 
 function buildFleetRecentActivity(devices, options = {}) {
