@@ -784,6 +784,20 @@ test('CLI exit codes distinguish truncated, complete, error, and ambiguous resul
   assert.match(ambiguous.stderr, /ERROR: Ambiguous device selector: Boron/);
 });
 
+test('context CLI prints status and attention for a silent device when reading DynamoDB without a webhook secret', async (t) => {
+  const deviceId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+  const env = await createTelemetryCliFixture(t, {
+    devices: [{ deviceId, deviceName: 'Boron Alpha', projectId: 'generalized-core-counter' }],
+    events: [],
+  });
+
+  const result = runTelemetry(['context', 'Boron Alpha'], env);
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /No data found/);
+  assert.match(result.stdout, /^Context: Boron Alpha \(aaaaaaaaaaaaaaaaaaaaaaaa\) · /);
+  assert.match(result.stdout, /\nSources: Particle cloud\n[\s\S]*Events: 0\n/);
+});
+
 test('serial CLI reports complete grep no-match results after full boundary-safe fetch', async (t) => {
   const deviceId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
   const env = await createTelemetryCliFixture(t, {

@@ -64,11 +64,11 @@ changing `device`, `fleet`, JSON schemas, or thresholds. The Ubidots-ID versus P
 Chip's: the command takes the Particle device ID or the device name.
 
 ## Closing note (2026-10-17, branch wo-2026-10-16-004-device-context)
-Budget versus actual: tools/telemetry +57 net (limit +60); tools/telemetry.test.js +29 net (limit +60);
+Budget versus actual: tools/telemetry +57 net (limit +60); tools/telemetry.test.js +43 net (limit +60);
 docs/tools.md 22 lines (limit 20, raised to 22 with Chip's OK: the real rendered example is 15 lines).
-Decisions: summary built from the full inventory so Attention matches `fleet`; 6h default window when
---since, --start and --hours are absent; exit 3 on truncation as `timeline`.
-Tests: node --check clean; node --test 217 tests, 210 pass, 0 fail, 7 skipped (Node v26.3.0, macOS);
-the context test fails if the Serial or Ledger source logic is broken. Live run is Chip's.
-Not unit-tested (inside main(), needs live backends): the 6h default and the exit code.
-Opus check found one defect, fixed: a silent device with no webhook secret failed with "No data found"; the context fetch now passes allowEmpty.
+Decisions: summary from the full inventory so Attention matches `fleet`; 6h default window when --since,
+--start and --hours are absent; exit 3 on truncation as `timeline`.
+Opus check found one defect, fixed: a silent device with no webhook secret failed with "No data found";
+the context fetch now passes allowEmpty. Chip's review added a CLI test (fake aws and Particle server)
+that fails without it. Tests: node --check clean; node --test 218 tests, 211 pass, 0 fail, 7 skipped
+(Node v26.3.0, macOS). Not unit-tested: the 6h default and exit code. Live run is Chip's.
