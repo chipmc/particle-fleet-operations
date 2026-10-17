@@ -31,7 +31,9 @@ const {
   fetchTimeline,
   fetchSerialTimeline,
   formatDuration,
+  buildDeviceContext,
   formatLongRelativeDuration,
+  outputDeviceContext,
   formatRelativeTime,
   formatSerialEntry,
   formatTruncationWarning,
@@ -780,6 +782,20 @@ test('CLI exit codes distinguish truncated, complete, error, and ambiguous resul
   ], env);
   assert.equal(ambiguous.status, 2);
   assert.match(ambiguous.stderr, /ERROR: Ambiguous device selector: Boron/);
+});
+
+test('context CLI prints status and attention for a silent device when reading DynamoDB without a webhook secret', async (t) => {
+  const deviceId = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+  const env = await createTelemetryCliFixture(t, {
+    devices: [{ deviceId, deviceName: 'Boron Alpha', projectId: 'generalized-core-counter' }],
+    events: [],
+  });
+
+  const result = runTelemetry(['context', 'Boron Alpha'], env);
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /No data found/);
+  assert.match(result.stdout, /^Context: Boron Alpha \(aaaaaaaaaaaaaaaaaaaaaaaa\) · /);
+  assert.match(result.stdout, /\nSources: Particle cloud\n[\s\S]*Events: 0\n/);
 });
 
 test('serial CLI reports complete grep no-match results after full boundary-safe fetch', async (t) => {
@@ -2070,6 +2086,33 @@ test('stale SOC is an attention item only when the device is not on schedule', (
   assert.deepEqual(status, { 'upcoming-stale': 'upcoming', 'overdue-stale': 'overdue', 'unknown-stale': 'unknown', 'upcoming-fresh': 'upcoming', 'unknown-fresh': 'unknown' });
   const soc = Object.fromEntries(summary.attention.map(entry => [entry.deviceId, entry.observations.some(text => /SOC/.test(text))]));
   assert.deepEqual(soc, { 'overdue-stale': true, 'unknown-stale': true });
+});
+
+test('context lists the sources that returned data, shows attention, and emits four JSON keys', () => {
+  const now = new Date('2026-07-14T12:00:00.000Z');
+  const defaults = { timing: { reportingIntervalSec: 3600, connectAttemptBudgetSec: 300 } };
+  const base = { hasProductInventory: true, hasCurrentState: true, particle: { connected: true, last_heard: '2026-07-14T11:55:00.000Z' } };
+  const devices = [
+    { ...base, deviceId: 'full', deviceName: 'Full', lastApplicationReportAt: '2026-07-14T11:30:00.000Z', productDefaultsLedgerData: defaults, deviceStatusLedgerData: { connection: { state: 'connected' } } },
+    { ...base, deviceId: 'late', deviceName: 'Late', lastApplicationReportAt: '2026-07-14T08:00:00.000Z', productDefaultsLedgerData: defaults },
+  ];
+  const summary = buildFleetSummary(devices, { productId: '42131', now });
+  const serial = { events: [{ eventTime: '2026-07-14T11:50:00.000Z', eventType: 'serial.log', eventName: 'serialLog', payload: { line: 'boot' } }] };
+  const run = (name, timeline, options = {}) => {
+    const logs = [];
+    const original = console.log;
+    console.log = line => logs.push(line);
+    try { outputDeviceContext(buildDeviceContext(summary, devices.find(d => d.deviceName === name), timeline), { color: false, now, timeZone: 'UTC', ...options }); } finally { console.log = original; }
+    return logs.join('\n');
+  };
+
+  assert.deepEqual(buildDeviceContext(summary, devices[0], serial).sources, ['Particle cloud', 'Ledger', 'Serial']);
+  assert.deepEqual(buildDeviceContext(summary, devices[1], { events: [] }).sources, ['Particle cloud']);
+  assert.match(run('Full', serial), /^Context: Full \(full\) · 07-14 12:00 UTC\nOK · .*\n\nAttention: none\n\nSources: Particle cloud, Ledger, Serial\n\nDevice: Full/);
+  assert.match(run('Late', { events: [] }), /\nAttention \(1\)\nLate: .*Overdue .*\n\nSources: Particle cloud\n/);
+  assert.deepEqual(Object.keys(JSON.parse(run('Full', serial, { json: true }))), ['device', 'attention', 'sources', 'timeline']);
+  assert.throws(() => resolveDeviceSelector(devices, 'nobody'), /Device selector not found/);
+  assert.equal(runTelemetry(['context', '--help']).status, 0);
 });
 
 test('fleet summary JSON includes optional attention observations', () => {

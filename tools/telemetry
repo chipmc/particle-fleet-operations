@@ -33,7 +33,7 @@ const DEVICE_ID_PATTERN = /^[a-fA-F0-9]{24}$/;
 const ISO_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/;
 const NS_PER_SECOND = 1000000000n;
 const NS_PER_MILLISECOND = 1000000n;
-const COMMANDS = new Set(['devices', 'device', 'timeline', 'watch', 'serial', 'fleet']);
+const COMMANDS = new Set(['devices', 'device', 'timeline', 'watch', 'serial', 'fleet', 'context']);
 
 async function main() {
   const args = process.argv.slice(2);
@@ -66,7 +66,8 @@ async function main() {
 
     const options = parseOptions(args);
 
-    if (command === 'timeline') validateStartSince(options);
+    if (command === 'timeline' || command === 'context') validateStartSince(options);
+    if (command === 'context' && !options.sinceMs && !options.startIso && !args.includes('--hours')) options.sinceMs = 6 * 60 * 60 * 1000;
     if (command === 'watch' && options.startIso) fail('--start is not supported for watch; use --since.');
 
     const context = await loadContext(options);
@@ -96,6 +97,23 @@ async function main() {
       const devices = await loadDeviceInventory(context, { productId: options.productId });
       const device = resolveDeviceSelector(devices, selector, context);
       outputDevice(device, options.json);
+      return;
+    }
+
+    if (command === 'context') {
+      const selector = requireSelector(options.positionals, 'context');
+      const devices = await loadDeviceInventory(context, { productId: options.productId });
+      const device = resolveDeviceSelector(devices, selector, context);
+      const summary = buildFleetSummary(devices, {
+        productId: options.productId,
+        transportAllowanceSeconds: options.transportAllowanceSeconds,
+      });
+      const timeline = await fetchTimeline(context, device.deviceId, { ...options, allowEmpty: true });
+      outputDeviceContext(buildDeviceContext(summary, device, timeline), options);
+      if (timeline.truncated) {
+        console.error(formatTruncationWarning(true, options.limit, 'timeline'));
+        process.exitCode = TRUNCATED_EXIT_CODE;
+      }
       return;
     }
 
@@ -148,6 +166,7 @@ function printUsage() {
   ./tools/telemetry fleet [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--activity-limit <n>] [--transport-allowance 60s] [--json] [--verbose]
   ./tools/telemetry device <name-or-device-id> [--json]
   ./tools/telemetry timeline <name-or-device-id> [--since 1h | --start <ISO8601> [--until <ISO8601>] | --hours 24] [--limit 50] [--json]
+  ./tools/telemetry context <name-or-device-id> [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--since 6h | --hours <n>] [--limit 25] [--json]
   ./tools/telemetry watch <name-or-device-id> [--interval 3] [--since 5m] [--serial-only] [--json]
   ./tools/telemetry serial <name-or-device-id> --since 1h [--follow] [--include-collector] [--grep text] [--json]
   ./tools/telemetry serial <name-or-device-id> --start <ISO8601> [--until <ISO8601>] [--include-collector] [--grep text] [--json]
@@ -280,6 +299,15 @@ Options:
   --project-id <id>    DeviceCurrentState projectId (default: ${DEFAULT_PROJECT_ID})
   --profile <name>     AWS CLI profile
   --region <region>    AWS region
+`,
+    context: `Usage:
+  ./tools/telemetry context <name-or-device-id> [--product-id ${DEFAULT_FLEET_PRODUCT_ID}] [--since 6h | --hours <n>] [--limit 25] [--json]
+
+One-device alert context: status, Attention, data sources, timeline. Exits ${TRUNCATED_EXIT_CODE} on truncation.
+
+Options:
+  --since <duration>   Lookback (default: 6h); --hours <n> also works. Other options as for timeline.
+  --json               Emit { device, attention, sources, timeline } JSON
 `,
     watch: `Usage:
   ./tools/telemetry watch <name-or-device-id> [--interval 3] [--since 5m] [--serial-only] [--json]
@@ -1709,6 +1737,33 @@ function fleetSummaryJson(summary, options) {
   };
 }
 
+function buildDeviceContext(summary, device, timeline) {
+  const entry = summary.devices.find(item => item.deviceId === device.deviceId);
+  const sources = [
+    entry.coverage.productInventory && 'Particle cloud',
+    entry.coverage.runtimeStatus && 'Ledger',
+    (timeline.events || []).some(item => presentEvent(item).kind === 'SERIAL') && 'Serial',
+  ].filter(Boolean);
+  const attention = summary.attention.find(item => item.deviceId === device.deviceId) || { deviceId: entry.deviceId, deviceName: entry.deviceName, observations: [] };
+  return { device: entry, attention, sources, timeline };
+}
+
+function outputDeviceContext({ device, attention, sources, timeline }, options) {
+  if (options.json) {
+    const { metadata, ...deviceJson } = device;
+    console.log(JSON.stringify({ device: deviceJson, attention, sources, timeline }, null, 2));
+    return;
+  }
+  const now = options.now || new Date();
+  console.log(`Context: ${safe(device.deviceName)} (${device.deviceId}) · ${formatLocalStamp(now, options, true)}`);
+  console.log([fleetReportingStatus(device), `next report ${expectedReportCell(device, now, false)}`,
+    `last heard ${formatFleetTime(fleetDeviceLastHeardTime(device), options)}`, `firmware ${safe(device.firmwareVersion)}`,
+    `SOC ${formatSocPercent(device.socPercent)}`, `cloud ${cloudCell(device.connected, false)}`].join(' · '));
+  const lines = attention.observations.length ? formatFleetAttention([attention]) : ['Attention: none'];
+  console.log(['', ...lines, '', `Sources: ${sources.join(', ') || 'none'}`, ''].join('\n'));
+  outputTimeline(device, timeline, false);
+}
+
 function outputTimeline(device, timeline, json) {
   if (json) {
     console.log(JSON.stringify(timeline, null, 2));
@@ -2683,6 +2738,8 @@ module.exports = {
   detectCurrentStateChanges,
   enrichDeviceNames,
   formatDuration,
+  buildDeviceContext,
+  outputDeviceContext,
   formatLongRelativeDuration,
   formatRelativeTime,
   formatSerialEntry,
