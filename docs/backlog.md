@@ -120,7 +120,7 @@ This is an operational projection derived from existing evidence rather than a f
   - Stage 1: pilot on devices tagged `enrich-pilot` (GCC test fleet plus one older device).
   - Stage 2: in-thread enrichment. Stage 3: AI summary, last.
   - Any posting back uses its own narrowly scoped token and a separate approval.
-- Add a server-side event filter (exclude serial) to the Timeline API so `context` can reach back further (needs a Lambda deploy).
+- Add a server-side event filter (exclude serial) to the Timeline API so `context` can reach back further (needs a Lambda deploy; matters only for serial-attached bench devices).
 - Older firmware has no Ledger, serial or Particle-log data: Ubidots is the only rich source there, and `telemetry context` adds little for it.
 
 ## Completed
