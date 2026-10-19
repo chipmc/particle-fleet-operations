@@ -273,6 +273,28 @@ JSON may also include additive `recentActivity` rows:
 }
 ```
 
+### Device Context
+
+`context` gathers what fleet-ops knows about one device, for use when an alert fires: the `fleet` status line, that device's Attention observations (identical to `fleet`, since they come from the full product inventory), the data sources that returned data (`Particle cloud`, `Ledger`, `Serial`; an old-firmware device shows `Particle cloud` only), and the timeline. The default window is 6 hours (`--since` or `--hours` overrides it) with a limit of 25. It exits 3 like `timeline` when the limit truncates. `--json` emits `{ device, attention, sources, timeline }`.
+
+```text
+Context: Counter F (e00fce68a1b2c3d4e5f60002) · 07-14 08:01 EDT
+OVERDUE · next report 55 min overdue · last heard 2 hr ago · firmware 20 · SOC 54% · cloud Offline
+
+Attention (1)
+Counter F: Overdue 55 minutes · cloud offline · last heard 2 hours ago · last report 06:00 EDT
+
+Sources: Particle cloud, Ledger, Serial
+
+Device: Counter F (e00fce68a1b2c3d4e5f60002)
+Window: 2026-07-14T06:01:00.000Z to 2026-07-14T12:01:00.000Z
+Events: 1
+
+TIME                     | SERIAL LOG
+-------------------------|-----------------
+2026-07-14T09:59:50.000Z | Serial log event
+```
+
 ### Shared Event Presentation
 
 `timeline`, `watch`, `serial`, and Fleet Summary Recent Activity translate canonical events through one operator-facing presentation record. Canonical fields remain unchanged in command JSON; presentation adds a concise `kind`, evidence-only `summary`, normalized `severity`, and source identity when the read model supplies it.
