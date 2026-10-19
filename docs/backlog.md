@@ -109,6 +109,20 @@ This is an operational projection derived from existing evidence rather than a f
 - Consider alerting/notification workflows after the read model and operator surfaces settle.
 - Add analytics and trend reporting.
 
+## Alert redesign and enrichment (at new-firmware rollout)
+
+- Decision (Chip, 2026-10-19): rotate the Slack incoming webhook used by the Ubidots events when the new firmware rollout starts and the alert events are redesigned; not before.
+- Redesign alerts from `fleet` status (OVERDUE, UNKNOWN) and the firmware `alerts` codes, not fixed "offline for N hours" thresholds, which are wrong for sleeping devices.
+- Every alert message carries the Particle device ID (the Ubidots device label); the "reconnected" message currently has the name only.
+- Stale E01 alerts: the `3h-flag` variable can go 1 then 0 within seconds while Slack still posts. Check current status before posting, and collapse repeats per device.
+- Event definitions copied in Ubidots have labels that do not match their names; match events by ID.
+- Enrichment: read-only Ubidots MCP plus `telemetry context` (join key: Particle device ID = Ubidots label).
+  - Stage 1: pilot on devices tagged `enrich-pilot` (GCC test fleet plus one older device).
+  - Stage 2: in-thread enrichment. Stage 3: AI summary, last.
+  - Any posting back uses its own narrowly scoped token and a separate approval.
+- Add a server-side event filter (exclude serial) to the Timeline API so `context` can reach back further (needs a Lambda deploy).
+- Older firmware has no Ledger, serial or Particle-log data: Ubidots is the only rich source there, and `telemetry context` adds little for it.
+
 ## Completed
 
 - Extracted Lambda ingestion from inline CDK into modular TypeScript.
